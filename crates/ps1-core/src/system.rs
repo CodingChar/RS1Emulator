@@ -1,5 +1,6 @@
 use crate::bus::Bus;
 use crate::cpu::interpreter::Interpreter;
+use crate::gpu::CPU_CYCLES_PER_FRAME;
 use crate::save_state::SaveState;
 use crate::types::Ps1Result;
 
@@ -15,7 +16,7 @@ pub struct System {
 
     /// Total elapsed emulation cycles since power-on.
     pub cycles: u64,
-    /// Cycles remaining in the current video frame (NTSC ~ 3413, PAL ~ 4100).
+    /// Cycles remaining in the current video frame.
     pub frame_cycles_remaining: u64,
     /// Target cycles per video frame.
     pub cycles_per_frame: u64,
@@ -32,7 +33,7 @@ impl System {
             bus: Bus::new(),
             cycles: 0,
             frame_cycles_remaining: 0,
-            cycles_per_frame: 3413, // NTSC default
+            cycles_per_frame: CPU_CYCLES_PER_FRAME, // NTSC default
             running: false,
             bios_loaded: false,
             disc_inserted: false,

@@ -60,6 +60,12 @@ impl CdRom {
         self.registers = Self::idle_registers();
     }
 
+    /// DMA: read one word of sector data.
+    pub fn dma_read_word(&mut self) -> u32 {
+        // TODO: pop the data FIFO once sector reads exist.
+        0
+    }
+
     pub fn step(&mut self) {
         // TODO: process CD-ROM command queue, DMA sector transfers.
     }

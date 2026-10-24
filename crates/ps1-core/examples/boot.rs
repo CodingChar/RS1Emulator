@@ -30,10 +30,12 @@ struct Args {
     bios: Option<PathBuf>,
     disc: Option<PathBuf>,
     steps: u64,
+    /// Addresses whose 32-bit contents are printed after the run.
+    peek: Vec<u32>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000 };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -45,6 +47,11 @@ fn parse_args() -> Result<Args, String> {
                     .replace('_', "")
                     .parse()
                     .map_err(|e| format!("--steps: {e}"))?
+            }
+            "--peek" => {
+                let text = value("--peek")?;
+                let hex = text.trim_start_matches("0x");
+                args.peek.push(u32::from_str_radix(hex, 16).map_err(|e| format!("--peek: {e}"))?)
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -72,7 +79,7 @@ fn main() {
     }
 
     match &args.bios {
-        Some(bios) => run_bios(bios, args.steps),
+        Some(bios) => run_bios(bios, args.steps, &args.peek),
         None => println!("\nNo --bios given: skipping CPU boot (a BIOS dump is required)."),
     }
 }
@@ -136,7 +143,7 @@ fn inspect_disc(cue: &Path) -> Result<(), String> {
 
 // ----- CPU boot -----
 
-fn run_bios(path: &Path, steps: u64) {
+fn run_bios(path: &Path, steps: u64, peek: &[u32]) {
     let bios = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -195,6 +202,30 @@ fn run_bios(path: &Path, steps: u64) {
         }
     }
 
+    println!("registers:");
+    for row in 0..8 {
+        let cells: Vec<String> = (0..4)
+            .map(|col| {
+                let r = row * 4 + col;
+                format!("{:>4}={:08X}", reg(r as u32), sys.cpu.regs[r])
+            })
+            .collect();
+        println!("  {}", cells.join("  "));
+    }
+    println!(
+        "  hi={:08X} lo={:08X} sr={:08X} cause={:08X} epc={:08X}",
+        sys.cpu.hi, sys.cpu.lo, sys.cpu.cp0[12], sys.cpu.cp0[13], sys.cpu.cp0[14]
+    );
+    println!(
+        "  I_STAT={:03X} I_MASK={:03X} scanline={}",
+        sys.bus.interrupt.stat, sys.bus.interrupt.mask, sys.bus.gpu.scanline
+    );
+    for addr in peek {
+        match sys.bus.read32(*addr) {
+            Ok(v) => println!("  [{addr:#010X}] = {v:08X}"),
+            Err(e) => println!("  [{addr:#010X}] = <{e}>"),
+        }
+    }
     println!(
         "I/O accesses with no device: {} ({} logged)",
         sys.bus.unhandled_io_count,

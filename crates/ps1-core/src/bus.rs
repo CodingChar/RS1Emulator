@@ -2,11 +2,11 @@ use crate::cdrom::CdRom;
 use crate::controllers::ControllerManager;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::interrupt::InterruptController;
+use crate::interrupt::{InterruptController, IRQ_DMA, IRQ_VBLANK};
 use crate::io::{extract, merge, read_le, write_le, StubRegs};
 use crate::memory::Memory;
 use crate::spu::Spu;
-use crate::timers::Timers;
+use crate::timers::{TimerClocks, Timers};
 use crate::types::{Ps1Error, Ps1Result};
 
 /// Mask applied to a virtual address to obtain the physical address, indexed
@@ -187,10 +187,19 @@ impl Bus {
         self.unhandled_io_count = 0;
     }
 
-    /// Advance all devices by one cycle.
+    /// Advance all devices by one CPU cycle.
     pub fn step_devices(&mut self) {
-        self.dma.step(&mut self.memory);
-        self.timers.step(&mut self.interrupt);
+        let video = self.gpu.advance(1);
+        if video.vblank_started {
+            self.interrupt.raise(IRQ_VBLANK);
+        }
+        let clocks = TimerClocks {
+            sysclk: 1,
+            dotclock: video.dot_ticks,
+            hblank: video.hblanks,
+        };
+        self.timers.tick(clocks, &mut self.interrupt);
+
         self.gpu.step();
         self.spu.step();
         self.cdrom.step();
@@ -321,7 +330,12 @@ impl Bus {
             SIO..=SIO_END => self.sio.write(phys - SIO, width, value),
             RAM_SIZE..=RAM_SIZE_END => self.ram_size = merge(self.ram_size, phys, width, value),
             INTERRUPT..=INTERRUPT_END => self.interrupt.write(phys - INTERRUPT, width, value),
-            DMA..=DMA_END => self.dma.write(phys - DMA, width, value),
+            DMA..=DMA_END => {
+                if let Some(channel) = self.dma.write(phys - DMA, width, value) {
+                    self.run_dma(channel);
+                }
+                self.forward_dma_irq();
+            }
             TIMERS..=TIMERS_END => self.timers.write(phys - TIMERS, width, value),
             CDROM..=CDROM_END => self.cdrom.write(phys - CDROM, width, value),
             GPU..=GPU_END => self.gpu.write(phys - GPU, width, value),
@@ -330,6 +344,25 @@ impl Bus {
             POST_REGISTER => self.post_code = value as u8,
             EXPANSION2..=EXPANSION2_END => {}
             _ => self.log_unhandled(phys, width, true, value),
+        }
+    }
+
+    /// Start a DMA transfer if the channel is ready, and signal completion.
+    fn run_dma(&mut self, channel: usize) {
+        if self.dma.should_run(channel) {
+            self.dma.run_channel(
+                channel,
+                &mut self.memory.ram,
+                &mut self.gpu,
+                &mut self.spu,
+                &mut self.cdrom,
+            );
+        }
+    }
+
+    fn forward_dma_irq(&mut self) {
+        if self.dma.take_irq() {
+            self.interrupt.raise(IRQ_DMA);
         }
     }
 
@@ -690,5 +723,191 @@ mod tests {
         assert_eq!(bus.read32(0x1F80_1008).unwrap(), 0x0013_243F);
         assert_eq!(bus.read32(0x1F80_0000).unwrap(), 0);
         assert_eq!(bus.unhandled_io_count, 0);
+    }
+
+    // ----- DMA transfers -----
+
+    const DMA_BASE: u32 = 0x1F80_1080;
+
+    fn dma_reg(channel: u32, reg: u32) -> u32 {
+        DMA_BASE + channel * 0x10 + reg * 4
+    }
+
+    fn enable_dma_channel(bus: &mut Bus, channel: u32) {
+        let dpcr = bus.read32(0x1F80_10F0).unwrap();
+        bus.write32(0x1F80_10F0, dpcr | (1 << (channel * 4 + 3))).unwrap();
+    }
+
+    #[test]
+    fn otc_dma_builds_an_ordering_table() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 6);
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap(); // MADR: last entry
+        bus.write32(dma_reg(6, 1), 4).unwrap(); // 4 entries
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap(); // start + trigger, backward
+
+        assert_eq!(bus.read32(0x1000).unwrap(), 0x0FFC);
+        assert_eq!(bus.read32(0x0FFC).unwrap(), 0x0FF8);
+        assert_eq!(bus.read32(0x0FF8).unwrap(), 0x0FF4);
+        assert_eq!(bus.read32(0x0FF4).unwrap(), 0x00FF_FFFF, "end marker");
+        assert_eq!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "no longer busy");
+        assert_eq!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 28), 0, "trigger consumed");
+        assert_eq!(bus.read32(dma_reg(6, 0)).unwrap(), 0x0FF0, "MADR after the last entry");
+    }
+
+    #[test]
+    fn dma_does_nothing_until_the_channel_is_enabled() {
+        let mut bus = Bus::new();
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap();
+        bus.write32(dma_reg(6, 1), 4).unwrap();
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        assert_eq!(bus.read32(0x1000).unwrap(), 0);
+        assert_ne!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "still busy");
+
+        // Enabling afterwards does not retroactively start it, but a new write does.
+        enable_dma_channel(&mut bus, 6);
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        assert_eq!(bus.read32(0x1000).unwrap(), 0x0FFC);
+    }
+
+    #[test]
+    fn manual_sync_dma_waits_for_the_trigger_bit() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 6);
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap();
+        bus.write32(dma_reg(6, 1), 2).unwrap();
+        bus.write32(dma_reg(6, 2), 0x0100_0002).unwrap(); // busy, no trigger
+        assert_eq!(bus.read32(0x1000).unwrap(), 0);
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        assert_eq!(bus.read32(0x1000).unwrap(), 0x0FFC);
+    }
+
+    #[test]
+    fn gpu_dma_block_mode_sends_every_word_to_gp0() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 2);
+        for i in 0..8u32 {
+            bus.write32(0x2000 + i * 4, 0xA000_0000 + i).unwrap();
+        }
+        bus.write32(dma_reg(2, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(2, 1), (2 << 16) | 4).unwrap(); // 2 blocks of 4 words
+        bus.write32(dma_reg(2, 2), 0x0100_0201).unwrap(); // request sync, from RAM
+        assert_eq!(bus.gpu.gp0_word_count, 8);
+        assert_eq!(bus.gpu.regs[0], 0xA000_0007);
+        assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
+        assert_eq!(bus.read32(dma_reg(2, 0)).unwrap(), 0x2020, "MADR advanced by 8 words");
+        assert_eq!(bus.read32(dma_reg(2, 1)).unwrap() >> 16, 0, "block counter ran down");
+    }
+
+    #[test]
+    fn gpu_dma_linked_list_follows_the_chain() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 2);
+        // Node A: 2 command words, next = 0x2100.
+        bus.write32(0x2000, (2 << 24) | 0x2100).unwrap();
+        bus.write32(0x2004, 0x1111_1111).unwrap();
+        bus.write32(0x2008, 0x2222_2222).unwrap();
+        // Node B: 1 command word, end of list.
+        bus.write32(0x2100, (1 << 24) | 0x00FF_FFFF).unwrap();
+        bus.write32(0x2104, 0x3333_3333).unwrap();
+
+        bus.write32(dma_reg(2, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap(); // linked-list sync, from RAM
+        assert_eq!(bus.gpu.gp0_word_count, 3);
+        assert_eq!(bus.gpu.regs[0], 0x3333_3333);
+        assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
+    }
+
+    #[test]
+    fn gpu_dma_linked_list_survives_a_cycle() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 2);
+        bus.write32(0x2000, 0x2000).unwrap(); // empty node pointing at itself
+        bus.write32(dma_reg(2, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap(); // must terminate
+        assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
+    }
+
+    #[test]
+    fn gpu_dma_to_ram_reads_gpuread() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 2);
+        bus.write32(0x3000, 0xFFFF_FFFF).unwrap();
+        bus.gpu.regs[2] = 0xCAFE_BABE;
+        bus.write32(dma_reg(2, 0), 0x3000).unwrap();
+        bus.write32(dma_reg(2, 1), (1 << 16) | 2).unwrap();
+        bus.write32(dma_reg(2, 2), 0x0100_0200).unwrap(); // request sync, to RAM
+        assert_eq!(bus.read32(0x3000).unwrap(), 0xCAFE_BABE);
+        assert_eq!(bus.read32(0x3004).unwrap(), 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn spu_dma_copies_ram_into_sound_ram() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 4);
+        for i in 0..4u32 {
+            bus.write32(0x4000 + i * 4, 0x0403_0201 + i * 0x0404_0404).unwrap();
+        }
+        bus.write16(0x1F80_1DA6, 0x100).unwrap(); // transfer address = 0x100 * 8
+        bus.write32(dma_reg(4, 0), 0x4000).unwrap();
+        bus.write32(dma_reg(4, 1), (1 << 16) | 4).unwrap();
+        bus.write32(dma_reg(4, 2), 0x0100_0201).unwrap();
+        assert_eq!(&bus.spu.sound_ram[0x800..0x808], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn spu_dma_from_sound_ram_reads_back() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 4);
+        bus.spu.sound_ram[0x800..0x804].copy_from_slice(&[0xDD, 0xCC, 0xBB, 0xAA]);
+        bus.write16(0x1F80_1DA6, 0x100).unwrap();
+        bus.write32(dma_reg(4, 0), 0x4000).unwrap();
+        bus.write32(dma_reg(4, 1), (1 << 16) | 1).unwrap();
+        bus.write32(dma_reg(4, 2), 0x0100_0200).unwrap();
+        assert_eq!(bus.read32(0x4000).unwrap(), 0xAABB_CCDD);
+    }
+
+    #[test]
+    fn spu_manual_fifo_writes_advance_the_transfer_address() {
+        let mut bus = Bus::new();
+        bus.write16(0x1F80_1DA6, 0x10).unwrap();
+        bus.write16(0x1F80_1DA8, 0x1234).unwrap();
+        bus.write16(0x1F80_1DA8, 0x5678).unwrap();
+        assert_eq!(&bus.spu.sound_ram[0x80..0x84], &[0x34, 0x12, 0x78, 0x56]);
+    }
+
+    #[test]
+    fn dma_completion_sets_the_flag_and_raises_the_interrupt() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 6);
+        // Master enable + enable for channel 6 (bit 16 + 6).
+        bus.write32(0x1F80_10F4, (1 << 23) | (1 << 22)).unwrap();
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap();
+        bus.write32(dma_reg(6, 1), 4).unwrap();
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+
+        let dicr = bus.read32(0x1F80_10F4).unwrap();
+        assert_ne!(dicr & (1 << 30), 0, "channel 6 flag");
+        assert_ne!(dicr & (1 << 31), 0, "master flag");
+        assert_eq!(bus.interrupt.stat & (1 << IRQ_DMA), 1 << IRQ_DMA);
+    }
+
+    #[test]
+    fn dma_completion_is_silent_when_the_channel_interrupt_is_disabled() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 6);
+        bus.write32(0x1F80_10F4, 1 << 23).unwrap(); // master enable only
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap();
+        bus.write32(dma_reg(6, 1), 4).unwrap();
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        assert_eq!(bus.read32(0x1F80_10F4).unwrap() & 0xFF00_0000, 0);
+        assert_eq!(bus.interrupt.stat, 0);
+    }
+
+    #[test]
+    fn forcing_the_dma_interrupt_raises_it() {
+        let mut bus = Bus::new();
+        bus.write32(0x1F80_10F4, 1 << 15).unwrap();
+        assert_eq!(bus.interrupt.stat & (1 << IRQ_DMA), 1 << IRQ_DMA);
     }
 }

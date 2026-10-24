@@ -3,6 +3,10 @@ const REGISTER_COUNT: usize = 0x200;
 /// Byte offsets (from `0x1F801C00`) of the control and status registers.
 const SPUCNT_OFFSET: u32 = 0x1AA;
 const SPUSTAT_OFFSET: u32 = 0x1AE;
+/// Sound RAM transfer address (in units of 8 bytes) and data FIFO.
+const TRANSFER_ADDRESS_OFFSET: u32 = 0x1A6;
+const TRANSFER_FIFO_OFFSET: u32 = 0x1A8;
+const SOUND_RAM_MASK: usize = 512 * 1024 - 1;
 /// SPUSTAT mirrors the low 6 bits of SPUCNT.
 const SPUSTAT_MIRROR_MASK: u16 = 0x3F;
 
@@ -18,6 +22,8 @@ pub struct Spu {
     pub register_file: [u16; REGISTER_COUNT],
     pub output_buffer: Vec<f32>,   // stereo interleaved f32
     pub sample_rate: u32,
+    /// Current sound RAM address (bytes) for CPU/DMA transfers.
+    transfer_address: usize,
 }
 
 impl Spu {
@@ -27,6 +33,7 @@ impl Spu {
             register_file: [0u16; REGISTER_COUNT],
             output_buffer: Vec::new(),
             sample_rate: 44100,
+            transfer_address: 0,
         }
     }
 
@@ -34,6 +41,34 @@ impl Spu {
         self.sound_ram.fill(0);
         self.register_file = [0u16; REGISTER_COUNT];
         self.output_buffer.clear();
+        self.transfer_address = 0;
+    }
+
+    /// Store a halfword at the transfer address in sound RAM and advance it.
+    fn push_transfer_half(&mut self, value: u16) {
+        let [lo, hi] = value.to_le_bytes();
+        self.sound_ram[self.transfer_address & SOUND_RAM_MASK] = lo;
+        self.sound_ram[(self.transfer_address + 1) & SOUND_RAM_MASK] = hi;
+        self.transfer_address = (self.transfer_address + 2) & SOUND_RAM_MASK;
+    }
+
+    fn pop_transfer_half(&mut self) -> u16 {
+        let lo = self.sound_ram[self.transfer_address & SOUND_RAM_MASK];
+        let hi = self.sound_ram[(self.transfer_address + 1) & SOUND_RAM_MASK];
+        self.transfer_address = (self.transfer_address + 2) & SOUND_RAM_MASK;
+        u16::from_le_bytes([lo, hi])
+    }
+
+    /// DMA: write one word into sound RAM.
+    pub fn dma_write_word(&mut self, word: u32) {
+        self.push_transfer_half(word as u16);
+        self.push_transfer_half((word >> 16) as u16);
+    }
+
+    /// DMA: read one word from sound RAM.
+    pub fn dma_read_word(&mut self) -> u32 {
+        let lo = self.pop_transfer_half() as u32;
+        lo | ((self.pop_transfer_half() as u32) << 16)
     }
 
     /// Advance SPU by one cycle and produce audio samples.
@@ -57,6 +92,11 @@ impl Spu {
         // SPUSTAT is read-only.
         if index < REGISTER_COUNT && off != SPUSTAT_OFFSET {
             self.register_file[index] = value;
+        }
+        match off {
+            TRANSFER_ADDRESS_OFFSET => self.transfer_address = (value as usize * 8) & SOUND_RAM_MASK,
+            TRANSFER_FIFO_OFFSET => self.push_transfer_half(value),
+            _ => {}
         }
     }
 

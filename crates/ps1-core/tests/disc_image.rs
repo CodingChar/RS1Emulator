@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 const RAW_SECTOR: u64 = 2352;
 
-/// Find the first `.bin` under `<workspace>/rom_test`.
+/// Find a disc image under `<workspace>/rom_test`: a `.bin` that has a `.cue`
+/// sheet next to it (a BIOS dump, also a `.bin`, does not).
 fn find_test_bin() -> Option<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rom_test");
     let mut stack = vec![root];
@@ -19,7 +20,9 @@ fn find_test_bin() -> Option<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bin")) {
+            } else if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("bin"))
+                && path.with_extension("cue").exists()
+            {
                 return Some(path);
             }
         }
