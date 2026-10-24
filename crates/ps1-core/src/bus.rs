@@ -1,8 +1,9 @@
 use crate::cdrom::CdRom;
+use crate::controllers::sio::Sio0;
 use crate::controllers::ControllerManager;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::interrupt::{InterruptController, IRQ_CDROM, IRQ_DMA, IRQ_VBLANK};
+use crate::interrupt::{InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_VBLANK};
 use crate::io::{extract, merge, read_le, write_le, StubRegs};
 use crate::memory::Memory;
 use crate::spu::Spu;
@@ -70,8 +71,6 @@ const MEM_CONTROL_RESET: [u32; 9] = [
     0x0003_1125, // common delay
 ];
 const RAM_SIZE_RESET: u32 = 0x0000_0B88;
-/// JOY_STAT at power-on: transmitter ready.
-const JOY_STAT_RESET: u32 = 0x0000_0005;
 /// MDEC status at power-on: data-out FIFO empty, ready for commands.
 const MDEC_STATUS_RESET: u32 = 0x8004_0000;
 
@@ -125,8 +124,10 @@ pub struct Bus {
     /// Last value written to the BIOS POST register.
     pub post_code: u8,
 
-    /// Serial port registers (controllers/memory cards), not emulated yet.
-    sio: StubRegs,
+    /// Serial port 0: controllers and memory cards.
+    pub sio0: Sio0,
+    /// Serial port 1 (link cable) registers, not emulated.
+    sio1: StubRegs,
     /// Motion decoder registers, not emulated yet.
     mdec: StubRegs,
 
@@ -152,15 +153,16 @@ impl Bus {
             ram_size: RAM_SIZE_RESET,
             cache_control: 0,
             post_code: 0,
-            sio: Self::idle_sio(),
+            sio0: Sio0::new(),
+            sio1: Self::idle_sio1(),
             mdec: Self::idle_mdec(),
             unhandled_io: Vec::new(),
             unhandled_io_count: 0,
         }
     }
 
-    fn idle_sio() -> StubRegs {
-        StubRegs::new(0x20).with_u32(4, JOY_STAT_RESET)
+    fn idle_sio1() -> StubRegs {
+        StubRegs::new(0x10)
     }
 
     fn idle_mdec() -> StubRegs {
@@ -181,7 +183,9 @@ impl Bus {
         self.ram_size = RAM_SIZE_RESET;
         self.cache_control = 0;
         self.post_code = 0;
-        self.sio = Self::idle_sio();
+        self.sio0.reset();
+        self.controllers.deselect();
+        self.sio1 = Self::idle_sio1();
         self.mdec = Self::idle_mdec();
         self.unhandled_io.clear();
         self.unhandled_io_count = 0;
@@ -204,6 +208,8 @@ impl Bus {
         self.spu.step();
         self.cdrom.step();
         self.forward_cdrom_irq();
+        self.sio0.step(&mut self.controllers);
+        self.forward_sio_irq();
     }
 
     fn decode(addr: u32) -> Target {
@@ -305,7 +311,10 @@ impl Bus {
             MEM_CONTROL1..=MEM_CONTROL1_END => {
                 extract(self.mem_control[((phys - MEM_CONTROL1) >> 2) as usize], phys, width)
             }
-            SIO..=SIO_END => self.sio.read(phys - SIO, width),
+            SIO..=SIO_END => match phys - SIO {
+                off @ 0..=0x0F => self.sio0.read(off, width),
+                off => self.sio1.read(off - 0x10, width),
+            },
             RAM_SIZE..=RAM_SIZE_END => extract(self.ram_size, phys, width),
             INTERRUPT..=INTERRUPT_END => self.interrupt.read(phys - INTERRUPT, width),
             DMA..=DMA_END => self.dma.read(phys - DMA, width),
@@ -328,7 +337,13 @@ impl Bus {
                 let i = ((phys - MEM_CONTROL1) >> 2) as usize;
                 self.mem_control[i] = merge(self.mem_control[i], phys, width, value);
             }
-            SIO..=SIO_END => self.sio.write(phys - SIO, width, value),
+            SIO..=SIO_END => match phys - SIO {
+                off @ 0..=0x0F => {
+                    self.sio0.write(off, width, value, &mut self.controllers);
+                    self.forward_sio_irq();
+                }
+                off => self.sio1.write(off - 0x10, width, value),
+            },
             RAM_SIZE..=RAM_SIZE_END => self.ram_size = merge(self.ram_size, phys, width, value),
             INTERRUPT..=INTERRUPT_END => self.interrupt.write(phys - INTERRUPT, width, value),
             DMA..=DMA_END => {
@@ -361,6 +376,12 @@ impl Bus {
                 &mut self.spu,
                 &mut self.cdrom,
             );
+        }
+    }
+
+    fn forward_sio_irq(&mut self) {
+        if self.sio0.take_irq() {
+            self.interrupt.raise(IRQ_CONTROLLER);
         }
     }
 
@@ -681,6 +702,40 @@ mod tests {
     #[test]
     fn serial_port_reports_transmitter_ready() {
         let mut bus = Bus::new();
+        assert_eq!(bus.read32(0x1F80_1044).unwrap() & 5, 5);
+    }
+
+    #[test]
+    fn serial_port_1_registers_just_store_values() {
+        let mut bus = Bus::new();
+        bus.write16(0x1F80_105A, 0x1234).unwrap();
+        assert_eq!(bus.read16(0x1F80_105A).unwrap(), 0x1234);
+        assert_eq!(bus.read16(0x1F80_104A).unwrap(), 0, "SIO0 control is separate");
+    }
+
+    #[test]
+    fn a_pad_poll_through_the_bus_raises_irq7() {
+        let mut bus = Bus::new();
+        bus.write16(0x1F80_1048, 0x000D).unwrap(); // MODE
+        bus.write16(0x1F80_104E, 0x0088).unwrap(); // BAUD
+        bus.write16(0x1F80_104A, 0x1003).unwrap(); // CTRL
+        bus.write8(0x1F80_1040, 0x01).unwrap();
+
+        for _ in 0..2000 {
+            bus.step_devices();
+        }
+        assert_eq!(bus.read8(0x1F80_1040).unwrap(), 0xFF);
+        assert_ne!(bus.interrupt.stat & (1 << IRQ_CONTROLLER), 0, "IRQ7 pending");
+        assert_ne!(bus.read32(0x1F80_1044).unwrap() & (1 << 9), 0, "JOY_STAT IRQ flag");
+    }
+
+    #[test]
+    fn bus_reset_releases_the_serial_port() {
+        let mut bus = Bus::new();
+        bus.write16(0x1F80_104A, 0x1003).unwrap();
+        bus.write8(0x1F80_1040, 0x01).unwrap();
+        bus.reset();
+        assert_eq!(bus.read16(0x1F80_104A).unwrap(), 0);
         assert_eq!(bus.read32(0x1F80_1044).unwrap() & 5, 5);
     }
 

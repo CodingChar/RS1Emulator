@@ -87,6 +87,32 @@ impl Ps1 {
         self.inner.load_state(data).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// Plug a 128 KB memory card image into slot 0 or 1.
+    pub fn insert_memory_card(&mut self, port: u32, data: &[u8]) -> Result<(), JsValue> {
+        self.inner
+            .insert_memory_card(port as usize, data.to_vec())
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    /// Plug a freshly formatted, empty memory card into slot 0 or 1.
+    pub fn insert_formatted_memory_card(&mut self, port: u32) {
+        self.inner.insert_formatted_memory_card(port as usize);
+    }
+
+    /// The card's contents (Uint8Array), or undefined if the slot is empty.
+    pub fn memory_card_data(&self, port: u32) -> Option<Vec<u8>> {
+        self.inner.memory_card_data(port as usize)
+    }
+
+    /// Whether the game wrote to the card since the last `clear_memory_card_dirty`.
+    pub fn memory_card_dirty(&self, port: u32) -> bool {
+        self.inner.memory_card_dirty(port as usize)
+    }
+
+    pub fn clear_memory_card_dirty(&mut self, port: u32) {
+        self.inner.clear_memory_card_dirty(port as usize);
+    }
+
     /// Whether the system is running.
     pub fn is_running(&self) -> bool {
         self.inner.running

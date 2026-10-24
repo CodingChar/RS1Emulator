@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+use crate::controllers::memory_card::MemoryCard;
 use crate::cpu::interpreter::Interpreter;
 use crate::gpu::CPU_CYCLES_PER_FRAME;
 use crate::save_state::SaveState;
@@ -58,6 +59,35 @@ impl System {
         self.bus.cdrom.insert_image(data)?;
         self.disc_inserted = true;
         Ok(())
+    }
+
+    /// Plug a memory card image (exactly 128 KB) into slot 0 or 1.
+    pub fn insert_memory_card(&mut self, port: usize, data: Vec<u8>) -> Ps1Result<()> {
+        let card = MemoryCard::from_bytes(data)
+            .ok_or_else(|| crate::types::Ps1Error::Io("a memory card image must be exactly 128 KB".into()))?;
+        self.bus.controllers.insert_memory_card(port, card);
+        Ok(())
+    }
+
+    /// Plug a freshly formatted, empty memory card into slot 0 or 1.
+    pub fn insert_formatted_memory_card(&mut self, port: usize) {
+        self.bus.controllers.insert_memory_card(port, MemoryCard::formatted());
+    }
+
+    /// The contents of the card in a slot, for saving it.
+    pub fn memory_card_data(&self, port: usize) -> Option<Vec<u8>> {
+        self.bus.controllers.memory_card(port).map(|card| card.data().to_vec())
+    }
+
+    /// Whether the console wrote to the card since `clear_memory_card_dirty`.
+    pub fn memory_card_dirty(&self, port: usize) -> bool {
+        self.bus.controllers.memory_card(port).is_some_and(|card| card.is_dirty())
+    }
+
+    pub fn clear_memory_card_dirty(&mut self, port: usize) {
+        if let Some(card) = self.bus.controllers.memory_card_mut(port) {
+            card.clear_dirty();
+        }
     }
 
     /// Insert an already-parsed disc (for example one read lazily from a file).
