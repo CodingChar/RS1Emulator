@@ -99,7 +99,25 @@ function makeReader(file) {
     };
 }
 
+/// A PS-X EXE (homebrew or a test program) instead of a disc.
+function loadExe(file) {
+    try {
+        ps1.load_exe(new Uint8Array(new FileReaderSync().readAsArrayBuffer(file)));
+    } catch (error) {
+        say(`No se pudo cargar el programa: ${error}`, true);
+        return false;
+    }
+    discLoaded = true;
+    post({ type: 'disc', names: [file.name], size: file.size });
+    publishState();
+    return true;
+}
+
 function loadDisc(files) {
+    if (files.length === 1 && /\.(exe|psx|ps-exe)$/i.test(files[0].name)) {
+        loadExe(files[0]);
+        return;
+    }
     const cue = files.find((f) => /\.cue$/i.test(f.name));
     const data = files.filter((f) => !/\.cue$/i.test(f.name));
     if (data.length === 0) {

@@ -4,6 +4,9 @@ use crate::cpu::interpreter::Interpreter;
 use crate::gpu::CPU_CYCLES_PER_FRAME;
 use crate::types::Ps1Result;
 
+/// Where the BIOS starts the shell, and where a queued program takes over.
+const SHELL_ENTRY: u32 = 0x8003_0000;
+
 /// Top-level PS1 emulation system.
 ///
 /// Owns the CPU and the bus; the bus in turn owns main memory and every
@@ -11,6 +14,8 @@ use crate::types::Ps1Result;
 /// controllers). `System` advances emulation one cycle at a time. This is the
 /// moral equivalent of `core.cpp` in DuckStation.
 pub struct System {
+    /// A program waiting for the BIOS to reach its shell (see `load_exe`).
+    pending_exe: Option<crate::exe::Exe>,
     pub cpu: Interpreter,
     pub bus: Bus,
 
@@ -29,6 +34,7 @@ impl System {
     /// Create a new, uninitialized PS1 system.
     pub fn new() -> Self {
         Self {
+            pending_exe: None,
             cpu: Interpreter::new(),
             bus: Bus::new(),
             cycles: 0,
@@ -51,6 +57,49 @@ impl System {
         bios.as_mut_slice()[..data.len()].copy_from_slice(data);
         self.bios_loaded = true;
         Ok(())
+    }
+
+    /// Queue a PS-X EXE to run instead of the BIOS shell: the BIOS boots as
+    /// usual and, when it reaches the shell, the program replaces it. Works
+    /// with or without a disc.
+    pub fn load_exe(&mut self, data: &[u8]) -> Ps1Result<()> {
+        self.pending_exe = Some(crate::exe::Exe::parse(data)?);
+        Ok(())
+    }
+
+    /// Whether a queued program has not started yet.
+    pub fn exe_pending(&self) -> bool {
+        self.pending_exe.is_some()
+    }
+
+    /// Put the queued program in RAM and jump to it.
+    fn start_pending_exe(&mut self) {
+        let Some(exe) = self.pending_exe.take() else { return };
+        self.sync();
+        let ram = self.bus.memory.ram.as_mut_slice();
+        let at = (exe.load_address & 0x1F_FFFF) as usize;
+        ram[at..at + exe.text.len()].copy_from_slice(&exe.text);
+        if let Some((address, size)) = exe.clear {
+            let start = (address & 0x1F_FFFF) as usize;
+            let end = (start + size as usize).min(ram.len());
+            ram[start..end].fill(0);
+        }
+        self.cpu.start_program(exe.pc, exe.gp, exe.sp);
+    }
+
+    /// Run the CPU for up to `count` instructions, starting a queued program
+    /// when the BIOS reaches the shell.
+    fn run_cpu(&mut self, count: u64) -> (u64, Ps1Result<()>) {
+        if self.pending_exe.is_none() {
+            return self.cpu.run(&mut self.bus, count);
+        }
+        let (executed, result, reached) = self.cpu.run_until(&mut self.bus, count, SHELL_ENTRY);
+        if !reached {
+            return (executed, result);
+        }
+        self.start_pending_exe();
+        let (more, result) = self.cpu.run(&mut self.bus, count - executed);
+        (executed + more, result)
     }
 
     /// Insert a game disc image.
@@ -136,7 +185,7 @@ impl System {
         if !self.running {
             return Ok(());
         }
-        let (executed, result) = self.cpu.run(&mut self.bus, count);
+        let (executed, result) = self.run_cpu(count);
         self.cycles += executed;
         result
     }
@@ -147,7 +196,7 @@ impl System {
         if !self.running {
             return Ok(());
         }
-        let (executed, result) = self.cpu.run(&mut self.bus, self.cycles_per_frame);
+        let (executed, result) = self.run_cpu(self.cycles_per_frame);
         self.cycles += executed;
         self.frame_cycles_remaining = self.cycles_per_frame - executed;
         self.sync();
@@ -261,5 +310,36 @@ mod tests {
         sys.step().unwrap();
         assert_eq!(sys.cpu.pc, 0xBFC0_0180, "BEV exception vector");
         assert_eq!((sys.cpu.cp0[13] >> 2) & 0x1F, 0, "ExcCode = Interrupt");
+    }
+
+    #[test]
+    fn a_queued_exe_replaces_the_shell() {
+        use crate::exe::tests::exe_bytes;
+        let mut sys = System::new();
+        // lui t0, 0x8003 ; jr t0 ; nop: straight to the shell entry.
+        sys.load_bios(&bios_with(&[0x3C08_8003, 0x0100_0008, 0])).unwrap();
+        // lui t1,0x8002 ; addiu t2,zero,0x1234 ; sw t2,0(t1) ; j (itself) ; nop
+        let program: Vec<u8> = [0x3C09_8002u32, 0x240A_1234, 0xAD2A_0000, 0x0800_4003, 0]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let exe = exe_bytes(&program, 0x8001_0000, 0x8001_0000, 0x8002_8000, (0x801F_F000, 0x100));
+        sys.load_exe(&exe).unwrap();
+        assert!(sys.exe_pending());
+        sys.reset().unwrap();
+
+        sys.run_cycles(1000).unwrap();
+        assert!(!sys.exe_pending());
+        assert_eq!(sys.bus.memory.ram.read32(0x2_0000), 0x1234, "the program ran");
+        assert_eq!(sys.cpu.regs[28], 0x8002_8000, "global pointer");
+        assert_eq!(sys.cpu.regs[29], 0x801F_F100, "stack pointer");
+        assert!((0x8001_000C..0x8001_0014).contains(&sys.cpu.pc), "looping at the end");
+    }
+
+    #[test]
+    fn a_bad_exe_is_refused_without_queuing_anything() {
+        let mut sys = System::new();
+        assert!(sys.load_exe(b"not an executable").is_err());
+        assert!(!sys.exe_pending());
     }
 }

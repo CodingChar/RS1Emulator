@@ -11,6 +11,7 @@ pub mod controllers;
 pub mod cdrom;
 pub mod disc;
 pub mod dma;
+pub mod exe;
 pub mod gte;
 pub mod gpu;
 pub mod interrupt;

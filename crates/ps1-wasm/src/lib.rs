@@ -166,6 +166,12 @@ impl Ps1 {
         Ok(())
     }
 
+    /// Queue a PS-X EXE program to run instead of the BIOS shell (the BIOS
+    /// boots first; call `reset` afterwards to start).
+    pub fn load_exe(&mut self, data: &[u8]) -> Result<(), JsValue> {
+        self.inner.load_exe(data).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
     /// Frames per second of the current video mode (about 60 for NTSC, 50 for PAL).
     pub fn frames_per_second(&self) -> f64 {
         33_868_800.0 / self.inner.bus.gpu.cycles_per_frame() as f64

@@ -40,7 +40,7 @@ impl Interpreter {
     // never reads again; that is intended.
     #[allow(unused_assignments)]
     #[inline(never)]
-    pub(super) fn run_fast(&mut self, bus: &mut Bus, limit: u32) -> u32 {
+    pub(super) fn run_fast<const BREAKPOINT: bool>(&mut self, bus: &mut Bus, limit: u32, break_pc: u32) -> u32 {
         let sr = self.cp0[COP0_SR];
         let user_mode = sr & SR_KUC != 0;
         let cache_isolated = sr & SR_ISC != 0;
@@ -126,6 +126,9 @@ impl Interpreter {
         }
 
         while count < limit {
+            if BREAKPOINT && pc == break_pc {
+                break;
+            }
             // ---- fetch
             if pc & 3 != 0 {
                 break;

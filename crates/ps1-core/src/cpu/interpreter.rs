@@ -171,6 +171,17 @@ impl Interpreter {
         self.branch_pending = false;
     }
 
+    /// Start a program: jump to `pc` with the global pointer and stack set,
+    /// dropping any branch or load still in flight.
+    pub fn start_program(&mut self, pc: u32, gp: u32, sp: u32) {
+        self.set_pc(pc);
+        self.pending_load = (0, 0);
+        self.next_load = (0, 0);
+        self.regs[28] = gp;
+        self.regs[29] = sp;
+        self.regs[30] = sp;
+    }
+
     /// Drive the external interrupt line (Cause.IP2), fed by the interrupt
     /// controller.
     pub fn set_irq(&mut self, asserted: bool) {
@@ -200,14 +211,35 @@ impl Interpreter {
     /// This is the same as calling [`Interpreter::step`] in a loop but keeps
     /// the whole interpreter in a single hot loop, which is what makes it fast.
     pub fn run(&mut self, bus: &mut Bus, count: u64) -> (u64, Ps1Result<()>) {
+        let (executed, result, _) = self.run_loop::<false>(bus, count, 0);
+        (executed, result)
+    }
+
+    /// Like [`Interpreter::run`], but stops (without executing it) when the
+    /// next instruction is the one at `break_pc`. The last value says whether
+    /// it stopped there.
+    pub fn run_until(&mut self, bus: &mut Bus, count: u64, break_pc: u32) -> (u64, Ps1Result<()>, bool) {
+        self.run_loop::<true>(bus, count, break_pc)
+    }
+
+    #[inline(always)]
+    fn run_loop<const BREAKPOINT: bool>(
+        &mut self,
+        bus: &mut Bus,
+        count: u64,
+        break_pc: u32,
+    ) -> (u64, Ps1Result<()>, bool) {
         let mut executed = 0u64;
         while executed < count {
+            if BREAKPOINT && self.pc == break_pc {
+                return (executed, Ok(()), true);
+            }
             self.set_irq(bus.interrupt.pending());
             if !self.interrupt_pending() {
                 // Nothing can change the interrupt line before the next device
                 // event, so a whole batch runs without looking at it again.
                 let limit = (count - executed).min(bus.cycles_to_deadline() as u64) as u32;
-                let done = self.run_fast(bus, limit);
+                let done = self.run_fast::<BREAKPOINT>(bus, limit, break_pc);
                 if done > 0 {
                     bus.tick(done);
                     executed += done as u64;
@@ -215,17 +247,20 @@ impl Interpreter {
                         continue;
                     }
                 }
+                if BREAKPOINT && self.pc == break_pc {
+                    continue;
+                }
             }
             // One instruction the fast path does not handle (or an interrupt).
             if let Err(trap) = self.step_inner(bus) {
                 if let Err(e) = self.handle_trap(trap) {
-                    return (executed, Err(e));
+                    return (executed, Err(e), false);
                 }
             }
             bus.tick(1);
             executed += 1;
         }
-        (count, Ok(()))
+        (count, Ok(()), false)
     }
 
     #[inline(always)]
