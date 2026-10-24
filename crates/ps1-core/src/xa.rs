@@ -1,6 +1,7 @@
 //! CD-ROM XA-ADPCM audio: decoding of Mode 2 Form 2 sectors and conversion
 //! to the SPU's 44.1 kHz.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Submode byte (raw sector offset 18) bits.
@@ -29,6 +30,7 @@ pub fn is_audio_sector(raw: &[u8]) -> bool {
 }
 
 /// Decoder state kept across sectors: ADPCM history and the resampler.
+#[derive(Serialize, Deserialize)]
 pub struct XaDecoder {
     /// `[channel][old1, old2]`.
     history: [[i32; 2]; 2],
@@ -113,6 +115,7 @@ impl Default for XaDecoder {
 }
 
 /// Streaming linear-interpolation resampler to 44.1 kHz.
+#[derive(Serialize, Deserialize)]
 pub struct Resampler {
     /// Last frame of the previous chunk.
     previous: Frame,

@@ -8,6 +8,7 @@
 //!
 //! Mirrors DuckStation's `gpu.cpp`, `gpu_commands.cpp` and `gpu_sw.cpp`.
 
+use serde::{Deserialize, Serialize};
 use crate::io::extract;
 
 pub mod backend;
@@ -72,7 +73,7 @@ const STAT_READY_FOR_DMA: u32 = 1 << 28;
 const GPU_VERSION: u32 = 2;
 
 /// Where GP0 is in the middle of a multi-word command or transfer.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Gp0State {
     /// Waiting for a command word.
     Command,
@@ -86,7 +87,7 @@ enum Gp0State {
 }
 
 /// A VRAM-to-CPU download in progress.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Download {
     x: usize,
     y: usize,
@@ -95,6 +96,7 @@ struct Download {
     index: usize,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Gpu {
     pub vram: Vram,
 

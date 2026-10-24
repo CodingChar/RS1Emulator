@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use crate::cdrom::CdRom;
 use crate::gpu::Gpu;
 use crate::io::{extract, merge};
@@ -55,6 +56,7 @@ const MAX_LIST_NODES: u32 = 0x8_0000;
 ///
 /// Transfers complete instantly when they start, instead of stalling the CPU
 /// for as long as the real hardware would.
+#[derive(Serialize, Deserialize)]
 pub struct Dma {
     /// One 32-bit word per register, indexed by `(address - 0x1F801080) / 4`.
     pub registers: [u32; 32],

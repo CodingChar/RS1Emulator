@@ -17,6 +17,7 @@
 //!
 //! Mirrors DuckStation's `sio.cpp`.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 use super::ControllerManager;
@@ -56,6 +57,7 @@ const ACK_WIDTH: u32 = 100;
 const BAUD_MULTIPLIER: [u32; 4] = [1, 1, 16, 64];
 
 /// A byte on its way to the device and back.
+#[derive(Serialize, Deserialize)]
 struct Transfer {
     /// Cycles until the exchange completes.
     remaining: u32,
@@ -63,6 +65,7 @@ struct Transfer {
     response: Option<(u8, bool)>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Sio0 {
     mode: u16,
     control: u16,

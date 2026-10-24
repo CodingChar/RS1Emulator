@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use crate::io::{extract, merge};
 
 /// Interrupt sources, as bit numbers in `I_STAT` / `I_MASK`.
@@ -24,6 +25,7 @@ const IRQ_MASK: u32 = 0x7FF;
 /// Registers: `I_STAT` at `0x1F801070`, `I_MASK` at `0x1F801074`.
 ///
 /// Mirrors DuckStation's `interrupt_controller.cpp`.
+#[derive(Serialize, Deserialize)]
 pub struct InterruptController {
     pub stat: u32,
     pub mask: u32,

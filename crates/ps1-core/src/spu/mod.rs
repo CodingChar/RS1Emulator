@@ -5,6 +5,7 @@
 mod reverb;
 mod voice;
 
+use serde::{Deserialize, Serialize};
 use crate::cdrom::CdRom;
 use reverb::Reverb;
 use voice::{IrqWatch, Phase, Voice, VoiceRegs, SOUND_RAM_MASK, SOUND_RAM_SIZE};
@@ -59,11 +60,14 @@ const CYCLES_PER_SAMPLE: u32 = 768;
 const OUTPUT_LIMIT: usize = 44_100 * 2 * 2;
 
 /// Sound Processing Unit (SPU).
+#[derive(Serialize, Deserialize)]
 pub struct Spu {
     pub sound_ram: Vec<u8>,
     /// Register window, one entry per halfword from `0x1F801C00`.
+    #[serde(with = "crate::serde_arrays")]
     pub register_file: [u16; REGISTER_COUNT],
     /// Stereo interleaved samples ready for the host, in -1.0..1.0.
+    #[serde(skip)]
     pub output_buffer: Vec<f32>,
     pub sample_rate: u32,
     /// Current sound RAM address (bytes) for CPU/DMA transfers.

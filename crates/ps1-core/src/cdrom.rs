@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 use crate::disc::{
@@ -74,13 +75,14 @@ const AUDIO_QUEUE_LIMIT: usize = 44_100 * 2;
 const COMMAND_LOG_LIMIT: usize = 256;
 
 /// A command the CPU issued, kept for debugging.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandRecord {
     pub command: u8,
     pub parameters: Vec<u8>,
 }
 
 /// A response waiting for its delivery time.
+#[derive(Serialize, Deserialize)]
 struct Scheduled {
     /// CPU cycles to wait after the previous response was delivered.
     delay: u32,
@@ -97,7 +99,10 @@ struct Scheduled {
 /// from the data FIFO, usually by DMA channel 3.
 ///
 /// Mirrors DuckStation's `cdrom.cpp`.
+#[derive(Serialize, Deserialize)]
 pub struct CdRom {
+    /// The disc is not part of a save state: the same one must be inserted.
+    #[serde(skip)]
     pub disc: Option<Disc>,
     /// Position of the read head (LBA of the next sector to read).
     pub current_sector: u32,

@@ -17,6 +17,7 @@ pub mod interrupt;
 pub mod io;
 pub mod mdec;
 pub mod profile;
+mod serde_arrays;
 pub mod memory;
 pub mod save_state;
 pub mod settings;

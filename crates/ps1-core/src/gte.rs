@@ -6,6 +6,7 @@
 //! encoded in the COP2 instruction.
 //!
 //! Mirrors DuckStation's `gte.cpp`.
+use serde::{Deserialize, Serialize};
 
 // ----- Data register indices (cop2r0-31) -----
 const VXY0: usize = 0;
@@ -85,7 +86,7 @@ type Matrix = [[i32; 3]; 3];
 type Vector = [i32; 3];
 
 /// The Geometry Transformation Engine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gte {
     /// Data registers (`cop2r0`-`cop2r31`), stored as written.
     pub data: [u32; 32],

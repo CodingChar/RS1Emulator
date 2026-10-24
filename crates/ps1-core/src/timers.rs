@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use crate::gpu::VideoTiming;
 use crate::interrupt::{InterruptController, IRQ_TIMER0};
 use crate::io::{extract, merge};
@@ -46,6 +47,7 @@ pub struct TimerClocks {
 /// and 1 free-run regardless of their sync setting.
 ///
 /// Mirrors DuckStation's `timers.cpp` / `timing_event.cpp`.
+#[derive(Serialize, Deserialize)]
 pub struct Timers {
     pub counter: [u32; 3],
     pub mode: [u32; 3],

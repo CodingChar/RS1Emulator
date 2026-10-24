@@ -11,6 +11,7 @@
 //! * **Get ID** `S` — `flag, 5A, 5D, 5C, 5D, 04, 00, 00, 80`.
 //!
 //! Mirrors DuckStation's `memory_card.cpp`.
+use serde::{Deserialize, Serialize};
 
 pub const FRAME_SIZE: usize = 128;
 pub const FRAME_COUNT: usize = 1024;
@@ -23,6 +24,7 @@ const WRITE_GOOD: u8 = 0x47; // 'G'
 const WRITE_BAD_CHECKSUM: u8 = 0x4E; // 'N'
 const WRITE_BAD_SECTOR: u8 = 0xFF;
 
+#[derive(Serialize, Deserialize)]
 pub struct MemoryCard {
     data: Vec<u8>,
     flag: u8,
@@ -87,12 +89,17 @@ impl MemoryCard {
         self.dirty = false;
     }
 
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     fn frame(&self, index: usize) -> &[u8] {
         &self.data[index * FRAME_SIZE..(index + 1) * FRAME_SIZE]
     }
 }
 
 /// One serial exchange with a card, from the address byte to the last reply.
+#[derive(Serialize, Deserialize)]
 pub struct CardSession {
     step: usize,
     command: u8,
@@ -101,6 +108,7 @@ pub struct CardSession {
     previous_tx: u8,
     checksum: u8,
     received_checksum: u8,
+    #[serde(with = "crate::serde_arrays")]
     buffer: [u8; FRAME_SIZE],
 }
 

@@ -128,12 +128,12 @@ pub struct Bus {
     /// Serial port 0: controllers and memory cards.
     pub sio0: Sio0,
     /// Serial port 1 (link cable) registers, not emulated.
-    sio1: StubRegs,
+    pub(crate) sio1: StubRegs,
     /// Motion decoder (FMV video decompression).
     pub mdec: Mdec,
     /// DMA channel 1 was started before the MDEC had produced enough data and
     /// finishes as soon as it has.
-    mdec_out_waiting: bool,
+    pub(crate) mdec_out_waiting: bool,
 
     /// First accesses to unclaimed I/O addresses (see `unhandled_io_count`).
     pub unhandled_io: Vec<UnhandledIo>,
@@ -224,6 +224,13 @@ impl Bus {
             .min(self.sio0.cycles_until_event())
             .min(self.spu.cycles_until_event())
             .max(1)
+    }
+
+    /// Forget the scheduling state after the devices were replaced wholesale
+    /// (loading a save state): nothing is pending and the deadline is recomputed.
+    pub(crate) fn restart_scheduling(&mut self) {
+        self.pending_cycles = 0;
+        self.deadline = self.compute_deadline();
     }
 
     /// The physical address of a virtual one (the segment bits dropped).

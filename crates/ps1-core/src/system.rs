@@ -2,7 +2,6 @@ use crate::bus::Bus;
 use crate::controllers::memory_card::MemoryCard;
 use crate::cpu::interpreter::Interpreter;
 use crate::gpu::CPU_CYCLES_PER_FRAME;
-use crate::save_state::SaveState;
 use crate::types::Ps1Result;
 
 /// Top-level PS1 emulation system.
@@ -168,18 +167,12 @@ impl System {
 
     /// Save the entire machine state (for save states).
     pub fn save_state(&mut self) -> Vec<u8> {
-        self.sync();
-        let state = SaveState::from_system(self);
-        bincode::serialize(&state).expect("save state serialization failed")
+        crate::save_state::save(self)
     }
 
     /// Load a previously saved machine state.
     pub fn load_state(&mut self, data: &[u8]) -> Ps1Result<()> {
-        let state: SaveState = bincode::deserialize(data)
-            .map_err(|e| crate::types::Ps1Error::Io(e.to_string()))?;
-        state.apply_to_system(self);
-        self.bus.sync_devices();
-        Ok(())
+        crate::save_state::load(self, data)
     }
 
     /// Set input state for a controller port.

@@ -8,6 +8,7 @@
 //! Decoding completes instantly when the last input word arrives, instead of
 //! taking the time the real chip needs.
 
+use serde::{Deserialize, Serialize};
 use crate::io::extract;
 
 /// Command in the top three bits of the command word.
@@ -37,7 +38,7 @@ const ZIGZAG: [usize; 64] = [
 ];
 
 /// Pixel format of the decoded data.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Depth {
     Bits4,
     Bits8,
@@ -46,7 +47,7 @@ enum Depth {
 }
 
 /// What the words following a command word are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Pending {
     Nothing,
     Decode { depth: Depth, signed: bool, bit15: bool },
@@ -54,6 +55,7 @@ enum Pending {
     ScaleTable,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Mdec {
     /// Last command word, for the format bits of the status register.
     command: u32,
@@ -63,9 +65,12 @@ pub struct Mdec {
     /// Parameter words received so far.
     params: Vec<u32>,
     /// Luma and chroma quantization tables, in natural (row-major) order.
+    #[serde(with = "crate::serde_arrays")]
     luma_quant: [u8; 64],
+    #[serde(with = "crate::serde_arrays")]
     chroma_quant: [u8; 64],
     /// IDCT matrix as signed 16-bit fixed point, `scale[frequency * 8 + x]`.
+    #[serde(with = "crate::serde_arrays")]
     scale: [i16; 64],
     /// Decoded output not yet read, and the position of the next word.
     output: Vec<u32>,

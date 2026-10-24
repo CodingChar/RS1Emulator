@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use crate::bus::Bus;
 use crate::gte::Gte;
 use crate::types::{Ps1Error, Ps1Result};
@@ -106,6 +107,7 @@ type Exec = Result<(), Trap>;
 /// - **load delay slot**: a loaded register only changes after the following
 ///   instruction has executed;
 /// - **COP0 exceptions**, with the 3-deep KU/IE mode stack in `SR`.
+#[derive(Serialize, Deserialize)]
 pub struct Interpreter {
     /// General-purpose registers r0–r31 (r0 is hardwired to 0).
     pub regs: [u32; 32],

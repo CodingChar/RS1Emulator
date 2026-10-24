@@ -1,5 +1,6 @@
 //! One of the SPU's 24 voices: ADPCM decoding, pitch counter, interpolation,
 //! the ADSR envelope and the volume sweeps.
+use serde::{Deserialize, Serialize};
 
 pub const SOUND_RAM_SIZE: usize = 512 * 1024;
 pub const SOUND_RAM_MASK: usize = SOUND_RAM_SIZE - 1;
@@ -16,7 +17,7 @@ const FLAG_LOOP_END: u8 = 1 << 0;
 const FLAG_LOOP_REPEAT: u8 = 1 << 1;
 const FLAG_LOOP_START: u8 = 1 << 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
     Off,
     Attack,
@@ -54,7 +55,7 @@ pub fn tick_level(level: i32, counter: &mut u32, rate: Rate) -> i32 {
 }
 
 /// A volume register: either a fixed value or a sweep towards a target.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Volume {
     level: i32,
     counter: u32,
@@ -95,6 +96,7 @@ pub struct VoiceRegs {
     pub adsr_high: u16,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Voice {
     pub phase: Phase,
     /// ADSR level, 0..=0x7FFF.

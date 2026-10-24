@@ -1,6 +1,7 @@
 //! SPU reverb: a network of comb and all-pass filters whose delay lines live
 //! in the top of sound RAM, run at 22.05 kHz.
 
+use serde::{Deserialize, Serialize};
 use super::voice::SOUND_RAM_SIZE;
 
 // Indices into the 32 reverb registers (`0x1F801DC0..0x1F801E00`).
@@ -44,6 +45,7 @@ fn mul(value: i32, volume: u16) -> i32 {
     (value * (volume as i16 as i32)) >> 15
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Reverb {
     /// Offset of the "current" position from the start of the work area.
     pub current: usize,

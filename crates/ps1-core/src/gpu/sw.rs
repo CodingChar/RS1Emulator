@@ -6,6 +6,7 @@
 //! drawing area clip.
 //!
 //! Mirrors DuckStation's `gpu_sw_rasterizer.cpp`.
+use serde::{Deserialize, Serialize};
 
 pub const VRAM_WIDTH: usize = 1024;
 pub const VRAM_HEIGHT: usize = 512;
@@ -24,7 +25,7 @@ const DITHER: [[i32; 4]; 4] = [
 ];
 
 /// 1 MB of video memory as 1024x512 15-bit pixels.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Vram {
     pub pixels: Vec<u16>,
 }
@@ -51,7 +52,7 @@ impl Default for Vram {
 }
 
 /// Inclusive clip rectangle set with GP0(E3h)/(E4h).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrawArea {
     pub left: i32,
     pub top: i32,
@@ -60,7 +61,7 @@ pub struct DrawArea {
 }
 
 /// Texture window (GP0 E2h): in units of 8 texels.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextureWindow {
     pub mask_x: u32,
     pub mask_y: u32,
@@ -69,7 +70,7 @@ pub struct TextureWindow {
 }
 
 /// Global drawing state shared by every primitive.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DrawSettings {
     pub area: DrawArea,
     pub offset_x: i32,

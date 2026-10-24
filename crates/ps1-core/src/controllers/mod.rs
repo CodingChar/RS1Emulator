@@ -2,6 +2,7 @@ pub mod memory_card;
 pub mod pad;
 pub mod sio;
 
+use serde::{Deserialize, Serialize};
 use bitflags::bitflags;
 use memory_card::{CardSession, MemoryCard};
 
@@ -28,11 +29,26 @@ bitflags! {
     }
 }
 
+/// Saves a button mask as its bits.
+mod buttons_bits {
+    use super::Buttons;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(buttons: &Buttons, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u16(buttons.bits())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Buttons, D::Error> {
+        Ok(Buttons::from_bits_truncate(u16::deserialize(deserializer)?))
+    }
+}
+
 /// State of a single controller port.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ControllerState {
     /// Whether a pad is plugged in.
     pub connected: bool,
+    #[serde(with = "buttons_bits")]
     pub buttons: Buttons,
     pub left_stick_x: i8,
     pub left_stick_y: i8,
@@ -41,6 +57,7 @@ pub struct ControllerState {
 }
 
 /// Where a serial exchange with a port's device currently stands.
+#[derive(Serialize, Deserialize)]
 enum Session {
     /// Waiting for the address byte that picks pad or memory card.
     Start,
@@ -53,6 +70,7 @@ enum Session {
 
 /// The devices on the two serial ports: pads (up to 8 slots, for multitap)
 /// and memory cards.
+#[derive(Serialize, Deserialize)]
 pub struct ControllerManager {
     pub ports: [ControllerState; 8],
     /// Memory cards in slots 1 and 2.

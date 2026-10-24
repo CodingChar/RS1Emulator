@@ -3,6 +3,7 @@
 //! The CPU can access most I/O registers as 8, 16 or 32 bits. Devices keep
 //! their registers as 32-bit words and use [`extract`] / [`merge`] to serve
 //! partial-width accesses at any byte offset.
+use serde::{Deserialize, Serialize};
 
 /// Read `width` bytes (1, 2 or 4) at byte offset `off` out of a 32-bit register.
 pub fn extract(word: u32, off: u32, width: u32) -> u32 {
@@ -51,6 +52,7 @@ pub fn write_le(bytes: &mut [u8], off: usize, width: u32, value: u32) {
 
 /// A block of plain read/write registers for a device that is not emulated
 /// yet: writes are remembered and read back, and nothing else happens.
+#[derive(Serialize, Deserialize)]
 pub struct StubRegs {
     bytes: Vec<u8>,
 }

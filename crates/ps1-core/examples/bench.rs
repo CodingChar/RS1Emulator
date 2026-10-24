@@ -6,6 +6,13 @@
 //! cargo run --release -p ps1-core --example bench --target <host triple> -- \
 //!     --bios path/to/bios.bin [--disc game.cue] [--steps 100000000]
 //! ```
+//!
+//! Other modes: `--synthetic alu|mem|branch` times endless loops instead of a
+//! BIOS, `--press MASK@FIRST-LAST` holds buttons between two instructions,
+//! `--frames N` runs whole video frames like the web frontend, and
+//! `--roundtrip FIRST,SECOND` checks that a save state taken after FIRST
+//! instructions makes a fresh machine continue exactly like the original.
+//! Built with `--features profile` it also prints the share of time per area.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -46,6 +53,49 @@ fn synthetic_program(kind: &str) -> Vec<u32> {
     }
 }
 
+/// A checksum of the whole machine state: screen, registers, RAM, audio.
+fn digest(sys: &mut System) -> u64 {
+    sys.sync();
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    fnv(&mut hash, &sys.framebuffer());
+    for reg in sys.cpu.regs {
+        fnv(&mut hash, &reg.to_le_bytes());
+    }
+    fnv(&mut hash, &sys.cpu.pc.to_le_bytes());
+    fnv(&mut hash, &sys.cpu.hi.to_le_bytes());
+    fnv(&mut hash, &sys.cpu.lo.to_le_bytes());
+    for reg in sys.cpu.cp0 {
+        fnv(&mut hash, &reg.to_le_bytes());
+    }
+    for sample in &sys.bus.spu.output_buffer {
+        fnv(&mut hash, &sample.to_le_bytes());
+    }
+    fnv(&mut hash, sys.bus.memory.ram.as_slice());
+    hash
+}
+
+/// Run from instruction `from` to `to`, applying the scripted button presses
+/// (checked every 4096 instructions).
+fn run_range(sys: &mut System, from: u64, to: u64, presses: &[(u16, u64, u64)]) {
+    let mut held = 0u16;
+    let mut done = from;
+    while done < to {
+        if !presses.is_empty() {
+            let mask = presses
+                .iter()
+                .filter(|(_, first, last)| done >= *first && done < *last)
+                .fold(0, |m, (bits, _, _)| m | bits);
+            if mask != held {
+                held = mask;
+                sys.set_input(0, held, 0, 0, 0, 0);
+            }
+        }
+        let chunk = (to - done).min(4096);
+        sys.run_cycles(chunk).expect("run");
+        done += chunk;
+    }
+}
+
 fn main() {
     let mut synthetic: Option<String> = None;
     let mut bios = None;
@@ -53,6 +103,7 @@ fn main() {
     let mut steps: u64 = 100_000_000;
     let mut cpu_only = false;
     let mut frames: Option<u64> = None;
+    let mut roundtrip: Option<(u64, u64)> = None;
     // (button mask, first step, last step): held between the two steps.
     let mut presses: Vec<(u16, u64, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -71,6 +122,14 @@ fn main() {
                 let mask = u16::from_str_radix(mask.trim_start_matches("0x"), 16).expect("mask");
                 presses.push((mask, first.parse().expect("first"), last.parse().expect("last")));
             }
+            "--roundtrip" => {
+                let text = value();
+                let (first, second) = text.split_once(',').expect("--roundtrip FIRST,SECOND");
+                roundtrip = Some((
+                    first.replace('_', "").parse().expect("first"),
+                    second.replace('_', "").parse().expect("second"),
+                ));
+            }
             "--frames" => frames = Some(value().parse().expect("--frames")),
             "--steps" => steps = value().replace('_', "").parse().expect("--steps"),
             other => panic!("unknown argument {other}"),
@@ -84,14 +143,40 @@ fn main() {
 
     let mut sys = System::new();
     sys.load_bios(&bios).expect("load BIOS");
-    if let Some(cue) = disc {
-        sys.insert_disc_image(open_disc(&cue).expect("open disc"));
+    if let Some(cue) = &disc {
+        sys.insert_disc_image(open_disc(cue).expect("open disc"));
     }
     sys.reset().expect("reset");
     if let Some(kind) = &synthetic {
         for (i, word) in synthetic_program(kind).iter().enumerate() {
             sys.bus.memory.ram.write32(0x1_0000 + i * 4, *word);
         }
+    }
+
+    if let Some((first, second)) = roundtrip {
+        run_range(&mut sys, 0, first, &presses);
+        let state = sys.save_state();
+        println!("saved a state of {} bytes after {first} instructions", state.len());
+        // Audio already produced is not part of a state; start both runs empty.
+        sys.bus.spu.output_buffer.clear();
+        run_range(&mut sys, first, first + second, &[]);
+        let original = digest(&mut sys);
+
+        let mut other = System::new();
+        other.load_bios(&bios).expect("load BIOS");
+        if let Some(cue) = &disc {
+            other.insert_disc_image(open_disc(cue).expect("open disc"));
+        }
+        other.reset().expect("reset");
+        other.load_state(&state).expect("load state");
+        run_range(&mut other, first, first + second, &[]);
+        let restored = digest(&mut other);
+        let same = original == restored;
+        println!(
+            "original {original:016X}, restored {restored:016X}: {}",
+            if same { "IDENTICAL" } else { "DIFFERENT" }
+        );
+        std::process::exit(if same { 0 } else { 1 });
     }
 
     #[cfg(feature = "profile")]
@@ -125,24 +210,7 @@ fn main() {
         }
         steps = sys.cycles;
     } else {
-        // Scripted button presses are checked every 4096 instructions.
-        let mut held = 0u16;
-        let mut done = 0u64;
-        while done < steps {
-            if !presses.is_empty() {
-                let mask = presses
-                    .iter()
-                    .filter(|(_, first, last)| done >= *first && done < *last)
-                    .fold(0, |m, (bits, _, _)| m | bits);
-                if mask != held {
-                    held = mask;
-                    sys.set_input(0, held, 0, 0, 0, 0);
-                }
-            }
-            let chunk = (steps - done).min(4096);
-            sys.run_cycles(chunk).expect("run");
-            done += chunk;
-        }
+        run_range(&mut sys, 0, steps, &presses);
     }
     sys.sync();
     let elapsed = start.elapsed().as_secs_f64();
@@ -160,21 +228,7 @@ fn main() {
             }
         }
     }
-    let mut hash = 0xCBF2_9CE4_8422_2325u64;
-    fnv(&mut hash, &sys.framebuffer());
-    for reg in sys.cpu.regs {
-        fnv(&mut hash, &reg.to_le_bytes());
-    }
-    fnv(&mut hash, &sys.cpu.pc.to_le_bytes());
-    fnv(&mut hash, &sys.cpu.hi.to_le_bytes());
-    fnv(&mut hash, &sys.cpu.lo.to_le_bytes());
-    for reg in sys.cpu.cp0 {
-        fnv(&mut hash, &reg.to_le_bytes());
-    }
-    for sample in &sys.bus.spu.output_buffer {
-        fnv(&mut hash, &sample.to_le_bytes());
-    }
-    fnv(&mut hash, &sys.bus.memory.ram.as_slice().to_vec());
+    let hash = digest(&mut sys);
     println!(
         "{steps} instructions in {elapsed:.2} s = {:.2} M instr/s ({:.0} % of real time)",
         steps as f64 / elapsed / 1e6,
