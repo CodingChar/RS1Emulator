@@ -898,11 +898,23 @@ fn gte_state_is_cleared_by_cpu_reset() {
 }
 
 #[test]
-fn bus_failures_are_fatal_errors_not_cpu_exceptions() {
+fn unmapped_data_accesses_raise_bus_errors() {
+    // A load and a store to a region nothing answers.
     let mut m = Machine::new(&[lui(1, 0xBFA0), lw(2, 0, 1), NOP]);
-    m.run(1);
-    let result = m.cpu.step(&mut m.bus);
-    assert!(matches!(result, Err(Ps1Error::MemoryOutOfRange(_))));
+    m.run(2);
+    assert_eq!(m.exc_code(), Exception::BusErrorData as u32);
+    assert_eq!(m.cpu.cp0[COP0_EPC], CODE + 4);
+
+    let mut m = Machine::new(&[lui(1, 0xBFA0), sw(0, 0, 1), NOP]);
+    m.run(2);
+    assert_eq!(m.exc_code(), Exception::BusErrorData as u32);
+}
+
+#[test]
+fn fetching_from_unmapped_memory_raises_a_bus_error() {
+    let mut m = Machine::new(&[lui(1, 0xBFA0), jr(1), NOP]);
+    m.run(4);
+    assert_eq!(m.exc_code(), Exception::BusErrorFetch as u32);
 }
 
 #[test]
