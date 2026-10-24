@@ -13,7 +13,8 @@ Marca `[x]` al completar cada ítem.
 ## Fase 0 — Base de pruebas (en paralelo con la Fase 1)
 
 - [x] Tests unitarios en `ps1-core` (`cargo test -p ps1-core --target x86_64-pc-windows-msvc`): CPU, bus y save state.
-- [ ] Documentar en el README cómo compilar/testear en host, ya que `.cargo/config.toml` fuerza `wasm32-unknown-unknown`.
+- [x] Documentar en el README cómo compilar/testear en host, ya que `.cargo/config.toml` fuerza `wasm32-unknown-unknown`.
+- [x] Harness de arranque `cargo run -p ps1-core --example boot` y test que valida la imagen de disco local en `rom_test/` (se omite si no existe; la carpeta está en `.gitignore`).
 - [ ] Integrar ROMs de test de CPU de dominio público (p. ej. `psxtest_cpu`, suite de `amidog`), sin incluir BIOS ni juegos.
 - [ ] CI básico: `cargo check`, `cargo test` y build wasm.
 
@@ -47,22 +48,23 @@ Archivo: `crates/ps1-core/src/cpu/interpreter.rs`
 - [ ] Temporización de `mult`/`div` y de los accesos a memoria; interlocks de HI/LO.
 - [ ] Instrucciones COP2 y `lwc2`/`swc2` (dependen de la Fase 8).
 
-## Fase 2 — Bus y mapa de memoria · prioridad máxima (junto con la Fase 1)
+## Fase 2 — Bus y mapa de memoria · HECHA (faltan excepciones de bus)
 
 Archivo: `crates/ps1-core/src/bus.rs`
 
 - [x] Traducción de segmentos: KUSEG, KSEG0 (`0x8000_0000`), KSEG1 (`0xA000_0000`); aplicar máscara en vez de comparar con `0x8000_0000`.
-- [ ] Mapa físico correcto: ya cubre RAM (2 MB con espejos x4) y BIOS (solo lectura); faltan I/O (`0x1F80_1000`+) y regiones de expansión.
+- [x] Mapa físico correcto: RAM (2 MB con espejos x4), expansión 1 (bus abierto), scratchpad, I/O + expansión 2, BIOS (solo lectura) y cache control en KSEG2.
 - [x] Accesos de 8, 16 y 32 bits reales (`read8`/`read16`/`read32` y `write*`), sin truncar palabras.
-- [ ] Scratchpad real (hoy devuelve 0).
-- [ ] Registros de I/O: interrupt stat/mask, DMA, timers, GPU (GP0/GP1), CD-ROM, SPU, pads/memory cards (SIO), MDEC.
-- [ ] Registros de configuración de memoria (`0x1F80_1000`–`0x1F80_1060`) y cache control (`0xFFFE_0130`).
+- [x] Scratchpad real (1 KB).
+- [x] Registros de I/O mapeados: interrupt stat/mask, DMA, timers, GPU (GP0/GP1/GPUSTAT), CD-ROM, SPU, SIO y MDEC. El comportamiento real de cada dispositivo llega en su fase; CD-ROM, SIO y MDEC son por ahora registros que devuelven lo escrito.
+- [ ] Registrar en el bus los accesos a direcciones de I/O sin dispositivo (hecho: `Bus::unhandled_io`) y revisarlos al arrancar la BIOS real.
+- [x] Registros de configuración de memoria (`0x1F80_1000`–`0x1F80_1060`) y cache control (`0xFFFE_0130`).
 - [ ] Alineación y excepciones de bus (`MemoryOutOfRange` hoy aborta la emulación).
-- [ ] Reemplazar los `memory: &mut Memory` repartidos por un diseño donde el bus sea dueño de los dispositivos (evita pasar `Memory` a todos los `step`).
+- [x] El bus es dueño de la memoria y de los dispositivos; la CPU solo recibe `&mut Bus`.
 
 ## Fase 3 — Temporización, interrupciones y timers
 
-- [ ] Controlador de interrupciones: `stat`/`mask`, enrutado a COP0 CAUSE bit 10 (`interrupt.rs`, hoy `step` no hace nada).
+- [x] Controlador de interrupciones: `I_STAT`/`I_MASK` y enrutado a COP0 CAUSE bit 10 (`System::step`). Faltan las fuentes (VBlank, timers, DMA, CD-ROM...).
 - [ ] Timers 0, 1, 2 con fuentes de reloj (sysclk, dotclock, hblank, sysclk/8), modos y IRQ (`timers.rs`).
 - [ ] Planificador por eventos (como `timing_event` de DuckStation) en lugar de avanzar todos los componentes un ciclo por instrucción.
 - [ ] Constantes de vídeo reales: ciclos por línea y por cuadro NTSC/PAL (hoy `cycles_per_frame = 3413`, que es un ciclo de línea, no de cuadro).
@@ -74,6 +76,7 @@ Hito: la BIOS llega a la pantalla de arranque / shell.
 
 - [ ] Cargar BIOS vía UI web (selector de archivo) y vía host.
 - [ ] Validar tamaño/checksum de la BIOS.
+- [x] Harness `examples/boot.rs`: ejecuta N instrucciones, imprime los códigos POST, los últimos `pc` y los accesos a I/O sin dispositivo.
 - [ ] Traza de ejecución y desensamblador para depurar (cpu trace, opcional detrás de feature flag).
 - [ ] Soporte para ejecutables PS-EXE para pruebas sin disco.
 

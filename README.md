@@ -35,6 +35,30 @@ trunk build --release --dir dist
 
 Then serve `dist/` with any static file server.
 
+## Testing
+
+`.cargo/config.toml` builds for `wasm32-unknown-unknown` by default, so run the
+host tests with an explicit target (use your own host triple):
+
+```bash
+cargo test -p ps1-core --target x86_64-pc-windows-msvc
+```
+
+### Test ROMs and BIOS
+
+Game discs and BIOS dumps are copyrighted and are **never committed**: the
+`rom_test/` folder, disc images (`*.bin`, `*.cue`, `*.iso`, ...), BIOS dumps
+and memory cards are listed in `.gitignore`. To test against a real disc, put
+it under `rom_test/`; `tests/disc_image.rs` uses it when present and skips
+itself otherwise.
+
+The boot harness inspects a disc and runs a BIOS you supply:
+
+```bash
+cargo run -p ps1-core --example boot --target x86_64-pc-windows-msvc -- \
+    --disc "rom_test/<game>/<game>.cue" --bios path/to/bios.bin --steps 20000000
+```
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for the pending work, ordered by priority.
