@@ -13,7 +13,7 @@
 //! checksum tests in `examples/bench.rs` check that over billions of
 //! instructions.
 
-use super::{Interpreter, COP0_SR, SR_ISC, SR_KUC};
+use super::{Interpreter, COP0_SR, SR_CU2, SR_ISC, SR_KUC};
 use crate::bus::Bus;
 use crate::io::{read_le, write_le};
 
@@ -41,6 +41,7 @@ impl Interpreter {
         let sr = self.cp0[COP0_SR];
         let user_mode = sr & SR_KUC != 0;
         let cache_isolated = sr & SR_ISC != 0;
+        let cop2_usable = sr & SR_CU2 != 0;
 
         let mut pc = self.pc;
         let mut next_pc = self.next_pc;
@@ -424,7 +425,75 @@ impl Interpreter {
                         break;
                     }
                 }
-                // COP0, COP2, LWL/LWR/SWL/SWR, LWC2/SWC2, reserved opcodes...
+                // ---- the GTE (COP2); without SR.CU2 these raise an exception
+                0x12 => {
+                    if !cop2_usable {
+                        break;
+                    }
+                    let rd = ((instr >> 11) & 0x1F) as usize;
+                    if instr & (1 << 25) != 0 {
+                        // A GTE command rather than a register move.
+                        commit!();
+                        self.gte.execute(instr & 0x01FF_FFFF);
+                    } else {
+                        match rs {
+                            // MFC2 / CFC2 are loads and have a load delay.
+                            0x00 => {
+                                commit!();
+                                let value = self.gte.read_data(rd);
+                                load!(rt, value);
+                            }
+                            0x02 => {
+                                commit!();
+                                let value = self.gte.read_control(rd);
+                                load!(rt, value);
+                            }
+                            0x04 => {
+                                commit!();
+                                self.gte.write_data(rd, self.regs[rt]);
+                            }
+                            0x06 => {
+                                commit!();
+                                self.gte.write_control(rd, self.regs[rt]);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                // LWC2: a word straight into a GTE data register (no load delay).
+                0x32 => {
+                    if !cop2_usable {
+                        break;
+                    }
+                    let phys = data_address!(self.regs[rs].wrapping_add(simm), 3);
+                    let value = if phys < RAM_MIRROR_END {
+                        bus.memory.ram.read32(phys as usize)
+                    } else if phys.wrapping_sub(SCRATCHPAD_START) < SCRATCHPAD_SIZE {
+                        read_le(&bus.scratchpad, (phys & 0x3FF) as usize, 4)
+                    } else {
+                        break;
+                    };
+                    commit!();
+                    self.gte.write_data(rt, value);
+                }
+                // SWC2: store a GTE data register.
+                0x3A => {
+                    if !cop2_usable || cache_isolated {
+                        break;
+                    }
+                    let phys = data_address!(self.regs[rs].wrapping_add(simm), 3);
+                    let value = self.gte.read_data(rt);
+                    if phys < RAM_MIRROR_END {
+                        commit!();
+                        bus.memory.ram.write32(phys as usize, value);
+                    } else if phys.wrapping_sub(SCRATCHPAD_START) < SCRATCHPAD_SIZE {
+                        commit!();
+                        write_le(&mut bus.scratchpad, (phys & 0x3FF) as usize, 4, value);
+                    } else {
+                        break;
+                    }
+                }
+                // COP0, LWL/LWR/SWL/SWR, reserved opcodes...
                 _ => break,
             }
 
