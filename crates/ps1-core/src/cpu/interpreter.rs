@@ -132,9 +132,10 @@ pub struct Interpreter {
     /// The instruction just executed was a branch/jump.
     branch_pending: bool,
     /// Load issued by the previous instruction; lands after the current one.
-    pending_load: Option<(usize, u32)>,
+    /// Register 0 stands for "no load" (loads into r0 are discarded anyway).
+    pending_load: (usize, u32),
     /// Load issued by the current instruction; becomes `pending_load`.
-    next_load: Option<(usize, u32)>,
+    next_load: (usize, u32),
 }
 
 impl Interpreter {
@@ -151,8 +152,8 @@ impl Interpreter {
             current_pc: RESET_VECTOR,
             in_delay_slot: false,
             branch_pending: false,
-            pending_load: None,
-            next_load: None,
+            pending_load: (0, 0),
+            next_load: (0, 0),
         };
         cpu.cp0[COP0_SR] = SR_RESET;
         cpu.cp0[COP0_PRID] = PRID_R3000A;
@@ -189,7 +190,7 @@ impl Interpreter {
         self.current_pc = self.pc;
         self.in_delay_slot = self.branch_pending;
         self.branch_pending = false;
-        self.pending_load = self.next_load.take();
+        self.pending_load = std::mem::replace(&mut self.next_load, (0, 0));
 
         let result = if self.interrupt_pending() {
             Err(Trap::exception(Exception::Interrupt))
@@ -198,8 +199,10 @@ impl Interpreter {
         };
 
         // The delayed load lands now, unless the instruction overwrote it.
-        if let Some((reg, value)) = self.pending_load.take() {
+        let (reg, value) = self.pending_load;
+        if reg != 0 {
             self.regs[reg] = value;
+            self.pending_load.0 = 0;
         }
         self.regs[0] = 0;
 
@@ -270,8 +273,8 @@ impl Interpreter {
     /// Write a register immediately (also cancels a pending load to it).
     fn set_reg(&mut self, reg: usize, value: u32) {
         if reg != 0 {
-            if matches!(self.pending_load, Some((r, _)) if r == reg) {
-                self.pending_load = None;
+            if self.pending_load.0 == reg {
+                self.pending_load.0 = 0;
             }
             self.regs[reg] = value;
         }
@@ -280,19 +283,20 @@ impl Interpreter {
     /// Issue a load: the register changes after the next instruction.
     fn load_reg(&mut self, reg: usize, value: u32) {
         if reg != 0 {
-            if matches!(self.pending_load, Some((r, _)) if r == reg) {
-                self.pending_load = None;
+            if self.pending_load.0 == reg {
+                self.pending_load.0 = 0;
             }
-            self.next_load = Some((reg, value));
+            self.next_load = (reg, value);
         }
     }
 
     /// Current value of a register as seen by LWL/LWR, which can read the
     /// result of a load still in flight.
     fn reg_for_merge(&self, reg: usize) -> u32 {
-        match self.pending_load {
-            Some((r, v)) if r == reg => v,
-            _ => self.regs[reg],
+        if reg != 0 && self.pending_load.0 == reg {
+            self.pending_load.1
+        } else {
+            self.regs[reg]
         }
     }
 

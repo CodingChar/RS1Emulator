@@ -135,12 +135,26 @@ impl System {
     /// Run exactly one video frame's worth of cycles.
     pub fn run_frame(&mut self) -> Ps1Result<()> {
         self.cycles_per_frame = self.bus.gpu.cycles_per_frame();
-        self.frame_cycles_remaining = self.cycles_per_frame;
-        while self.frame_cycles_remaining > 0 {
-            self.step()?;
+        if !self.running {
+            return Ok(());
         }
+        // The same as calling `step` once per cycle, without its bookkeeping.
+        let mut executed = 0;
+        let result = loop {
+            if executed == self.cycles_per_frame {
+                break Ok(());
+            }
+            self.cpu.set_irq(self.bus.interrupt.pending());
+            if let Err(e) = self.cpu.step(&mut self.bus) {
+                break Err(e);
+            }
+            self.bus.tick(1);
+            executed += 1;
+        };
+        self.cycles += executed;
+        self.frame_cycles_remaining = self.cycles_per_frame - executed;
         self.sync();
-        Ok(())
+        result
     }
 
     /// Bring every device up to date with the CPU. Needed before reading device
