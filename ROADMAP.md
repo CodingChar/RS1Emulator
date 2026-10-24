@@ -2,11 +2,13 @@
 
 Estado actual: la CPU (R3000A) y el GTE están completos; el bus mapea RAM, BIOS,
 scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
-contadores reales, DMA y el controlador del CD-ROM con lectura de BIN/CUE (222 tests
-unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS arranca entera: identifica el
-disco (GetID → SCEA), lee su sistema de archivos y el ejecutable, llega al POST 0x09 y se
-queda esperando un byte del pad por el puerto serie (SIO0, Fase 9), que sigue siendo un
-stub. GPU, SPU y MDEC no existen todavía, así que el framebuffer sigue en negro.
+contadores reales, DMA, el controlador del CD-ROM con lectura de BIN/CUE y el puerto
+serie SIO0 con pad digital y memory cards (273 tests unitarios). Con una BIOS SCPH1001 real
+y un disco, la BIOS arranca entera: identifica el disco (GetID → SCEA), lee su sistema de
+archivos, carga el ejecutable del juego (verificado byte a byte contra el disco) y le cede
+el control. El juego queda esperando una cuenta de VSync que nunca avanza
+(`VSync` de libgpu, contador en `0x800BDE58`); GPU, SPU y MDEC no existen todavía, así que
+el framebuffer sigue en negro.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
 Marca `[x]` al completar cada ítem.
@@ -86,7 +88,8 @@ Hito: la BIOS llega a la pantalla de arranque / shell.
 - [ ] Traza de ejecución (cpu trace, opcional detrás de feature flag).
 - [x] Hito parcial: con `SCPH1001.BIN` la BIOS recorre los POST 0x01–0x07, instala el kernel en RAM, usa DMA/VBlank, inicializa el CD-ROM y reconoce el disco (GetID, lectura de los sectores de licencia).
 - [x] El bloqueo del GTE (`ctc2 t0, cop2r29`, tras ~137 M de instrucciones) quedó resuelto en la Fase 8; la BIOS alcanza el POST 0x09 (~172 M de instrucciones).
-- [ ] Siguiente bloqueo: bucle de espera en `JOY_STAT` (SIO0, Fase 9): el stub nunca marca "byte recibido".
+- [x] El bucle de espera en `JOY_STAT` (SIO0) quedó resuelto en la Fase 9: la BIOS arranca el juego (SLUS_001.70) y le cede el control.
+- [ ] Siguiente bloqueo: el juego queda en `VSync` (libgpu, `0x8007D6B8`) esperando que el contador `0x800BDE58` llegue a su objetivo; se llega con ~170 M de instrucciones y los punteros de libgpu (`0x800BDE60`/`64`) siguen a cero, así que probablemente `ResetGraph` no completó. Hace falta la GPU (Fase 5) para seguir investigándolo.
 - [ ] Hito: la BIOS muestra el logo de arranque (necesita CD-ROM y GPU).
 - [ ] Soporte para ejecutables PS-EXE para pruebas sin disco.
 
@@ -143,11 +146,15 @@ Archivo: `gte.rs`
 
 Archivos: `controllers/mod.rs`, `controllers/pad.rs`
 
-- [ ] Registros SIO0 (JOY_DATA, STAT, MODE, CTRL, BAUD) e IRQ.
-- [ ] Protocolo del pad digital (0x01 0x42), luego analógico (DualShock) y vibración.
-- [ ] Memory cards: protocolo y persistencia (IndexedDB desde `ps1-wasm`).
+- [x] Registros SIO0 (JOY_DATA, STAT, MODE, CTRL, BAUD) con FIFO de recepción, temporización por baudios, ACK e IRQ7.
+- [x] Protocolo del pad digital (0x01 0x42) y puerto vacío (la línea queda a 0xFF sin ACK).
+- [ ] Pad analógico (DualShock): modos 0x73/0x79, comandos de configuración (0x43, 0x44, 0x45...), palancas y vibración.
+- [x] Memory cards: lectura, escritura (con checksum y sector inválido) e ID; formato vacío válido; indicador de escritura (`dirty`) y API `System`/`Ps1` para insertar y extraer la imagen.
+- [ ] Persistencia de las memory cards en IndexedDB desde `ps1-web` (el núcleo ya expone `memory_card_data`/`memory_card_dirty`).
+- [ ] Guardar en el save state el estado de SIO0 y de las memory cards.
 - [ ] Teclado y gamepad API en `ps1-web` mapeados a `set_input`.
 - [ ] Multitap (el `ControllerManager` ya reserva 8 puertos).
+- [ ] SIO1 (puerto serie/cable link): hoy solo registros que devuelven lo escrito.
 
 ## Fase 10 — Audio (SPU)
 

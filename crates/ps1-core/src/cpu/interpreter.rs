@@ -119,6 +119,9 @@ pub struct Interpreter {
     pub cp0: [u32; 32],
     /// Coprocessor 2: the Geometry Transformation Engine.
     pub gte: Gte,
+    /// How many times each exception code (Cause.ExcCode) was taken since
+    /// reset, for debugging.
+    pub exception_counts: [u64; 16],
 
     /// Address of the instruction being executed (for EPC).
     current_pc: u32,
@@ -142,6 +145,7 @@ impl Interpreter {
             lo: 0,
             cp0: [0u32; 32],
             gte: Gte::new(),
+            exception_counts: [0; 16],
             current_pc: RESET_VECTOR,
             in_delay_slot: false,
             branch_pending: false,
@@ -225,6 +229,7 @@ impl Interpreter {
 
     /// Enter the exception handler.
     fn raise_exception(&mut self, code: Exception, bad_vaddr: Option<u32>, cop: u8) {
+        self.exception_counts[code as usize] += 1;
         let sr = self.cp0[COP0_SR];
         let handler = if sr & SR_BEV != 0 {
             EXCEPTION_VECTOR_BIOS

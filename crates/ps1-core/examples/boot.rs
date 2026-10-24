@@ -35,10 +35,12 @@ struct Args {
     peek: Vec<u32>,
     /// `(address, instruction count)` ranges disassembled after the run.
     disasm: Vec<(u32, u32)>,
+    /// Write RAM to a file after the run (`--dump-ram`).
+    dump_ram: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new() };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -56,6 +58,7 @@ fn parse_args() -> Result<Args, String> {
                 let hex = text.trim_start_matches("0x");
                 args.peek.push(u32::from_str_radix(hex, 16).map_err(|e| format!("--peek: {e}"))?)
             }
+            "--dump-ram" => args.dump_ram = Some(PathBuf::from(value("--dump-ram")?)),
             "--disasm" => {
                 let text = value("--disasm")?;
                 let (addr, count) = text.split_once(',').unwrap_or((&text, "16"));
@@ -90,7 +93,7 @@ fn main() {
     }
 
     match &args.bios {
-        Some(bios) => run_bios(bios, args.disc.as_deref(), args.steps, &args.peek, &args.disasm),
+        Some(bios) => run_bios(bios, args.disc.as_deref(), args.steps, &args.peek, &args.disasm, args.dump_ram.as_deref()),
         None => println!("\nNo --bios given: skipping CPU boot (a BIOS dump is required)."),
     }
 }
@@ -166,7 +169,14 @@ fn open_disc(cue: &Path) -> Result<Disc, String> {
     .map_err(|e| e.to_string())
 }
 
-fn run_bios(path: &Path, cue: Option<&Path>, steps: u64, peek: &[u32], ranges: &[(u32, u32)]) {
+fn run_bios(
+    path: &Path,
+    cue: Option<&Path>,
+    steps: u64,
+    peek: &[u32],
+    ranges: &[(u32, u32)],
+    dump_ram: Option<&Path>,
+) {
     let bios = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -245,6 +255,15 @@ fn run_bios(path: &Path, cue: Option<&Path>, steps: u64, peek: &[u32], ranges: &
     for record in sys.bus.cdrom.command_log.iter().take(40) {
         println!("  {:#04x} {:02X?}", record.command, record.parameters);
     }
+    let counts = &sys.cpu.exception_counts;
+    println!(
+        "exceptions: interrupts={} syscalls={} address-errors={}/{} other={}",
+        counts[0],
+        counts[8],
+        counts[4],
+        counts[5],
+        counts.iter().sum::<u64>() - counts[0] - counts[8] - counts[4] - counts[5]
+    );
     println!("registers:");
     for row in 0..8 {
         let cells: Vec<String> = (0..4)
@@ -267,6 +286,12 @@ fn run_bios(path: &Path, cue: Option<&Path>, steps: u64, peek: &[u32], ranges: &
         match sys.bus.read32(*addr) {
             Ok(v) => println!("  [{addr:#010X}] = {v:08X}"),
             Err(e) => println!("  [{addr:#010X}] = <{e}>"),
+        }
+    }
+    if let Some(path) = dump_ram {
+        match std::fs::write(path, sys.bus.memory.ram.as_slice()) {
+            Ok(()) => println!("RAM written to {}", path.display()),
+            Err(e) => eprintln!("dump-ram: {}: {e}", path.display()),
         }
     }
     for (start, count) in ranges {
