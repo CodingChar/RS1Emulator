@@ -219,7 +219,7 @@ impl Bus {
     fn compute_deadline(&self) -> u32 {
         self.gpu
             .cycles_until_vblank()
-            .min(self.timers.cycles_until_event())
+            .min(self.timers.cycles_until_event(&self.gpu.video_timing()))
             .min(self.cdrom.cycles_until_event())
             .min(self.sio0.cycles_until_event())
             .min(self.spu.cycles_until_event())

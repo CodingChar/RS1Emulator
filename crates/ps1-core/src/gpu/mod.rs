@@ -38,6 +38,20 @@ pub const CPU_CYCLES_PER_FRAME: u64 = (NTSC_LINES_PER_FRAME as u64
     * CPU_CYCLES_PER_11_GPU_CLOCKS as u64)
     / GPU_CLOCKS_PER_7_CPU_CYCLES as u64;
 
+/// When the video clocks that drive timers 0 and 1 will pulse next, as lower
+/// bounds in CPU cycles.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoTiming {
+    /// Until the next dot clock pulse.
+    pub next_dot: u32,
+    /// Between two dot clock pulses.
+    pub dot_period: u32,
+    /// Until the next horizontal blank.
+    pub next_hblank: u32,
+    /// Between two horizontal blanks.
+    pub hblank_period: u32,
+}
+
 /// What happened on screen while the GPU advanced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VideoTick {
@@ -282,6 +296,23 @@ impl Gpu {
             }
         }
         tick
+    }
+
+    /// Lower bounds on when the dot clock and hblank next pulse.
+    pub fn video_timing(&self) -> VideoTiming {
+        // gpu_clocks(c) = (remainder + 11 c) / 7 must reach `clocks`.
+        let cycles_for = |clocks: u32| {
+            (clocks * CPU_CYCLES_PER_11_GPU_CLOCKS).saturating_sub(self.clock_remainder)
+                / GPU_CLOCKS_PER_7_CPU_CYCLES
+        };
+        let divider = self.dot_clock_divider();
+        let per_line = self.clocks_per_line();
+        VideoTiming {
+            next_dot: cycles_for(divider - self.dot_remainder.min(divider - 1)),
+            dot_period: divider * CPU_CYCLES_PER_11_GPU_CLOCKS / GPU_CLOCKS_PER_7_CPU_CYCLES,
+            next_hblank: cycles_for(per_line - self.line_clock.min(per_line - 1)),
+            hblank_period: per_line * CPU_CYCLES_PER_11_GPU_CLOCKS / GPU_CLOCKS_PER_7_CPU_CYCLES,
+        }
     }
 
     /// A lower bound on the CPU cycles until the next vertical blank starts.

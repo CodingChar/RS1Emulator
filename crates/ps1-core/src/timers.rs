@@ -1,3 +1,4 @@
+use crate::gpu::VideoTiming;
 use crate::interrupt::{InterruptController, IRQ_TIMER0};
 use crate::io::{extract, merge};
 
@@ -22,10 +23,6 @@ const MODE_WRITABLE: u32 = 0x3FF;
 /// The counters are 16 bits wide.
 const COUNTER_OVERFLOW: u32 = 0x1_0000;
 
-/// Lower bounds on the CPU cycles between two pulses of each clock source,
-/// used to schedule the next possible timer event.
-const MIN_CYCLES_PER_DOT: u32 = 2;
-const MIN_CYCLES_PER_HBLANK: u32 = 2000;
 
 /// Clock pulses elapsed since the previous call to [`Timers::tick`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -94,20 +91,21 @@ impl Timers {
 
     /// A lower bound on the CPU cycles until a timer reaches its target or
     /// overflows (`u32::MAX` when none can).
-    pub fn cycles_until_event(&self) -> u32 {
+    pub fn cycles_until_event(&self, video: &VideoTiming) -> u32 {
         let mut next = u32::MAX;
         for timer in 0..3 {
             if self.is_halted(timer) {
                 continue;
             }
             let source = (self.mode[timer] >> MODE_CLOCK_SOURCE_SHIFT) & 3;
-            let cycles_per_pulse = match timer {
-                0 if source & 1 != 0 => MIN_CYCLES_PER_DOT,
-                1 if source & 1 != 0 => MIN_CYCLES_PER_HBLANK,
-                2 if source & 2 != 0 => 8,
-                _ => 1,
+            // (cycles until the first pulse, cycles between pulses) of the source
+            let (first, period) = match timer {
+                0 if source & 1 != 0 => (video.next_dot, video.dot_period),
+                1 if source & 1 != 0 => (video.next_hblank, video.hblank_period),
+                2 if source & 2 != 0 => (8 - self.div8_remainder, 8),
+                _ => (1, 1),
             };
-            next = next.min((self.ticks_until_event(timer) - 1) * cycles_per_pulse);
+            next = next.min(first + (self.ticks_until_event(timer) - 1) * period);
         }
         next
     }
