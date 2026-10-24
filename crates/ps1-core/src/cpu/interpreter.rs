@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+use crate::gte::Gte;
 use crate::types::{Ps1Error, Ps1Result};
 
 /// Address the CPU starts executing from after reset (start of the BIOS, KSEG1).
@@ -116,6 +117,8 @@ pub struct Interpreter {
     pub lo: u32,
     /// Coprocessor 0 registers.
     pub cp0: [u32; 32],
+    /// Coprocessor 2: the Geometry Transformation Engine.
+    pub gte: Gte,
 
     /// Address of the instruction being executed (for EPC).
     current_pc: u32,
@@ -138,6 +141,7 @@ impl Interpreter {
             hi: 0,
             lo: 0,
             cp0: [0u32; 32],
+            gte: Gte::new(),
             current_pc: RESET_VECTOR,
             in_delay_slot: false,
             branch_pending: false,
@@ -436,13 +440,7 @@ impl Interpreter {
             0x0F => self.set_reg(rt, imm << 16),
             0x10 => self.execute_cop0(instr)?,
             0x11 => return Err(Trap::coprocessor_unusable(1)),
-            0x12 => {
-                if self.cp0[COP0_SR] & SR_CU2 == 0 {
-                    return Err(Trap::coprocessor_unusable(2));
-                }
-                // TODO: GTE (COP2) instructions.
-                return Err(Trap::Fatal(Ps1Error::UnimplementedOpcode(instr)));
-            }
+            0x12 => self.execute_cop2(instr)?,
             0x13 => return Err(Trap::coprocessor_unusable(3)),
             0x20 => {
                 let addr = self.regs[rs].wrapping_add(simm);
@@ -537,12 +535,18 @@ impl Interpreter {
             0x30 | 0x38 => return Err(Trap::coprocessor_unusable(0)),
             0x31 | 0x39 => return Err(Trap::coprocessor_unusable(1)),
             0x33 | 0x3B => return Err(Trap::coprocessor_unusable(3)),
-            0x32 | 0x3A => {
-                if self.cp0[COP0_SR] & SR_CU2 == 0 {
-                    return Err(Trap::coprocessor_unusable(2));
-                }
-                // TODO: GTE register loads/stores.
-                return Err(Trap::Fatal(Ps1Error::UnimplementedOpcode(instr)));
+            0x32 => {
+                // LWC2: load a word straight into a GTE data register.
+                self.require_cop2()?;
+                let addr = self.regs[rs].wrapping_add(simm);
+                let value = self.read32(bus, addr)?;
+                self.gte.write_data(rt, value);
+            }
+            0x3A => {
+                // SWC2: store a GTE data register.
+                self.require_cop2()?;
+                let addr = self.regs[rs].wrapping_add(simm);
+                self.write32(bus, addr, self.gte.read_data(rt))?;
             }
             _ => return Err(Trap::exception(Exception::ReservedInstruction)),
         }
@@ -607,6 +611,42 @@ impl Interpreter {
             0x27 => self.set_reg(rd, !(a | b)),
             0x2A => self.set_reg(rd, ((a as i32) < (b as i32)) as u32),
             0x2B => self.set_reg(rd, (a < b) as u32),
+            _ => return Err(Trap::exception(Exception::ReservedInstruction)),
+        }
+        Ok(())
+    }
+
+    /// COP2 needs `SR.CU2`, even from kernel mode.
+    fn require_cop2(&self) -> Exec {
+        if self.cp0[COP0_SR] & SR_CU2 == 0 {
+            return Err(Trap::coprocessor_unusable(2));
+        }
+        Ok(())
+    }
+
+    fn execute_cop2(&mut self, instr: u32) -> Exec {
+        self.require_cop2()?;
+
+        // Bit 25 set: a GTE command rather than a register move.
+        if instr & (1 << 25) != 0 {
+            self.gte.execute(instr & 0x01FF_FFFF);
+            return Ok(());
+        }
+
+        let rt = ((instr >> 16) & 0x1F) as usize;
+        let rd = ((instr >> 11) & 0x1F) as usize;
+        match (instr >> 21) & 0x1F {
+            // MFC2 / CFC2 are loads and have a load delay.
+            0x00 => {
+                let value = self.gte.read_data(rd);
+                self.load_reg(rt, value);
+            }
+            0x02 => {
+                let value = self.gte.read_control(rd);
+                self.load_reg(rt, value);
+            }
+            0x04 => self.gte.write_data(rd, self.regs[rt]),
+            0x06 => self.gte.write_control(rd, self.regs[rt]),
             _ => return Err(Trap::exception(Exception::ReservedInstruction)),
         }
         Ok(())

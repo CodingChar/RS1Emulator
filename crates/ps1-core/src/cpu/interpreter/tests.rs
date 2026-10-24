@@ -757,12 +757,144 @@ fn unusable_coprocessors_report_their_number() {
     }
 }
 
-#[test]
-fn gte_instructions_are_reported_as_unimplemented_when_enabled() {
-    let mut m = Machine::new(&[0x12 << 26]);
+// ----- COP2 / GTE -----
+
+fn mtc2(rt: u32, rd: u32) -> u32 { (0x12 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11) }
+fn mfc2(rt: u32, rd: u32) -> u32 { (0x12 << 26) | (rt << 16) | (rd << 11) }
+fn ctc2(rt: u32, rd: u32) -> u32 { (0x12 << 26) | (0x06 << 21) | (rt << 16) | (rd << 11) }
+fn cfc2(rt: u32, rd: u32) -> u32 { (0x12 << 26) | (0x02 << 21) | (rt << 16) | (rd << 11) }
+fn lwc2(rt: u32, off: i32, base: u32) -> u32 { itype(0x32, base, rt, off) }
+fn swc2(rt: u32, off: i32, base: u32) -> u32 { itype(0x3A, base, rt, off) }
+/// A GTE command word (bit 25 set).
+fn gte_command(opcode: u32) -> u32 { (0x12 << 26) | (1 << 25) | opcode }
+
+fn gte_machine(program: &[u32]) -> Machine {
+    let mut m = Machine::new(program);
     m.cpu.cp0[COP0_SR] = SR_CU2;
-    let result = m.cpu.step(&mut m.bus);
-    assert_eq!(result, Err(Ps1Error::UnimplementedOpcode(0x12 << 26)));
+    m
+}
+
+#[test]
+fn gte_register_moves_go_both_ways() {
+    // The BIOS's first GTE instructions: ctc2 into ZSF3 / ZSF4.
+    let mut m = gte_machine(&[
+        addiu(8, 0, 0x155),
+        ctc2(8, 29),
+        addiu(8, 0, 0x100),
+        ctc2(8, 30),
+        cfc2(2, 29),
+        cfc2(3, 30),
+        NOP,
+    ]);
+    m.run(7);
+    assert_eq!(m.reg(2), 0x155);
+    assert_eq!(m.reg(3), 0x100);
+    assert_eq!(m.cpu.gte.control[29], 0x155);
+}
+
+#[test]
+fn mtc2_and_mfc2_use_data_registers_with_a_load_delay() {
+    let mut m = gte_machine(&[
+        addiu(1, 0, -2),
+        mtc2(1, 9), // IR1 = -2
+        mfc2(2, 9),
+        addu(3, 2, 0), // load delay slot: still the old r2
+        addu(4, 2, 0), // sees the loaded value
+    ]);
+    m.cpu.regs[2] = 0x55;
+    m.run(5);
+    assert_eq!(m.reg(3), 0x55);
+    assert_eq!(m.reg(4), 0xFFFF_FFFE, "IR1 reads back sign-extended");
+}
+
+#[test]
+fn lwc2_and_swc2_move_words_between_memory_and_gte() {
+    let mut m = gte_machine(&[
+        lwc2(6, DATA as i32, 0),       // RGBC <- [DATA]
+        swc2(6, DATA as i32 + 8, 0),   // [DATA+8] <- RGBC
+        lwc2(15, DATA as i32 + 4, 0),  // SXYP push
+        mfc2(5, 14),
+        NOP,
+    ]);
+    m.poke32(DATA, 0x1122_3344);
+    m.poke32(DATA + 4, 0x0005_0006);
+    m.run(5);
+    assert_eq!(m.cpu.gte.data[6], 0x1122_3344);
+    assert_eq!(m.peek32(DATA + 8), 0x1122_3344);
+    assert_eq!(m.reg(5), 0x0005_0006);
+}
+
+#[test]
+fn lwc2_and_swc2_check_alignment() {
+    let mut m = gte_machine(&[lwc2(6, DATA as i32 + 2, 0)]);
+    m.step();
+    assert_eq!(m.exc_code(), Exception::AddressErrorLoad as u32);
+
+    let mut m = gte_machine(&[swc2(6, DATA as i32 + 1, 0)]);
+    m.step();
+    assert_eq!(m.exc_code(), Exception::AddressErrorStore as u32);
+}
+
+#[test]
+fn gte_commands_run_and_their_results_are_readable() {
+    // NCLIP on a counter-clockwise triangle: MAC0 = 100.
+    let mut m = gte_machine(&[
+        mtc2(1, 15),
+        mtc2(2, 15),
+        mtc2(3, 15),
+        gte_command(0x06),
+        mfc2(4, 24),
+        NOP,
+    ]);
+    m.cpu.regs[1] = 0x0000_0000; // (0, 0)
+    m.cpu.regs[2] = 0x0000_000A; // (10, 0)
+    m.cpu.regs[3] = 0x000A_0000; // (0, 10)
+    m.run(6);
+    assert_eq!(m.reg(4), 100);
+}
+
+#[test]
+fn gte_flag_register_is_visible_through_cfc2() {
+    // Divide overflow: RTPS with H = 600 and a depth of 100.
+    let mut m = gte_machine(&[
+        ctc2(1, 58), // H
+        mtc2(2, 1),  // VZ0
+        gte_command(0x01 | (1 << 19)),
+        cfc2(3, 63),
+        NOP,
+    ]);
+    m.cpu.regs[1] = 600;
+    m.cpu.regs[2] = 100;
+    m.run(5);
+    assert_eq!(m.reg(3) & (1 << 17), 1 << 17, "divide overflow");
+    assert_eq!(m.reg(3) >> 31, 1, "summary bit");
+}
+
+#[test]
+fn every_cop2_instruction_needs_cu2() {
+    for instr in [mtc2(1, 9), mfc2(1, 9), ctc2(1, 9), cfc2(1, 9), gte_command(0x06), lwc2(1, 0, 0), swc2(1, 0, 0)] {
+        let mut m = Machine::new(&[instr]); // SR = 0: CU2 clear
+        m.step();
+        assert_eq!(m.exc_code(), Exception::CoprocessorUnusable as u32, "{instr:#010x}");
+        assert_eq!((m.cpu.cp0[COP0_CAUSE] >> 28) & 3, 2);
+    }
+}
+
+#[test]
+fn unknown_cop2_moves_are_reserved_instructions() {
+    let mut m = gte_machine(&[(0x12 << 26) | (0x08 << 21)]); // BC2
+    m.step();
+    assert_eq!(m.exc_code(), Exception::ReservedInstruction as u32);
+}
+
+#[test]
+fn gte_state_is_cleared_by_cpu_reset() {
+    let mut m = gte_machine(&[mtc2(1, 9)]);
+    m.cpu.regs[1] = 5;
+    m.step();
+    assert_eq!(m.cpu.gte.data[9], 5);
+    m.cpu.reset();
+    assert_eq!(m.cpu.gte.data[9], 0);
 }
 
 #[test]

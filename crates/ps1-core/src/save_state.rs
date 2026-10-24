@@ -13,6 +13,8 @@ pub struct SaveState {
     pub cpu_pc: u32,
     pub cpu_next_pc: u32,
     pub cpu_cp0: [u32; 32],
+    pub gte_data: [u32; 32],
+    pub gte_control: [u32; 32],
     pub cpu_regs: [u32; 32],
     pub cpu_hi: u32,
     pub cpu_lo: u32,
@@ -31,7 +33,7 @@ pub struct SaveState {
     pub controllers: Vec<(u16, i8, i8, i8, i8)>,
 }
 
-const SAVE_STATE_VERSION: u32 = 3;
+const SAVE_STATE_VERSION: u32 = 4;
 
 impl SaveState {
     pub const CURRENT_VERSION: u32 = SAVE_STATE_VERSION;
@@ -42,6 +44,8 @@ impl SaveState {
             cpu_pc: sys.cpu.pc,
             cpu_next_pc: sys.cpu.next_pc,
             cpu_cp0: sys.cpu.cp0,
+            gte_data: sys.cpu.gte.data,
+            gte_control: sys.cpu.gte.control,
             cpu_regs: sys.cpu.regs,
             cpu_hi: sys.cpu.hi,
             cpu_lo: sys.cpu.lo,
@@ -75,6 +79,8 @@ impl SaveState {
         sys.cpu.set_pc(self.cpu_pc);
         sys.cpu.next_pc = self.cpu_next_pc;
         sys.cpu.cp0 = self.cpu_cp0;
+        sys.cpu.gte.data = self.gte_data;
+        sys.cpu.gte.control = self.gte_control;
         sys.cpu.regs = self.cpu_regs;
         sys.cpu.hi = self.cpu_hi;
         sys.cpu.lo = self.cpu_lo;
@@ -112,6 +118,8 @@ mod tests {
         a.cpu.lo = 2;
         a.cpu.cp0[12] = 0x0040_0001;
         a.cpu.cp0[14] = 0x8000_0F00;
+        a.cpu.gte.data[6] = 0x1234_5678;
+        a.cpu.gte.control[26] = 500;
 
         let bytes = a.save_state();
         let mut b = System::new();
@@ -122,5 +130,6 @@ mod tests {
         assert_eq!(b.cpu.regs[5], 0xDEAD_BEEF);
         assert_eq!((b.cpu.hi, b.cpu.lo), (1, 2));
         assert_eq!(b.cpu.cp0, a.cpu.cp0);
+        assert_eq!(b.cpu.gte, a.cpu.gte);
     }
 }
