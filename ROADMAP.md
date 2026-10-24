@@ -196,8 +196,9 @@ Archivos: `spu/mod.rs` (registros y mezclador), `spu/voice.rs` (ADPCM, ADSR, vol
 - [x] Audio: `AudioWorklet` a 44,1 kHz con cola corta (silencio si el emulador va lento, descarta lo viejo si va rápido).
 - [x] Tarjetas de memoria 1 y 2 persistentes en IndexedDB (guardado al detectar escrituras), con exportar, importar y formatear.
 - [x] Estados guardados (3 ranuras) en IndexedDB en lugar de localStorage.
-- [x] Probado en el navegador con un módulo simulado de `ps1_wasm` (carga de archivos, bucle, cambio de resolución, entrada, tarjetas, estados, pausa y el worklet); falta probarlo con el módulo real, que necesita `wasm-bindgen-cli` para generarse (`web/build.sh`).
-- [ ] Probar el frontend con el emulador real en el navegador y medir su velocidad en WebAssembly.
+- [x] Probado en el navegador con el módulo real (`web/build.sh` con `wasm-bindgen-cli` 0.2.129): BIOS y disco de 649 MB cargados por trozos, logo de la BIOS, intro FMV y título de Resident Evil, Start (teclado) lleva a la escena inicial del juego en 3D, y guardar/cargar estado (3 MB) sin errores en la consola. Antes se probó la interfaz con un módulo simulado.
+- [ ] Rendimiento en WebAssembly: ~20-27 % de la velocidad real (11-16 fps), así que el audio sale entrecortado; es el punto débil que queda (ver más abajo).
+- [ ] Probar en el navegador la persistencia de las tarjetas con una partida real y el audio con altavoces.
 - [ ] Mando analógico (DualShock), vibración y selección del puerto 2.
 - [ ] Cambio de disco en caliente, lista de discos recientes y carga de discos grandes con `File` perezoso desde un Web Worker.
 - [ ] Guardado de estados completo y versionado (hoy `SaveState` no cubre GPU, timers/IRQ internos ni CD-ROM, y falla en silencio si cambia la versión); persistir en IndexedDB.
