@@ -1,9 +1,11 @@
 # RS1Emu — Roadmap
 
-Estado actual: la CPU (R3000A) está completa salvo el GTE, con delay slots, load delay,
-excepciones y COP0, y el bus traduce segmentos y hace accesos de 8/16/32 bits a
-RAM/BIOS/scratchpad (61 tests unitarios). El resto de los componentes son stubs, y el
-framebuffer siempre está en negro.
+Estado actual: la CPU (R3000A) está completa salvo el GTE; el bus mapea RAM, BIOS,
+scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
+contadores reales y DMA (120 tests unitarios). Con una BIOS SCPH1001 real la CPU supera el
+POST 7 y llega al `VSync` del kernel; ahí se queda porque el controlador del CD-ROM
+(Fase 7) todavía es un stub que solo devuelve lo escrito. GPU, SPU, GTE y MDEC siguen sin
+implementar, y el framebuffer siempre está en negro.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
 Marca `[x]` al completar cada ítem.
@@ -65,19 +67,24 @@ Archivo: `crates/ps1-core/src/bus.rs`
 ## Fase 3 — Temporización, interrupciones y timers
 
 - [x] Controlador de interrupciones: `I_STAT`/`I_MASK` y enrutado a COP0 CAUSE bit 10 (`System::step`). Faltan las fuentes (VBlank, timers, DMA, CD-ROM...).
-- [ ] Timers 0, 1, 2 con fuentes de reloj (sysclk, dotclock, hblank, sysclk/8), modos y IRQ (`timers.rs`).
+- [x] Timers 0, 1, 2 con fuentes de reloj (sysclk, dotclock, hblank, sysclk/8), modos y IRQ (`timers.rs`). Falta la sincronización con hblank/vblank de los timers 0 y 1 (solo el timer 2 detiene su contador).
 - [ ] Planificador por eventos (como `timing_event` de DuckStation) en lugar de avanzar todos los componentes un ciclo por instrucción.
-- [ ] Constantes de vídeo reales: ciclos por línea y por cuadro NTSC/PAL (hoy `cycles_per_frame = 3413`, que es un ciclo de línea, no de cuadro).
-- [ ] VBlank / HBlank que disparen IRQ.
+- [x] Constantes de vídeo NTSC: 3413 ciclos de GPU por línea, 263 líneas, 571212 ciclos de CPU por cuadro.
+- [ ] Modo PAL (314 líneas), entrelazado y divisor del dot clock según la resolución (GP1 08h).
+- [x] VBlank (línea 240) dispara IRQ0; el hblank alimenta al timer 1.
+- [ ] Bit 31 de GPUSTAT (línea par/impar): el `VSync` de la BIOS lo sondea en modo entrelazado.
 
 ## Fase 4 — Arranque de BIOS
 
 Hito: la BIOS llega a la pantalla de arranque / shell.
 
-- [ ] Cargar BIOS vía UI web (selector de archivo) y vía host.
+- [x] Cargar la BIOS desde el host (`examples/boot.rs --bios`); en la web, el selector de archivo sigue pendiente.
 - [ ] Validar tamaño/checksum de la BIOS.
 - [x] Harness `examples/boot.rs`: ejecuta N instrucciones, imprime los códigos POST, los últimos `pc` y los accesos a I/O sin dispositivo.
-- [ ] Traza de ejecución y desensamblador para depurar (cpu trace, opcional detrás de feature flag).
+- [x] Desensamblador y listado de bucles calientes en el harness (`--disasm`, `--peek`).
+- [ ] Traza de ejecución (cpu trace, opcional detrás de feature flag).
+- [x] Hito parcial: con `SCPH1001.BIN` la BIOS recorre los POST 0x01–0x07, instala el kernel en RAM, usa DMA/VBlank y empieza a inicializar el CD-ROM.
+- [ ] Hito: la BIOS muestra el logo de arranque (necesita CD-ROM y GPU).
 - [ ] Soporte para ejecutables PS-EXE para pruebas sin disco.
 
 ## Fase 5 — GPU
@@ -95,9 +102,11 @@ Archivos: `gpu/mod.rs`, `gpu/sw.rs`, `gpu/backend.rs`
 
 Archivo: `dma.rs`
 
-- [ ] Registros por canal (MADR, BCR, CHCR), DPCR, DICR e IRQ.
-- [ ] Modos: bloque, slice y lista enlazada (GPU), orden de prioridad.
-- [ ] Canales: MDEC in/out, GPU, CD-ROM, SPU, PIO, OTC.
+- [x] Registros por canal (MADR, BCR, CHCR), DPCR, DICR e IRQ.
+- [x] Modos: bloque, slice y lista enlazada (GPU); las transferencias terminan al instante.
+- [x] Canales: OTC, GPU (a/desde RAM y lista enlazada) y SPU (memoria de sonido). CD-ROM devuelve ceros hasta la Fase 7.
+- [ ] Canales MDEC in/out y PIO.
+- [ ] Prioridad entre canales, troceado (chopping) y duración real de las transferencias (hoy no detienen a la CPU).
 
 ## Fase 7 — CD-ROM y formatos de disco
 

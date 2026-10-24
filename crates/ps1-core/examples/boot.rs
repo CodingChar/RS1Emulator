@@ -32,10 +32,12 @@ struct Args {
     steps: u64,
     /// Addresses whose 32-bit contents are printed after the run.
     peek: Vec<u32>,
+    /// `(address, instruction count)` ranges disassembled after the run.
+    disasm: Vec<(u32, u32)>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new() };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -52,6 +54,14 @@ fn parse_args() -> Result<Args, String> {
                 let text = value("--peek")?;
                 let hex = text.trim_start_matches("0x");
                 args.peek.push(u32::from_str_radix(hex, 16).map_err(|e| format!("--peek: {e}"))?)
+            }
+            "--disasm" => {
+                let text = value("--disasm")?;
+                let (addr, count) = text.split_once(',').unwrap_or((&text, "16"));
+                let addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("--disasm address: {e}"))?;
+                let count = count.parse().map_err(|e| format!("--disasm count: {e}"))?;
+                args.disasm.push((addr, count));
             }
             other => return Err(format!("unknown argument {other}")),
         }
@@ -79,7 +89,7 @@ fn main() {
     }
 
     match &args.bios {
-        Some(bios) => run_bios(bios, args.steps, &args.peek),
+        Some(bios) => run_bios(bios, args.steps, &args.peek, &args.disasm),
         None => println!("\nNo --bios given: skipping CPU boot (a BIOS dump is required)."),
     }
 }
@@ -143,7 +153,7 @@ fn inspect_disc(cue: &Path) -> Result<(), String> {
 
 // ----- CPU boot -----
 
-fn run_bios(path: &Path, steps: u64, peek: &[u32]) {
+fn run_bios(path: &Path, steps: u64, peek: &[u32], ranges: &[(u32, u32)]) {
     let bios = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -224,6 +234,14 @@ fn run_bios(path: &Path, steps: u64, peek: &[u32]) {
         match sys.bus.read32(*addr) {
             Ok(v) => println!("  [{addr:#010X}] = {v:08X}"),
             Err(e) => println!("  [{addr:#010X}] = <{e}>"),
+        }
+    }
+    for (start, count) in ranges {
+        println!("disassembly at {start:#010X}:");
+        for i in 0..*count {
+            let pc = start.wrapping_add(i * 4);
+            let word = sys.bus.read32(pc).unwrap_or(0);
+            println!("  {pc:#010X}  {word:08X}  {}", disasm(pc, word));
         }
     }
     println!(
