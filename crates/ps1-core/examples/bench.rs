@@ -69,7 +69,6 @@ fn main() {
         }
     } else if let Some(frames) = frames {
         // What the web frontend does: whole video frames.
-        steps = 0;
         for _ in 0..frames {
             sys.run_frame().expect("frame");
         }

@@ -440,7 +440,22 @@ impl Bus {
 
     // ----- Memory-mapped I/O -----
 
+    /// Whether an access to this register depends on, or sets, the time
+    /// (so the devices must be brought up to date first). The others hold
+    /// state that only changes at the events the deadline already covers.
+    fn is_timed(phys: u32) -> bool {
+        match phys {
+            TIMERS..=TIMERS_END | CDROM..=CDROM_END | SIO..=SIO_END => true,
+            // GPUSTAT (scanline, field) and GP1 (video mode); not GP0/GPUREAD.
+            GPU..=GPU_END => phys >= GPU + 4,
+            _ => false,
+        }
+    }
+
     fn io_read(&mut self, phys: u32, width: u32) -> u32 {
+        if !Self::is_timed(phys) {
+            return self.io_read_synced(phys, width);
+        }
         self.sync_devices();
         let value = self.io_read_synced(phys, width);
         // Reading a serial port or the drive can start something new.
@@ -476,16 +491,15 @@ impl Bus {
     }
 
     fn io_write(&mut self, phys: u32, width: u32, value: u32) {
-        self.sync_devices();
+        let timed = Self::is_timed(phys);
+        if timed {
+            self.sync_devices();
+        }
         self.io_write_synced(phys, width, value);
         if self.spu.take_irq() {
             self.interrupt.raise(IRQ_SPU);
         }
-        // Writes to these never change when a device next has something to do.
-        if !matches!(
-            phys,
-            SPU..=SPU_END | MEM_CONTROL1..=MEM_CONTROL1_END | RAM_SIZE..=RAM_SIZE_END | POST_REGISTER
-        ) {
+        if timed {
             self.deadline = self.compute_deadline();
         }
     }
