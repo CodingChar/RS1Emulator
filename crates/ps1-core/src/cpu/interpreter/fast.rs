@@ -52,6 +52,11 @@ impl Interpreter {
         // Load issued by the instruction being executed.
         let (mut next_load_reg, mut next_load_value) = self.next_load;
         let mut count = 0u32;
+        // The 4 KB page of code being fetched from: translated once, not for
+        // every instruction. `u32::MAX` never matches a page address.
+        let mut code_page = u32::MAX;
+        let mut code_phys = 0usize;
+        let mut code_in_bios = false;
 
         // Write a register now, cancelling a delayed load to it.
         macro_rules! set {
@@ -119,16 +124,30 @@ impl Interpreter {
 
         while count < limit {
             // ---- fetch
-            if pc & 3 != 0 || (user_mode && pc & 0x8000_0000 != 0) {
+            if pc & 3 != 0 {
                 break;
             }
-            let phys = Bus::physical(pc);
-            let instr = if phys < RAM_MIRROR_END {
-                bus.memory.ram.read32(phys as usize)
-            } else if phys.wrapping_sub(BIOS_START) < BIOS_SIZE {
-                bus.memory.bios.read32((phys - BIOS_START) as usize)
+            if pc & !0xFFF != code_page {
+                if user_mode && pc & 0x8000_0000 != 0 {
+                    break;
+                }
+                let phys = Bus::physical(pc);
+                if phys < RAM_MIRROR_END {
+                    code_phys = (phys & !0xFFF) as usize;
+                    code_in_bios = false;
+                } else if phys.wrapping_sub(BIOS_START) < BIOS_SIZE {
+                    code_phys = ((phys - BIOS_START) & !0xFFF) as usize;
+                    code_in_bios = true;
+                } else {
+                    break;
+                }
+                code_page = pc & !0xFFF;
+            }
+            let offset = code_phys | (pc & 0xFFF) as usize;
+            let instr = if code_in_bios {
+                bus.memory.bios.read32(offset)
             } else {
-                break;
+                bus.memory.ram.read32(offset)
             };
 
             let rs = ((instr >> 21) & 0x1F) as usize;
