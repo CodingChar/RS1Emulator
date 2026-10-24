@@ -2,6 +2,8 @@
 //! the ADSR envelope and the volume sweeps.
 use serde::{Deserialize, Serialize};
 
+use super::gauss::GAUSS;
+
 pub const SOUND_RAM_SIZE: usize = 512 * 1024;
 pub const SOUND_RAM_MASK: usize = SOUND_RAM_SIZE - 1;
 
@@ -236,15 +238,17 @@ impl Voice {
         loop_end
     }
 
+    /// The SPU's four-point Gaussian interpolation of the last four samples,
+    /// at the phase given by bits 4-11 of the pitch counter.
+    #[inline(always)]
     fn interpolate(&self) -> i32 {
-        let [p0, p1, p2, p3] = self.window.map(|s| s as i64);
-        let t = self.fraction as i64;
-        let a = -p0 + 3 * p1 - 3 * p2 + p3;
-        let b = 2 * p0 - 5 * p1 + 4 * p2 - p3;
-        let c = -p0 + p2;
-        let d = 2 * p1;
-        let value = ((((((a * t) >> 12) + b) * t >> 12) + c) * t >> 12) + d;
-        ((value >> 1) as i32).clamp(-0x8000, 0x7FFF)
+        let phase = ((self.fraction >> 4) & 0xFF) as usize;
+        let [oldest, older, old, new] = self.window.map(|s| s as i32);
+        let mut out = (GAUSS[0xFF - phase] as i32 * oldest) >> 15;
+        out += (GAUSS[0x1FF - phase] as i32 * older) >> 15;
+        out += (GAUSS[0x100 + phase] as i32 * old) >> 15;
+        out += (GAUSS[phase] as i32 * new) >> 15;
+        out.clamp(-0x8000, 0x7FFF)
     }
 
     fn tick_envelope(&mut self, regs: &VoiceRegs) {

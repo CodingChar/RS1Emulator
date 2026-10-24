@@ -2,6 +2,7 @@
 //! modulation, reverb, and a mixer that adds the CD audio input. Produces
 //! 44.1 kHz stereo.
 
+mod gauss;
 mod reverb;
 mod voice;
 
