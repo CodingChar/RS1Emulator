@@ -331,27 +331,31 @@ impl Mdec {
             if k > 63 {
                 break;
             }
-            let position = ZIGZAG[k];
-            let value = if scale == 0 {
-                sign_extend_10(word) * 2
+            // With a quantizer scale of 0 the value is used as is and lands at
+            // its scan position; otherwise the table entry for that scan
+            // position scales it and it goes to its place in the block.
+            if scale == 0 {
+                coefficients[k] = (sign_extend_10(word) * 2).clamp(-0x400, 0x3FF);
             } else {
-                (sign_extend_10(word) * quant[position] as i32 * scale + 4) / 8
-            };
-            coefficients[position] = value.clamp(-0x400, 0x3FF);
+                let value = (sign_extend_10(word) * quant[k] as i32 * scale + 4) / 8;
+                coefficients[ZIGZAG[k]] = value.clamp(-0x400, 0x3FF);
+            }
         }
         Some(self.idct(&coefficients))
     }
 
-    /// Two-pass inverse DCT using the uploaded scale table.
+    /// Two-pass inverse DCT using the uploaded scale table. The chip only
+    /// keeps the upper 13 bits of each table entry, and each pass rounds the
+    /// sum with a shift by 13.
     fn idct(&self, coefficients: &[i32; 64]) -> [i32; 64] {
         let mut temp = [0i32; 64];
         for x in 0..8 {
             for y in 0..8 {
                 let mut sum = 0i32;
                 for u in 0..8 {
-                    sum += coefficients[u * 8 + x] * self.scale[u * 8 + y] as i32;
+                    sum += coefficients[u * 8 + x] * (self.scale[u * 8 + y] as i32 >> 3);
                 }
-                temp[y * 8 + x] = (sum + 0x7FFF) >> 16;
+                temp[y * 8 + x] = (sum + 0xFFF) >> 13;
             }
         }
         let mut out = [0i32; 64];
@@ -359,9 +363,9 @@ impl Mdec {
             for x in 0..8 {
                 let mut sum = 0i32;
                 for u in 0..8 {
-                    sum += temp[y * 8 + u] * self.scale[u * 8 + x] as i32;
+                    sum += temp[y * 8 + u] * (self.scale[u * 8 + x] as i32 >> 3);
                 }
-                let v = (sum + 0x7FFF) >> 16;
+                let v = (sum + 0xFFF) >> 13;
                 // The chip keeps 9 bits; saturate to the signed 8-bit pixel range.
                 out[y * 8 + x] = sign_extend_9(v).clamp(-128, 127);
             }
@@ -544,8 +548,8 @@ mod tests {
     #[test]
     fn an_ac_coefficient_varies_along_x_only() {
         let mut mdec = ready_mdec();
-        // Zigzag position 1 is the first horizontal frequency.
-        // qscale 0 so the coefficient is 2 * 200 = 400 (run 0).
+        // Scan position 1 is the first horizontal frequency. With qscale 0 the
+        // value is used as is (times 2): 400, at position 1 of the block.
         decode(&mut mdec, MODE_8BIT, &[0, 200, END_OF_BLOCK]);
         let pixels = read_bytes(&mut mdec, 64);
         for y in 1..8 {
@@ -557,8 +561,9 @@ mod tests {
     #[test]
     fn a_run_skips_zigzag_positions() {
         let mut mdec = ready_mdec();
-        // Run 1 lands on zigzag position 2, which is the first vertical frequency.
-        decode(&mut mdec, MODE_8BIT, &[0, (1 << 10) | 200, END_OF_BLOCK]);
+        // Run 1 lands on scan position 2, the first vertical frequency once
+        // the quantizer scale is non-zero: (500 * 2 * 1 + 4) / 8 = 125.
+        decode(&mut mdec, MODE_8BIT, &[1 << 10, (1 << 10) | 500, END_OF_BLOCK]);
         let pixels = read_bytes(&mut mdec, 64);
         for x in 1..8 {
             assert_eq!(pixels[x], pixels[0], "column {x} equals column 0");
