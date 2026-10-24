@@ -148,3 +148,65 @@ impl Default for System {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interrupt::IRQ_VBLANK;
+
+    fn word(w: u32) -> [u8; 4] {
+        w.to_le_bytes()
+    }
+
+    /// A BIOS image whose first instructions are `program`.
+    fn bios_with(program: &[u32]) -> Vec<u8> {
+        program.iter().flat_map(|w| word(*w)).collect()
+    }
+
+    #[test]
+    fn reset_requires_a_bios() {
+        let mut sys = System::new();
+        assert_eq!(sys.reset(), Err(crate::types::Ps1Error::BiosNotLoaded));
+    }
+
+    #[test]
+    fn program_in_the_bios_programs_the_interrupt_mask() {
+        // lui   r1, 0x1F80
+        // ori   r1, r1, 0x1074     ; I_MASK
+        // addiu r2, r0, 1
+        // sw    r2, 0(r1)
+        let mut sys = System::new();
+        sys.load_bios(&bios_with(&[
+            0x3C01_1F80,
+            0x3421_1074,
+            0x2402_0001,
+            0xAC22_0000,
+        ]))
+        .unwrap();
+        sys.reset().unwrap();
+        for _ in 0..4 {
+            sys.step().unwrap();
+        }
+        assert_eq!(sys.bus.interrupt.mask, 1);
+        assert_eq!(sys.cycles, 4);
+    }
+
+    #[test]
+    fn pending_unmasked_interrupt_reaches_the_cpu() {
+        let mut sys = System::new();
+        sys.load_bios(&bios_with(&[0, 0, 0, 0])).unwrap();
+        sys.reset().unwrap();
+        // Interrupts enabled in COP0 with IM2 unmasked; BEV is set after reset.
+        sys.cpu.cp0[12] |= 1 | (1 << 10);
+        sys.bus.interrupt.mask = 1 << IRQ_VBLANK;
+
+        // Nothing pending: the CPU keeps running through the BIOS.
+        sys.step().unwrap();
+        assert_eq!(sys.cpu.pc, 0xBFC0_0004);
+
+        sys.bus.interrupt.raise(IRQ_VBLANK);
+        sys.step().unwrap();
+        assert_eq!(sys.cpu.pc, 0xBFC0_0180, "BEV exception vector");
+        assert_eq!((sys.cpu.cp0[13] >> 2) & 0x1F, 0, "ExcCode = Interrupt");
+    }
+}

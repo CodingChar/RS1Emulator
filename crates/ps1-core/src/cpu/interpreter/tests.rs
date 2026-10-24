@@ -767,7 +767,7 @@ fn gte_instructions_are_reported_as_unimplemented_when_enabled() {
 
 #[test]
 fn bus_failures_are_fatal_errors_not_cpu_exceptions() {
-    let mut m = Machine::new(&[lui(1, 0xBF80), lw(2, 0x1000, 1), NOP]);
+    let mut m = Machine::new(&[lui(1, 0xBFA0), lw(2, 0, 1), NOP]);
     m.run(1);
     let result = m.cpu.step(&mut m.bus);
     assert!(matches!(result, Err(Ps1Error::MemoryOutOfRange(_))));

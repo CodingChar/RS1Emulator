@@ -20,15 +20,18 @@ pub struct SaveState {
     pub spu_regs: Vec<u16>,
     pub ram_snapshot: Vec<u8>,       // compressed in the future
     pub vram_snapshot: Vec<u8>,
-    pub dma_regs: [u32; 16],
-    pub timers: [u32; 3],
+    pub dma_regs: [u32; 32],
+    pub timer_counters: [u32; 3],
+    pub timer_modes: [u32; 3],
+    pub timer_targets: [u32; 3],
+    pub scratchpad: Vec<u8>,
     pub interrupt_stat: u32,
     pub interrupt_mask: u32,
     pub cdrom_sector: u32,
     pub controllers: Vec<(u16, i8, i8, i8, i8)>,
 }
 
-const SAVE_STATE_VERSION: u32 = 2;
+const SAVE_STATE_VERSION: u32 = 3;
 
 impl SaveState {
     pub const CURRENT_VERSION: u32 = SAVE_STATE_VERSION;
@@ -47,7 +50,10 @@ impl SaveState {
             ram_snapshot: sys.bus.memory.ram.as_slice().to_vec(),
             vram_snapshot: sys.bus.memory.vram.clone(),
             dma_regs: sys.bus.dma.registers,
-            timers: [sys.bus.timers.timer0, sys.bus.timers.timer1, sys.bus.timers.timer2],
+            timer_counters: sys.bus.timers.counter,
+            timer_modes: sys.bus.timers.mode,
+            timer_targets: sys.bus.timers.target,
+            scratchpad: sys.bus.scratchpad.to_vec(),
             interrupt_stat: sys.bus.interrupt.stat,
             interrupt_mask: sys.bus.interrupt.mask,
             cdrom_sector: sys.bus.cdrom.current_sector,
@@ -77,9 +83,10 @@ impl SaveState {
         sys.bus.memory.ram.as_mut_slice().copy_from_slice(&self.ram_snapshot);
         sys.bus.memory.vram.copy_from_slice(&self.vram_snapshot);
         sys.bus.dma.registers = self.dma_regs;
-        sys.bus.timers.timer0 = self.timers[0];
-        sys.bus.timers.timer1 = self.timers[1];
-        sys.bus.timers.timer2 = self.timers[2];
+        sys.bus.timers.counter = self.timer_counters;
+        sys.bus.timers.mode = self.timer_modes;
+        sys.bus.timers.target = self.timer_targets;
+        sys.bus.scratchpad.copy_from_slice(&self.scratchpad);
         sys.bus.interrupt.stat = self.interrupt_stat;
         sys.bus.interrupt.mask = self.interrupt_mask;
         sys.bus.cdrom.current_sector = self.cdrom_sector;

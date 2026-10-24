@@ -1,3 +1,5 @@
+use crate::io::StubRegs;
+
 /// CD-ROM drive emulation.
 ///
 /// Parses ISO / BIN+CUE / PBP / CCD image formats and emulates the
@@ -9,7 +11,13 @@ pub struct CdRom {
     pub sector_size: u32,
     pub current_sector: u32,
     pub total_sectors: u32,
+    /// The four registers at `0x1F801800`. Plain storage until the
+    /// controller is emulated.
+    registers: StubRegs,
 }
+
+/// Index/status register value with the parameter FIFO empty and not full.
+const STATUS_IDLE: u32 = 0x18;
 
 impl CdRom {
     pub fn new() -> Self {
@@ -18,7 +26,24 @@ impl CdRom {
             sector_size: 2048,
             current_sector: 0,
             total_sectors: 0,
+            registers: Self::idle_registers(),
         }
+    }
+
+    fn idle_registers() -> StubRegs {
+        StubRegs::new(4).with_u32(0, STATUS_IDLE)
+    }
+
+    /// Register read; `off` is relative to `0x1F801800`.
+    pub fn read(&mut self, off: u32, width: u32) -> u32 {
+        // TODO: index/status, response FIFO, interrupt flags.
+        self.registers.read(off, width)
+    }
+
+    /// Register write; `off` is relative to `0x1F801800`.
+    pub fn write(&mut self, off: u32, width: u32, value: u32) {
+        // TODO: command, parameter FIFO, interrupt enable/acknowledge.
+        self.registers.write(off, width, value);
     }
 
     pub fn insert_image(&mut self, data: Vec<u8>) -> crate::types::Ps1Result<()> {
@@ -32,6 +57,7 @@ impl CdRom {
     pub fn reset(&mut self) {
         self.current_sector = 0;
         self.total_sectors = 0;
+        self.registers = Self::idle_registers();
     }
 
     pub fn step(&mut self) {
