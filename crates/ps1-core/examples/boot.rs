@@ -37,10 +37,20 @@ struct Args {
     disasm: Vec<(u32, u32)>,
     /// Write RAM to a file after the run (`--dump-ram`).
     dump_ram: Option<PathBuf>,
+    /// Save a screenshot every N instructions as `<prefix>_<step>.png`
+    /// (`--shots-every N --shots-prefix PREFIX`).
+    shots_every: u64,
+    shots_prefix: Option<PathBuf>,
+    /// Addresses to count executions of (`--watch-pc`).
+    watch: Vec<u32>,
+    /// Save the displayed frame as a PNG after the run (`--screenshot`).
+    screenshot: Option<PathBuf>,
+    /// Save the whole 1024x512 VRAM as a PNG after the run (`--vram`).
+    vram: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -58,6 +68,21 @@ fn parse_args() -> Result<Args, String> {
                 let hex = text.trim_start_matches("0x");
                 args.peek.push(u32::from_str_radix(hex, 16).map_err(|e| format!("--peek: {e}"))?)
             }
+            "--shots-every" => {
+                args.shots_every = value("--shots-every")?
+                    .replace('_', "")
+                    .parse()
+                    .map_err(|e| format!("--shots-every: {e}"))?
+            }
+            "--shots-prefix" => args.shots_prefix = Some(PathBuf::from(value("--shots-prefix")?)),
+            "--watch-pc" => {
+                let text = value("--watch-pc")?;
+                let addr = u32::from_str_radix(text.trim_start_matches("0x"), 16)
+                    .map_err(|e| format!("--watch-pc: {e}"))?;
+                args.watch.push(addr);
+            }
+            "--screenshot" => args.screenshot = Some(PathBuf::from(value("--screenshot")?)),
+            "--vram" => args.vram = Some(PathBuf::from(value("--vram")?)),
             "--dump-ram" => args.dump_ram = Some(PathBuf::from(value("--dump-ram")?)),
             "--disasm" => {
                 let text = value("--disasm")?;
@@ -93,7 +118,7 @@ fn main() {
     }
 
     match &args.bios {
-        Some(bios) => run_bios(bios, args.disc.as_deref(), args.steps, &args.peek, &args.disasm, args.dump_ram.as_deref()),
+        Some(bios) => run_bios(bios, args.disc.as_deref(), args.steps, &args.peek, &args.disasm, &args),
         None => println!("\nNo --bios given: skipping CPU boot (a BIOS dump is required)."),
     }
 }
@@ -175,7 +200,7 @@ fn run_bios(
     steps: u64,
     peek: &[u32],
     ranges: &[(u32, u32)],
-    dump_ram: Option<&Path>,
+    args: &Args,
 ) {
     let bios = match std::fs::read(path) {
         Ok(b) => b,
@@ -207,6 +232,8 @@ fn run_bios(
     let mut last_post = 0u8;
     let mut executed = 0u64;
     let mut failure = None;
+    // For each watched address: (address, times executed, step of the first execution).
+    let mut watched: Vec<(u32, u64, Option<u64>)> = args.watch.iter().map(|a| (*a, 0, None)).collect();
 
     for i in 0..steps {
         let pc = sys.cpu.pc;
@@ -215,17 +242,36 @@ fn run_bios(
         if i + 100_000 >= steps {
             *histogram.entry(pc).or_default() += 1;
         }
+        for entry in watched.iter_mut().filter(|e| e.0 == pc) {
+            entry.1 += 1;
+            entry.2.get_or_insert(i);
+        }
         if let Err(e) = sys.step() {
             failure = Some(e);
             break;
         }
         executed += 1;
+        if args.shots_every > 0 && executed % args.shots_every == 0 {
+            if let Some(prefix) = &args.shots_prefix {
+                let (w, h) = (sys.bus.gpu.display_width(), sys.bus.gpu.display_height());
+                let name = format!("{}_{executed:010}.png", prefix.display());
+                if let Err(e) = write_png(Path::new(&name), w, h, &sys.framebuffer()) {
+                    eprintln!("screenshot: {e}");
+                }
+            }
+        }
         if sys.bus.post_code != last_post {
             last_post = sys.bus.post_code;
             println!("  [{executed:>10}] POST code {last_post:#04X}");
         }
     }
 
+    for (addr, count, first) in &watched {
+        match first {
+            Some(step) => println!("watch {addr:#010X}: executed {count} times, first at step {step}"),
+            None => println!("watch {addr:#010X}: never executed"),
+        }
+    }
     println!("\nExecuted {executed} instructions.");
     println!("pc = {:#010X}", sys.cpu.pc);
     if let Some(e) = failure {
@@ -288,7 +334,28 @@ fn run_bios(
             Err(e) => println!("  [{addr:#010X}] = <{e}>"),
         }
     }
-    if let Some(path) = dump_ram {
+    if let Some(path) = &args.screenshot {
+        let (w, h) = (sys.bus.gpu.display_width(), sys.bus.gpu.display_height());
+        match write_png(path, w, h, &sys.framebuffer()) {
+            Ok(()) => println!("screenshot {w}x{h} written to {}", path.display()),
+            Err(e) => eprintln!("screenshot: {e}"),
+        }
+    }
+    if let Some(path) = &args.vram {
+        let pixels = &sys.bus.gpu.vram.pixels;
+        let rgba: Vec<u8> = pixels
+            .iter()
+            .flat_map(|p| {
+                let e = |c: u16| ((c << 3) | (c >> 2)) as u8;
+                [e(p & 31), e((p >> 5) & 31), e((p >> 10) & 31), 255]
+            })
+            .collect();
+        match write_png(path, 1024, 512, &rgba) {
+            Ok(()) => println!("VRAM written to {}", path.display()),
+            Err(e) => eprintln!("vram: {e}"),
+        }
+    }
+    if let Some(path) = args.dump_ram.as_deref() {
         match std::fs::write(path, sys.bus.memory.ram.as_slice()) {
             Ok(()) => println!("RAM written to {}", path.display()),
             Err(e) => eprintln!("dump-ram: {}: {e}", path.display()),
@@ -419,4 +486,63 @@ fn disasm(pc: u32, w: u32) -> String {
         0x3A => format!("swc2 cop2r{rt}, {simm}({})", reg(rs)),
         _ => format!(".word {w:#010x}"),
     }
+}
+
+// ----- PNG output (uncompressed, no dependencies) -----
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in data {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in data {
+        a = (a + *byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let mut body = kind.to_vec();
+    body.extend_from_slice(data);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+}
+
+/// Write RGBA pixels as a PNG using stored (uncompressed) deflate blocks.
+fn write_png(path: &Path, width: usize, height: usize, rgba: &[u8]) -> Result<(), String> {
+    let mut raw = Vec::with_capacity((width * 4 + 1) * height);
+    for row in rgba.chunks_exact(width * 4) {
+        raw.push(0); // filter: none
+        raw.extend_from_slice(row);
+    }
+
+    let mut zlib = vec![0x78, 0x01];
+    let mut blocks = raw.chunks(65535).peekable();
+    while let Some(block) = blocks.next() {
+        zlib.push(blocks.peek().is_none() as u8);
+        zlib.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut header = Vec::new();
+    header.extend_from_slice(&(width as u32).to_be_bytes());
+    header.extend_from_slice(&(height as u32).to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    png_chunk(&mut png, b"IHDR", &header);
+    png_chunk(&mut png, b"IDAT", &zlib);
+    png_chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png).map_err(|e| format!("{}: {e}", path.display()))
 }

@@ -2,13 +2,12 @@
 
 Estado actual: la CPU (R3000A) y el GTE están completos; el bus mapea RAM, BIOS,
 scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
-contadores reales, DMA, el controlador del CD-ROM con lectura de BIN/CUE y el puerto
-serie SIO0 con pad digital y memory cards (273 tests unitarios). Con una BIOS SCPH1001 real
-y un disco, la BIOS arranca entera: identifica el disco (GetID → SCEA), lee su sistema de
-archivos, carga el ejecutable del juego (verificado byte a byte contra el disco) y le cede
-el control. El juego queda esperando una cuenta de VSync que nunca avanza
-(`VSync` de libgpu, contador en `0x800BDE58`); GPU, SPU y MDEC no existen todavía, así que
-el framebuffer sigue en negro.
+contadores reales, DMA, el controlador del CD-ROM con lectura de BIN/CUE, el puerto serie
+SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (353 tests
+unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS muestra su logo, identifica el
+disco, carga el ejecutable del juego y se lo cede; Resident Evil (USA) muestra el logo de
+CAPCOM y su pantalla de título (~1.200 M de instrucciones). Faltan SPU y MDEC (FMV), y el
+intérprete va a ~15 M instr/s en nativo, la mitad del tiempo real.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
 Marca `[x]` al completar cada ítem.
@@ -75,7 +74,7 @@ Archivo: `crates/ps1-core/src/bus.rs`
 - [x] Constantes de vídeo NTSC: 3413 ciclos de GPU por línea, 263 líneas, 571212 ciclos de CPU por cuadro.
 - [ ] Modo PAL (314 líneas), entrelazado y divisor del dot clock según la resolución (GP1 08h).
 - [x] VBlank (línea 240) dispara IRQ0; el hblank alimenta al timer 1.
-- [ ] Bit 31 de GPUSTAT (línea par/impar): el `VSync` de la BIOS lo sondea en modo entrelazado.
+- [x] Bit 31 de GPUSTAT (línea par/impar) implementado en `Gpu::status()`.
 
 ## Fase 4 — Arranque de BIOS
 
@@ -89,19 +88,24 @@ Hito: la BIOS llega a la pantalla de arranque / shell.
 - [x] Hito parcial: con `SCPH1001.BIN` la BIOS recorre los POST 0x01–0x07, instala el kernel en RAM, usa DMA/VBlank, inicializa el CD-ROM y reconoce el disco (GetID, lectura de los sectores de licencia).
 - [x] El bloqueo del GTE (`ctc2 t0, cop2r29`, tras ~137 M de instrucciones) quedó resuelto en la Fase 8; la BIOS alcanza el POST 0x09 (~172 M de instrucciones).
 - [x] El bucle de espera en `JOY_STAT` (SIO0) quedó resuelto en la Fase 9: la BIOS arranca el juego (SLUS_001.70) y le cede el control.
-- [ ] Siguiente bloqueo: el juego queda en `VSync` (libgpu, `0x8007D6B8`) esperando que el contador `0x800BDE58` llegue a su objetivo; se llega con ~170 M de instrucciones y los punteros de libgpu (`0x800BDE60`/`64`) siguen a cero, así que probablemente `ResetGraph` no completó. Hace falta la GPU (Fase 5) para seguir investigándolo.
-- [ ] Hito: la BIOS muestra el logo de arranque (necesita CD-ROM y GPU).
+- [x] El supuesto bloqueo en `VSync` era falso: el juego solo necesitaba más tiempo emulado (ver Fase 5); el contador de libgpu avanza al ritmo del VBlank.
+- [x] Hito: la BIOS muestra el logo SCE (~160 M de instrucciones) y el de PlayStation con la licencia (~260 M).
 - [ ] Soporte para ejecutables PS-EXE para pruebas sin disco.
 
 ## Fase 5 — GPU
 
 Archivos: `gpu/mod.rs`, `gpu/sw.rs`, `gpu/backend.rs`
 
-- [ ] VRAM de 1024×512 a 16 bpp (hoy el framebuffer es 320×240 RGBA y `vram` es un `Vec<u8>` sin uso).
-- [ ] Registros GP0/GP1 y GPUSTAT; parser de comandos GP0.
-- [ ] Transferencias VRAM: CPU→VRAM, VRAM→CPU, VRAM→VRAM, fill rectangle.
-- [ ] Rasterizador software: triángulos con Gouraud, texturas (4/8/15 bpp, CLUT), semi-transparencia, dithering, rectángulos y líneas.
-- [ ] Display area y resoluciones (256/320/368/512/640 × 240/480), conversión VRAM→RGBA para presentación.
+- [x] VRAM de 1024×512 a 16 bpp dentro de la GPU (`gpu/sw.rs::Vram`).
+- [x] Registros GP0/GP1 y GPUSTAT; parser de comandos GP0 (comandos, polilíneas, cargas de píxeles).
+- [x] Transferencias VRAM: CPU→VRAM, VRAM→CPU, VRAM→VRAM, fill rectangle.
+- [x] Rasterizador software: triángulos con Gouraud, texturas (4/8/15 bpp, CLUT, ventana de textura), semi-transparencia, dithering, máscara, rectángulos y líneas.
+- [x] Display area y resoluciones (256/320/368/512/640 × 240/480), conversión VRAM→RGBA de 15/24 bpp; el frontend redimensiona el canvas cada cuadro.
+- [x] Hito: se ve la imagen del juego (logo de CAPCOM y pantalla de título de Resident Evil con la BIOS real).
+- [x] Harness: `--screenshot`, `--vram`, `--shots-every N --shots-prefix P` y `--watch-pc` guardan PNG / cuentan ejecuciones.
+- [ ] Temporización de la GPU (flags de ocupado, coste de dibujo) y caché de texturas.
+- [ ] Entrelazado 480i con dibujo por campos y restricción `draw_to_display`.
+- [ ] Rellenos, líneas y polígonos exactos al píxel frente a una suite de referencia.
 - [ ] Implementar `GpuBackend` para WebGL2 (hoy `ps1-web` usa canvas 2D).
 
 ## Fase 6 — DMA
