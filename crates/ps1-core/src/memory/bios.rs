@@ -16,19 +16,16 @@ impl Bios {
         BIOS_SIZE
     }
 
+    #[inline(always)]
     pub fn read32(&self, offset: usize) -> u32 {
         let o = offset & (BIOS_SIZE - 4);
-        u32::from_le_bytes([
-            self.data[o],
-            self.data[o + 1],
-            self.data[o + 2],
-            self.data[o + 3],
-        ])
+        u32::from_le_bytes(self.data[o..o + 4].try_into().unwrap())
     }
 
+    #[inline(always)]
     pub fn read16(&self, offset: usize) -> u16 {
         let o = offset & (BIOS_SIZE - 2);
-        u16::from_le_bytes([self.data[o], self.data[o + 1]])
+        u16::from_le_bytes(self.data[o..o + 2].try_into().unwrap())
     }
 
     pub fn read8(&self, offset: usize) -> u8 {

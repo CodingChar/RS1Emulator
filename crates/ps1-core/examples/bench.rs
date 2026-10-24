@@ -37,6 +37,7 @@ fn main() {
     let mut disc = None;
     let mut steps: u64 = 100_000_000;
     let mut cpu_only = false;
+    let mut frames: Option<u64> = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().unwrap_or_else(|| panic!("{flag} needs a value"));
@@ -44,6 +45,7 @@ fn main() {
             "--bios" => bios = Some(PathBuf::from(value())),
             "--disc" => disc = Some(PathBuf::from(value())),
             "--cpu-only" => cpu_only = true,
+            "--frames" => frames = Some(value().parse().expect("--frames")),
             "--steps" => steps = value().replace('_', "").parse().expect("--steps"),
             other => panic!("unknown argument {other}"),
         }
@@ -65,6 +67,13 @@ fn main() {
             sys.cpu.set_irq(sys.bus.interrupt.pending());
             sys.cpu.step(&mut sys.bus).expect("step");
         }
+    } else if let Some(frames) = frames {
+        // What the web frontend does: whole video frames.
+        steps = 0;
+        for _ in 0..frames {
+            sys.run_frame().expect("frame");
+        }
+        steps = sys.cycles;
     } else {
         for _ in 0..steps {
             sys.step().expect("step");
@@ -94,5 +103,4 @@ fn main() {
         steps as f64 / elapsed / 33_868_800.0 * 100.0
     );
     println!("state checksum {hash:016X}");
-    println!("syncs {} mmio {}", sys.bus.dbg_syncs, sys.bus.dbg_mmio);
 }

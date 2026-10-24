@@ -142,8 +142,6 @@ pub struct Bus {
 
     /// CPU cycles run since the devices were last brought up to date.
     pending_cycles: u32,
-    pub dbg_syncs: u64,
-    pub dbg_mmio: u64,
     /// Cycles after which a device may have something to report.
     deadline: u32,
 }
@@ -171,8 +169,6 @@ impl Bus {
             unhandled_io: Vec::new(),
             unhandled_io_count: 0,
             pending_cycles: 0,
-            dbg_syncs: 0,
-            dbg_mmio: 0,
             deadline: 1,
         }
         .with_deadline()
@@ -241,7 +237,6 @@ impl Bus {
 
     /// Bring every device up to date with the CPU.
     pub fn sync_devices(&mut self) {
-        self.dbg_syncs += 1;
         let cycles = std::mem::take(&mut self.pending_cycles);
         if cycles == 0 {
             return;
@@ -446,7 +441,6 @@ impl Bus {
     // ----- Memory-mapped I/O -----
 
     fn io_read(&mut self, phys: u32, width: u32) -> u32 {
-        self.dbg_mmio += 1;
         self.sync_devices();
         let value = self.io_read_synced(phys, width);
         // Reading a serial port or the drive can start something new.
@@ -482,7 +476,6 @@ impl Bus {
     }
 
     fn io_write(&mut self, phys: u32, width: u32, value: u32) {
-        self.dbg_mmio += 1;
         self.sync_devices();
         self.io_write_synced(phys, width, value);
         if self.spu.take_irq() {
