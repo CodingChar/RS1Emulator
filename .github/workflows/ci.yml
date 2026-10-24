@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests (native)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # .cargo/config.toml builds for wasm by default, so name the host target.
+      - name: Unit and integration tests
+        run: cargo test -p ps1-core --target x86_64-unknown-linux-gnu
+      - name: Benchmarks and the boot harness still build
+        run: cargo build --release -p ps1-core --examples --target x86_64-unknown-linux-gnu
+
+  wasm:
+    name: WebAssembly build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the wasm module
+        run: cargo build --release -p ps1-wasm
+      - name: Check the whole workspace
+        run: cargo check --workspace
