@@ -7,7 +7,7 @@ SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (40
 unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS muestra su logo, identifica el
 disco, carga el ejecutable del juego y se lo cede; Resident Evil (USA) muestra el logo de
 CAPCOM y su pantalla de título (~1.200 M de instrucciones). El MDEC decodifica el FMV de introducción (Resident Evil lo muestra entero antes del título). La SPU mezcla 24 voces con ADSR, ruido, FM, reverb y el audio del CD (XA y CD-DA); la intro de Resident Evil genera audio continuo (sin comprobarlo de oídas). Falta el
-intérprete va a ~15 M instr/s en nativo, la mitad del tiempo real.
+intérprete corre a 35-50 M instr/s en nativo (1,0-1,5× el tiempo real) y a 20-30 M en WebAssembly.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
 Marca `[x]` al completar cada ítem.
@@ -197,13 +197,14 @@ Archivos: `spu/mod.rs` (registros y mezclador), `spu/voice.rs` (ADPCM, ADSR, vol
 - [x] Tarjetas de memoria 1 y 2 persistentes en IndexedDB (guardado al detectar escrituras), con exportar, importar y formatear.
 - [x] Estados guardados (3 ranuras) en IndexedDB en lugar de localStorage.
 - [x] Probado en el navegador con el módulo real (`web/build.sh` con `wasm-bindgen-cli` 0.2.129): BIOS y disco de 649 MB cargados por trozos, logo de la BIOS, intro FMV y título de Resident Evil, Start (teclado) lleva a la escena inicial del juego en 3D, y guardar/cargar estado (3 MB) sin errores en la consola. Antes se probó la interfaz con un módulo simulado.
-- [ ] Rendimiento en WebAssembly: ~20-27 % de la velocidad real (11-16 fps), así que el audio sale entrecortado; es el punto débil que queda (ver más abajo).
+- [x] Rendimiento en WebAssembly: de 11-16 fps (20-27 % de la velocidad real) a 50-58 fps (82-98 %) en el navegador, tras las optimizaciones del intérprete (ver más abajo).
 - [ ] Probar en el navegador la persistencia de las tarjetas con una partida real y el audio con altavoces.
 - [ ] Mando analógico (DualShock), vibración y selección del puerto 2.
 - [ ] Cambio de disco en caliente, lista de discos recientes y carga de discos grandes con `File` perezoso desde un Web Worker.
 - [ ] Guardado de estados completo y versionado (hoy `SaveState` no cubre GPU, timers/IRQ internos ni CD-ROM, y falla en silencio si cambia la versión); persistir en IndexedDB.
 - [ ] Ajustes persistentes (`settings.rs` hoy solo guarda en memoria).
-- [ ] Rendimiento: perfilar el intérprete, evaluar cachés de bloques/threaded code; Web Workers para emulación fuera del hilo principal.
+- [x] Rendimiento (`examples/bench.rs`, que comprueba además un checksum de todo el estado para asegurar que las optimizaciones no cambian el comportamiento): dispositivos al día de forma perezosa (solo en su próximo evento o al tocar un registro con tiempo), caminos rápidos de RAM en el bus, tipos de error pequeños, retardo de carga sin `Option`. Nativo: 11,4 → 35 M instr/s (BIOS) y 21 → 51 M (arranque del juego hasta el título, 1.500 M de instrucciones, mismo checksum). WebAssembly (Node): 6 → 21 M (BIOS) y 10 → 31 M (juego).
+- [ ] Más rendimiento: caché de bloques decodificados o recompilador, SIMD en el rasterizador, y Web Workers para emular fuera del hilo principal.
 - [ ] Documentación de usuario y de arquitectura.
 
 ---

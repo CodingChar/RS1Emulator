@@ -66,6 +66,14 @@ cargo run -p ps1-core --example boot --target x86_64-pc-windows-msvc -- \
     --disc "rom_test/<game>/<game>.cue" --bios path/to/bios.bin --steps 20000000
 ```
 
+`examples/bench.rs` measures speed (instructions per second) and prints a checksum
+of the whole machine state, so a change that should only make things faster can be
+checked to behave identically:
+
+```bash
+cargo run --release -p ps1-core --example bench --target x86_64-pc-windows-msvc --     --bios path/to/bios.bin [--disc "game.cue"] --steps 300000000
+```
+
 ## Roadmap
 
 See [ROADMAP.md](ROADMAP.md) for the pending work, ordered by priority.
