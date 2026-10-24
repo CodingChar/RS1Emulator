@@ -226,6 +226,19 @@ impl Bus {
             .max(1)
     }
 
+    /// The physical address of a virtual one (the segment bits dropped).
+    #[inline(always)]
+    pub fn physical(addr: u32) -> u32 {
+        addr & REGION_MASK[(addr >> 29) as usize]
+    }
+
+    /// CPU cycles that can run before some device needs to be brought up to
+    /// date (at least 1).
+    #[inline(always)]
+    pub fn cycles_to_deadline(&self) -> u32 {
+        self.deadline.saturating_sub(self.pending_cycles).max(1)
+    }
+
     /// Account for `cycles` executed CPU cycles.
     #[inline]
     pub fn tick(&mut self, cycles: u32) {

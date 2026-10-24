@@ -200,20 +200,30 @@ impl Interpreter {
     /// This is the same as calling [`Interpreter::step`] in a loop but keeps
     /// the whole interpreter in a single hot loop, which is what makes it fast.
     pub fn run(&mut self, bus: &mut Bus, count: u64) -> (u64, Ps1Result<()>) {
-        let mut irq_line = bus.interrupt.pending();
-        self.set_irq(irq_line);
-        for executed in 0..count {
-            let line = bus.interrupt.pending();
-            if line != irq_line {
-                irq_line = line;
-                self.set_irq(line);
+        let mut executed = 0u64;
+        while executed < count {
+            self.set_irq(bus.interrupt.pending());
+            if !self.interrupt_pending() {
+                // Nothing can change the interrupt line before the next device
+                // event, so a whole batch runs without looking at it again.
+                let limit = (count - executed).min(bus.cycles_to_deadline() as u64) as u32;
+                let done = self.run_fast(bus, limit);
+                if done > 0 {
+                    bus.tick(done);
+                    executed += done as u64;
+                    if done == limit {
+                        continue;
+                    }
+                }
             }
+            // One instruction the fast path does not handle (or an interrupt).
             if let Err(trap) = self.step_inner(bus) {
                 if let Err(e) = self.handle_trap(trap) {
                     return (executed, Err(e));
                 }
             }
             bus.tick(1);
+            executed += 1;
         }
         (count, Ok(()))
     }
@@ -816,6 +826,8 @@ impl Default for Interpreter {
 fn sign_extend16(imm: u32) -> u32 {
     imm as u16 as i16 as i32 as u32
 }
+
+mod fast;
 
 #[cfg(test)]
 mod tests;
