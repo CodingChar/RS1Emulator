@@ -120,8 +120,9 @@ impl System {
         self.cpu.set_irq(self.bus.interrupt.pending());
         self.cpu.step(&mut self.bus)?;
 
-        // Advance DMA, timers, GPU, SPU, CD-ROM in lockstep with CPU cycles.
-        self.bus.step_devices();
+        // Timers, GPU, SPU, CD-ROM and the rest follow in lockstep, caught up
+        // lazily (see `Bus::tick`).
+        self.bus.tick(1);
 
         self.cycles += 1;
         if self.frame_cycles_remaining > 0 {
@@ -138,7 +139,14 @@ impl System {
         while self.frame_cycles_remaining > 0 {
             self.step()?;
         }
+        self.sync();
         Ok(())
+    }
+
+    /// Bring every device up to date with the CPU. Needed before reading device
+    /// state directly (the bus does it for register accesses).
+    pub fn sync(&mut self) {
+        self.bus.sync_devices();
     }
 
     /// Copy the current GPU framebuffer (RGBA8) for presentation.
@@ -147,7 +155,8 @@ impl System {
     }
 
     /// Save the entire machine state (for save states).
-    pub fn save_state(&self) -> Vec<u8> {
+    pub fn save_state(&mut self) -> Vec<u8> {
+        self.sync();
         let state = SaveState::from_system(self);
         bincode::serialize(&state).expect("save state serialization failed")
     }
@@ -157,6 +166,7 @@ impl System {
         let state: SaveState = bincode::deserialize(data)
             .map_err(|e| crate::types::Ps1Error::Io(e.to_string()))?;
         state.apply_to_system(self);
+        self.bus.sync_devices();
         Ok(())
     }
 

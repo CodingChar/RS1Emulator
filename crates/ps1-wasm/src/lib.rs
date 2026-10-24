@@ -169,7 +169,7 @@ impl Ps1 {
     }
 
     /// Save state as bytes (Uint8Array from JS).
-    pub fn save_state(&self) -> Vec<u8> {
+    pub fn save_state(&mut self) -> Vec<u8> {
         self.inner.save_state()
     }
 

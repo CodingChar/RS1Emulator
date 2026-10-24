@@ -139,6 +139,11 @@ pub struct Bus {
     pub unhandled_io: Vec<UnhandledIo>,
     /// Total number of accesses to unclaimed I/O addresses.
     pub unhandled_io_count: u64,
+
+    /// CPU cycles run since the devices were last brought up to date.
+    pending_cycles: u32,
+    /// Cycles after which a device may have something to report.
+    deadline: u32,
 }
 
 impl Bus {
@@ -163,7 +168,15 @@ impl Bus {
             mdec_out_waiting: false,
             unhandled_io: Vec::new(),
             unhandled_io_count: 0,
+            pending_cycles: 0,
+            deadline: 1,
         }
+        .with_deadline()
+    }
+
+    fn with_deadline(mut self) -> Self {
+        self.deadline = self.compute_deadline();
+        self
     }
 
     fn idle_sio1() -> StubRegs {
@@ -191,9 +204,69 @@ impl Bus {
         self.mdec_out_waiting = false;
         self.unhandled_io.clear();
         self.unhandled_io_count = 0;
+        self.pending_cycles = 0;
+        self.deadline = self.compute_deadline();
     }
 
-    /// Advance all devices by one CPU cycle.
+    // ----- Device scheduling -----
+    //
+    // Devices do not run on every CPU cycle. The bus counts the cycles and
+    // brings the devices up to date only when one of them may have something
+    // to report (the `deadline`) or when the CPU talks to a device, so the
+    // result is exactly what stepping them every cycle would give.
+
+    /// The cycles after which the next device event can happen (at least 1).
+    fn compute_deadline(&self) -> u32 {
+        self.gpu
+            .cycles_until_vblank()
+            .min(self.timers.cycles_until_event())
+            .min(self.cdrom.cycles_until_event())
+            .min(self.sio0.cycles_until_event())
+            .min(self.spu.cycles_until_event())
+            .max(1)
+    }
+
+    /// Account for `cycles` executed CPU cycles.
+    #[inline]
+    pub fn tick(&mut self, cycles: u32) {
+        self.pending_cycles += cycles;
+        if self.pending_cycles >= self.deadline {
+            self.sync_devices();
+        }
+    }
+
+    /// Bring every device up to date with the CPU.
+    pub fn sync_devices(&mut self) {
+        let cycles = std::mem::take(&mut self.pending_cycles);
+        if cycles > 0 {
+            self.advance_devices(cycles);
+        }
+        self.deadline = self.compute_deadline();
+    }
+
+    /// Run the devices for `cycles` CPU cycles: the first `cycles - 1` in one
+    /// go (nothing happens in them) and the last one exactly.
+    fn advance_devices(&mut self, cycles: u32) {
+        if cycles > 1 {
+            let skipped = cycles - 1;
+            let video = self.gpu.advance(skipped);
+            if video.vblank_started {
+                self.interrupt.raise(IRQ_VBLANK);
+            }
+            let clocks = TimerClocks {
+                sysclk: skipped,
+                dotclock: video.dot_ticks,
+                hblank: video.hblanks,
+            };
+            self.timers.tick(clocks, &mut self.interrupt);
+            self.cdrom.skip_cycles(skipped);
+            self.sio0.skip_cycles(skipped);
+            self.spu.skip_cycles(skipped);
+        }
+        self.step_devices();
+    }
+
+    /// Advance all devices by exactly one CPU cycle.
     pub fn step_devices(&mut self) {
         let video = self.gpu.advance(1);
         if video.vblank_started {
@@ -313,6 +386,14 @@ impl Bus {
     // ----- Memory-mapped I/O -----
 
     fn io_read(&mut self, phys: u32, width: u32) -> u32 {
+        self.sync_devices();
+        let value = self.io_read_synced(phys, width);
+        // Reading can change a device (pop a FIFO, clear a flag).
+        self.deadline = self.compute_deadline();
+        value
+    }
+
+    fn io_read_synced(&mut self, phys: u32, width: u32) -> u32 {
         match phys {
             MEM_CONTROL1..=MEM_CONTROL1_END => {
                 extract(self.mem_control[((phys - MEM_CONTROL1) >> 2) as usize], phys, width)
@@ -338,6 +419,12 @@ impl Bus {
     }
 
     fn io_write(&mut self, phys: u32, width: u32, value: u32) {
+        self.sync_devices();
+        self.io_write_synced(phys, width, value);
+        self.deadline = self.compute_deadline();
+    }
+
+    fn io_write_synced(&mut self, phys: u32, width: u32, value: u32) {
         match phys {
             MEM_CONTROL1..=MEM_CONTROL1_END => {
                 let i = ((phys - MEM_CONTROL1) >> 2) as usize;

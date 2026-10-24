@@ -22,6 +22,11 @@ const MODE_WRITABLE: u32 = 0x3FF;
 /// The counters are 16 bits wide.
 const COUNTER_OVERFLOW: u32 = 0x1_0000;
 
+/// Lower bounds on the CPU cycles between two pulses of each clock source,
+/// used to schedule the next possible timer event.
+const MIN_CYCLES_PER_DOT: u32 = 2;
+const MIN_CYCLES_PER_HBLANK: u32 = 2000;
+
 /// Clock pulses elapsed since the previous call to [`Timers::tick`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TimerClocks {
@@ -70,6 +75,43 @@ impl Timers {
         *self = Self::new();
     }
 
+    /// Whether the timer is held still by its sync mode.
+    fn is_halted(&self, timer: usize) -> bool {
+        let mode = self.mode[timer];
+        let sync_mode = (mode >> MODE_SYNC_MODE_SHIFT) & 3;
+        timer == 2 && mode & MODE_SYNC_ENABLE != 0 && (sync_mode == 0 || sync_mode == 3)
+    }
+
+    /// Pulses until the counter next reaches its target or overflows (at least 1).
+    fn ticks_until_event(&self, timer: usize) -> u32 {
+        let counter = self.counter[timer];
+        let mut ticks = COUNTER_OVERFLOW - counter;
+        if self.target[timer] > counter {
+            ticks = ticks.min(self.target[timer] - counter);
+        }
+        ticks.max(1)
+    }
+
+    /// A lower bound on the CPU cycles until a timer reaches its target or
+    /// overflows (`u32::MAX` when none can).
+    pub fn cycles_until_event(&self) -> u32 {
+        let mut next = u32::MAX;
+        for timer in 0..3 {
+            if self.is_halted(timer) {
+                continue;
+            }
+            let source = (self.mode[timer] >> MODE_CLOCK_SOURCE_SHIFT) & 3;
+            let cycles_per_pulse = match timer {
+                0 if source & 1 != 0 => MIN_CYCLES_PER_DOT,
+                1 if source & 1 != 0 => MIN_CYCLES_PER_HBLANK,
+                2 if source & 2 != 0 => 8,
+                _ => 1,
+            };
+            next = next.min((self.ticks_until_event(timer) - 1) * cycles_per_pulse);
+        }
+        next
+    }
+
     /// Advance all timers by the given clock pulses.
     pub fn tick(&mut self, clocks: TimerClocks, interrupt: &mut InterruptController) {
         let sysclk_div8 = {
@@ -90,11 +132,13 @@ impl Timers {
             };
 
             // Timer 2 sync modes 0 and 3 halt the counter.
-            let sync_mode = (mode >> MODE_SYNC_MODE_SHIFT) & 3;
-            let halted = timer == 2
-                && mode & MODE_SYNC_ENABLE != 0
-                && (sync_mode == 0 || sync_mode == 3);
-            if halted {
+            if self.is_halted(timer) {
+                continue;
+            }
+
+            // Far from the target and the overflow nothing happens: add up.
+            if ticks < self.ticks_until_event(timer) {
+                self.counter[timer] += ticks;
                 continue;
             }
 

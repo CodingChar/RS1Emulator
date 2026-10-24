@@ -184,6 +184,16 @@ impl Spu {
 
     // ----- Time -----
 
+    /// CPU cycles until the next sample is mixed.
+    pub fn cycles_until_event(&self) -> u32 {
+        CYCLES_PER_SAMPLE - self.cycles
+    }
+
+    /// Advance by `cycles` cycles that end before the next sample is due.
+    pub fn skip_cycles(&mut self, cycles: u32) {
+        self.cycles += cycles;
+    }
+
     /// Advance the SPU by one CPU cycle; every 768 cycles it mixes one
     /// stereo sample, taking the CD audio input from the drive.
     pub fn step(&mut self, cdrom: &mut CdRom) {

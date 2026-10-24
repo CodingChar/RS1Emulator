@@ -214,6 +214,27 @@ impl Sio0 {
     }
 
     /// Advance the port by one CPU cycle.
+    /// CPU cycles until a transfer or /ACK pulse completes (`u32::MAX` when idle).
+    pub fn cycles_until_event(&self) -> u32 {
+        let mut next = u32::MAX;
+        if self.ack_delay > 0 {
+            next = next.min(self.ack_delay);
+        }
+        if let Some(transfer) = &self.transfer {
+            next = next.min(transfer.remaining.max(1));
+        }
+        next
+    }
+
+    /// Advance by `cycles` cycles in which nothing completes.
+    pub fn skip_cycles(&mut self, cycles: u32) {
+        self.ack_hold = self.ack_hold.saturating_sub(cycles);
+        self.ack_delay = self.ack_delay.saturating_sub(cycles);
+        if let Some(transfer) = &mut self.transfer {
+            transfer.remaining = transfer.remaining.saturating_sub(cycles);
+        }
+    }
+
     pub fn step(&mut self, devices: &mut ControllerManager) {
         if self.ack_hold > 0 {
             self.ack_hold -= 1;

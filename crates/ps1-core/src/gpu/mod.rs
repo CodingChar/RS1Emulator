@@ -284,6 +284,20 @@ impl Gpu {
         tick
     }
 
+    /// A lower bound on the CPU cycles until the next vertical blank starts.
+    pub fn cycles_until_vblank(&self) -> u32 {
+        let per_line = self.clocks_per_line();
+        let lines = if self.scanline < VBLANK_START_LINE {
+            VBLANK_START_LINE - self.scanline
+        } else {
+            (self.lines_per_frame() + VBLANK_START_LINE).saturating_sub(self.scanline)
+        };
+        let clocks = (lines * per_line).saturating_sub(self.line_clock);
+        // gpu_clocks(c) = (remainder + 11 c) / 7 must reach `clocks`.
+        (clocks * CPU_CYCLES_PER_11_GPU_CLOCKS).saturating_sub(self.clock_remainder)
+            / GPU_CLOCKS_PER_7_CPU_CYCLES
+    }
+
     /// Advance GPU by one cycle. Drawing is immediate, so there is no work.
     pub fn step(&mut self) {}
 

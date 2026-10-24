@@ -321,6 +321,48 @@ impl CdRom {
 
     // ----- Time -----
 
+    /// CPU cycles until the drive next does something visible (`u32::MAX`
+    /// when it waits for the CPU). Never 0.
+    pub fn cycles_until_event(&self) -> u32 {
+        let mut next = u32::MAX;
+        if !self.queue.is_empty() {
+            next = next.min(if self.countdown > 0 {
+                self.countdown
+            } else if self.interrupt_flag == 0 {
+                1
+            } else {
+                u32::MAX
+            });
+        }
+        if self.playing {
+            next = next.min(self.play_countdown.max(1));
+        }
+        if self.reading {
+            next = next.min(if self.read_countdown > 0 {
+                self.read_countdown
+            } else if self.interrupt_flag == 0 && self.queue.is_empty() {
+                1
+            } else {
+                u32::MAX
+            });
+        }
+        next
+    }
+
+    /// Advance by `cycles` cycles in which [`CdRom::cycles_until_event`]
+    /// promised nothing happens.
+    pub fn skip_cycles(&mut self, cycles: u32) {
+        if !self.queue.is_empty() {
+            self.countdown = self.countdown.saturating_sub(cycles);
+        }
+        if self.playing {
+            self.play_countdown = self.play_countdown.saturating_sub(cycles);
+        }
+        if self.reading {
+            self.read_countdown = self.read_countdown.saturating_sub(cycles);
+        }
+    }
+
     /// Advance the drive by one CPU cycle.
     pub fn step(&mut self) {
         if !self.queue.is_empty() {
