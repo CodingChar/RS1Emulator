@@ -1,12 +1,13 @@
 use crate::cdrom::CdRom;
 use crate::controllers::sio::Sio0;
 use crate::controllers::ControllerManager;
-use crate::dma::Dma;
+use crate::dma::{Dma, CHANNEL_MDEC_IN, CHANNEL_MDEC_OUT};
 use crate::gpu::Gpu;
 use crate::interrupt::{
     InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_GPU, IRQ_VBLANK,
 };
 use crate::io::{extract, merge, read_le, write_le, StubRegs};
+use crate::mdec::Mdec;
 use crate::memory::Memory;
 use crate::spu::Spu;
 use crate::timers::{TimerClocks, Timers};
@@ -73,8 +74,6 @@ const MEM_CONTROL_RESET: [u32; 9] = [
     0x0003_1125, // common delay
 ];
 const RAM_SIZE_RESET: u32 = 0x0000_0B88;
-/// MDEC status at power-on: data-out FIFO empty, ready for commands.
-const MDEC_STATUS_RESET: u32 = 0x8004_0000;
 
 /// Keep at most this many unhandled accesses in `Bus::unhandled_io`.
 const UNHANDLED_IO_LOG_LIMIT: usize = 256;
@@ -130,8 +129,11 @@ pub struct Bus {
     pub sio0: Sio0,
     /// Serial port 1 (link cable) registers, not emulated.
     sio1: StubRegs,
-    /// Motion decoder registers, not emulated yet.
-    mdec: StubRegs,
+    /// Motion decoder (FMV video decompression).
+    pub mdec: Mdec,
+    /// DMA channel 1 was started before the MDEC had produced enough data and
+    /// finishes as soon as it has.
+    mdec_out_waiting: bool,
 
     /// First accesses to unclaimed I/O addresses (see `unhandled_io_count`).
     pub unhandled_io: Vec<UnhandledIo>,
@@ -157,7 +159,8 @@ impl Bus {
             post_code: 0,
             sio0: Sio0::new(),
             sio1: Self::idle_sio1(),
-            mdec: Self::idle_mdec(),
+            mdec: Mdec::new(),
+            mdec_out_waiting: false,
             unhandled_io: Vec::new(),
             unhandled_io_count: 0,
         }
@@ -165,10 +168,6 @@ impl Bus {
 
     fn idle_sio1() -> StubRegs {
         StubRegs::new(0x10)
-    }
-
-    fn idle_mdec() -> StubRegs {
-        StubRegs::new(8).with_u32(4, MDEC_STATUS_RESET)
     }
 
     /// Reset every device and clear RAM/VRAM (the BIOS ROM is kept).
@@ -188,7 +187,8 @@ impl Bus {
         self.sio0.reset();
         self.controllers.deselect();
         self.sio1 = Self::idle_sio1();
-        self.mdec = Self::idle_mdec();
+        self.mdec.reset();
+        self.mdec_out_waiting = false;
         self.unhandled_io.clear();
         self.unhandled_io_count = 0;
     }
@@ -374,14 +374,28 @@ impl Bus {
 
     /// Start a DMA transfer if the channel is ready, and signal completion.
     fn run_dma(&mut self, channel: usize) {
-        if self.dma.should_run(channel) {
-            self.dma.run_channel(
-                channel,
-                &mut self.memory.ram,
-                &mut self.gpu,
-                &mut self.spu,
-                &mut self.cdrom,
-            );
+        if !self.dma.should_run(channel) {
+            return;
+        }
+        if channel == CHANNEL_MDEC_OUT
+            && self.mdec.output_words() < self.dma.transfer_words(channel) as usize
+        {
+            // The decoder has not produced the data yet: wait for it.
+            self.mdec_out_waiting = true;
+            return;
+        }
+        self.dma.run_channel(
+            channel,
+            &mut self.memory.ram,
+            &mut self.gpu,
+            &mut self.spu,
+            &mut self.cdrom,
+            &mut self.mdec,
+        );
+        if channel == CHANNEL_MDEC_IN && self.mdec_out_waiting {
+            self.mdec_out_waiting = false;
+            self.run_dma(CHANNEL_MDEC_OUT);
+            self.forward_dma_irq();
         }
     }
 
@@ -938,6 +952,53 @@ mod tests {
         assert_eq!(bus.read32(0x3000).unwrap(), 0x5678_1234);
     }
 
+
+    /// Queue a one-block 8-bit decode (DC only) at 0x2000 for MDEC input.
+    fn stage_mdec_stream(bus: &mut Bus) {
+        bus.write32(0x2000, 0x2800_0001).unwrap(); // decode, 8-bit, 1 word
+        bus.write32(0x2004, 0xFE00_0020).unwrap(); // DC word + end of block
+    }
+
+    fn start_mdec_input(bus: &mut Bus) {
+        bus.write32(dma_reg(0, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(0, 1), (1 << 16) | 2).unwrap();
+        bus.write32(dma_reg(0, 2), 0x0100_0201).unwrap();
+    }
+
+    fn start_mdec_output(bus: &mut Bus) {
+        bus.write32(dma_reg(1, 0), 0x3000).unwrap();
+        bus.write32(dma_reg(1, 1), (1 << 16) | 16).unwrap();
+        bus.write32(dma_reg(1, 2), 0x0100_0200).unwrap();
+    }
+
+    #[test]
+    fn mdec_dma_decodes_input_and_returns_pixels() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 0);
+        enable_dma_channel(&mut bus, 1);
+        stage_mdec_stream(&mut bus);
+        start_mdec_input(&mut bus);
+        assert_eq!(bus.mdec.output_words(), 16);
+        start_mdec_output(&mut bus);
+        for i in 0..16 {
+            assert_eq!(bus.read32(0x3000 + i * 4).unwrap(), 0x8080_8080, "word {i}");
+        }
+        assert_eq!(bus.read32(dma_reg(1, 2)).unwrap() & (1 << 24), 0);
+        assert_eq!(bus.read32(0x1F80_1824).unwrap() & (1 << 31), 1 << 31, "output drained");
+    }
+
+    #[test]
+    fn mdec_output_dma_started_early_waits_for_the_decoder() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 0);
+        enable_dma_channel(&mut bus, 1);
+        stage_mdec_stream(&mut bus);
+        start_mdec_output(&mut bus);
+        assert_ne!(bus.read32(dma_reg(1, 2)).unwrap() & (1 << 24), 0, "still busy");
+        start_mdec_input(&mut bus);
+        assert_eq!(bus.read32(dma_reg(1, 2)).unwrap() & (1 << 24), 0, "finished");
+        assert_eq!(bus.read32(0x3000).unwrap(), 0x8080_8080);
+    }
 
     #[test]
     fn spu_dma_copies_ram_into_sound_ram() {

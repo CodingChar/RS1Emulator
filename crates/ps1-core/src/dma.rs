@@ -1,6 +1,7 @@
 use crate::cdrom::CdRom;
 use crate::gpu::Gpu;
 use crate::io::{extract, merge};
+use crate::mdec::Mdec;
 use crate::memory::ram::Ram;
 use crate::spu::Spu;
 
@@ -163,6 +164,7 @@ impl Dma {
         gpu: &mut Gpu,
         spu: &mut Spu,
         cdrom: &mut CdRom,
+        mdec: &mut Mdec,
     ) {
         let chcr = self.chcr(channel);
         let sync = (chcr >> CHCR_SYNC_SHIFT) & 3;
@@ -185,9 +187,9 @@ impl Dma {
             for _ in 0..words {
                 if from_ram {
                     let word = ram.read32(address as usize);
-                    Self::write_device(channel, word, gpu, spu);
+                    Self::write_device(channel, word, gpu, spu, mdec);
                 } else {
-                    let word = Self::read_device(channel, gpu, spu, cdrom);
+                    let word = Self::read_device(channel, gpu, spu, cdrom, mdec);
                     ram.write32(address as usize, word);
                 }
                 address = address.wrapping_add(step) & RAM_ADDRESS_MASK;
@@ -247,23 +249,38 @@ impl Dma {
         node
     }
 
-    fn write_device(channel: usize, word: u32, gpu: &mut Gpu, spu: &mut Spu) {
+    fn write_device(channel: usize, word: u32, gpu: &mut Gpu, spu: &mut Spu, mdec: &mut Mdec) {
         match channel {
             CHANNEL_GPU => gpu.write(0, 4, word),
             CHANNEL_SPU => spu.dma_write_word(word),
-            // TODO: MDEC input.
-            CHANNEL_MDEC_IN | CHANNEL_MDEC_OUT | CHANNEL_CDROM | CHANNEL_PIO => {}
+            CHANNEL_MDEC_IN => mdec.write_command(word),
             _ => {}
         }
     }
 
-    fn read_device(channel: usize, gpu: &mut Gpu, spu: &mut Spu, cdrom: &mut CdRom) -> u32 {
+    fn read_device(
+        channel: usize,
+        gpu: &mut Gpu,
+        spu: &mut Spu,
+        cdrom: &mut CdRom,
+        mdec: &mut Mdec,
+    ) -> u32 {
         match channel {
             CHANNEL_GPU => gpu.read(0, 4),
             CHANNEL_CDROM => cdrom.dma_read_word(),
             CHANNEL_SPU => spu.dma_read_word(),
-            // TODO: MDEC output.
+            CHANNEL_MDEC_OUT => mdec.read_data(),
             _ => 0,
+        }
+    }
+
+    /// Number of words a block/slice/manual transfer on the channel moves.
+    pub fn transfer_words(&self, channel: usize) -> u32 {
+        let bcr = self.bcr(channel);
+        if (self.chcr(channel) >> CHCR_SYNC_SHIFT) & 3 == SYNC_MANUAL {
+            Self::block_length(bcr & 0xFFFF)
+        } else {
+            Self::block_length(bcr & 0xFFFF) * (bcr >> 16)
         }
     }
 
