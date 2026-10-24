@@ -186,9 +186,12 @@ fn run_bios(path: &Path, steps: u64) {
     } else {
         let mut hot: Vec<_> = histogram.into_iter().collect();
         hot.sort_by(|a, b| b.1.cmp(&a.1));
-        println!("hottest pcs in the last 100k instructions:");
-        for (pc, n) in hot.iter().take(5) {
-            println!("  {pc:#010X}  x{n}");
+        println!("hottest pcs in the last 100k instructions (by address):");
+        let mut loop_body: Vec<_> = hot.iter().take(40).copied().collect();
+        loop_body.sort_by_key(|(pc, _)| *pc);
+        for (pc, n) in loop_body {
+            let word = sys.bus.read32(pc).unwrap_or(0);
+            println!("  {pc:#010X}  x{n:<6} {word:08X}  {}", disasm(pc, word));
         }
     }
 
@@ -205,5 +208,108 @@ fn run_bios(path: &Path, steps: u64) {
             access.addr,
             if access.write { format!(" = {:#X}", access.value) } else { String::new() }
         );
+    }
+}
+
+// ----- Disassembler (debugging aid) -----
+
+const REG_NAMES: [&str; 32] = [
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+    "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp",
+    "fp", "ra",
+];
+
+fn reg(n: u32) -> &'static str {
+    REG_NAMES[(n & 31) as usize]
+}
+
+/// Render one R3000A instruction located at `pc`.
+fn disasm(pc: u32, w: u32) -> String {
+    let (rs, rt, rd, sh) = ((w >> 21) & 31, (w >> 16) & 31, (w >> 11) & 31, (w >> 6) & 31);
+    let imm = w & 0xFFFF;
+    let simm = imm as u16 as i16;
+    let branch = pc.wrapping_add(4).wrapping_add(((simm as i32) << 2) as u32);
+    let mem = |op: &str| format!("{op} {}, {simm}({})", reg(rt), reg(rs));
+    let arith = |op: &str| format!("{op} {}, {}, {}", reg(rd), reg(rs), reg(rt));
+    let imm_op = |op: &str| format!("{op} {}, {}, {imm:#x}", reg(rt), reg(rs));
+    match w >> 26 {
+        0x00 => match w & 0x3F {
+            0x00 if w == 0 => "nop".into(),
+            0x00 => format!("sll {}, {}, {sh}", reg(rd), reg(rt)),
+            0x02 => format!("srl {}, {}, {sh}", reg(rd), reg(rt)),
+            0x03 => format!("sra {}, {}, {sh}", reg(rd), reg(rt)),
+            0x04 => format!("sllv {}, {}, {}", reg(rd), reg(rt), reg(rs)),
+            0x06 => format!("srlv {}, {}, {}", reg(rd), reg(rt), reg(rs)),
+            0x07 => format!("srav {}, {}, {}", reg(rd), reg(rt), reg(rs)),
+            0x08 => format!("jr {}", reg(rs)),
+            0x09 => format!("jalr {}, {}", reg(rd), reg(rs)),
+            0x0C => "syscall".into(),
+            0x0D => "break".into(),
+            0x10 => format!("mfhi {}", reg(rd)),
+            0x11 => format!("mthi {}", reg(rs)),
+            0x12 => format!("mflo {}", reg(rd)),
+            0x13 => format!("mtlo {}", reg(rs)),
+            0x18 => format!("mult {}, {}", reg(rs), reg(rt)),
+            0x19 => format!("multu {}, {}", reg(rs), reg(rt)),
+            0x1A => format!("div {}, {}", reg(rs), reg(rt)),
+            0x1B => format!("divu {}, {}", reg(rs), reg(rt)),
+            0x20 => arith("add"),
+            0x21 => arith("addu"),
+            0x22 => arith("sub"),
+            0x23 => arith("subu"),
+            0x24 => arith("and"),
+            0x25 => arith("or"),
+            0x26 => arith("xor"),
+            0x27 => arith("nor"),
+            0x2A => arith("slt"),
+            0x2B => arith("sltu"),
+            _ => format!(".word {w:#010x}"),
+        },
+        0x01 => {
+            let op = match rt {
+                0x00 => "bltz",
+                0x01 => "bgez",
+                0x10 => "bltzal",
+                0x11 => "bgezal",
+                _ => return format!(".word {w:#010x}"),
+            };
+            format!("{op} {}, {branch:#010x}", reg(rs))
+        }
+        0x02 => format!("j {:#010x}", (pc.wrapping_add(4) & 0xF000_0000) | ((w & 0x03FF_FFFF) << 2)),
+        0x03 => format!("jal {:#010x}", (pc.wrapping_add(4) & 0xF000_0000) | ((w & 0x03FF_FFFF) << 2)),
+        0x04 => format!("beq {}, {}, {branch:#010x}", reg(rs), reg(rt)),
+        0x05 => format!("bne {}, {}, {branch:#010x}", reg(rs), reg(rt)),
+        0x06 => format!("blez {}, {branch:#010x}", reg(rs)),
+        0x07 => format!("bgtz {}, {branch:#010x}", reg(rs)),
+        0x08 => format!("addi {}, {}, {simm}", reg(rt), reg(rs)),
+        0x09 => format!("addiu {}, {}, {simm}", reg(rt), reg(rs)),
+        0x0A => format!("slti {}, {}, {simm}", reg(rt), reg(rs)),
+        0x0B => format!("sltiu {}, {}, {simm}", reg(rt), reg(rs)),
+        0x0C => imm_op("andi"),
+        0x0D => imm_op("ori"),
+        0x0E => imm_op("xori"),
+        0x0F => format!("lui {}, {imm:#x}", reg(rt)),
+        0x10 => match rs {
+            0x00 => format!("mfc0 {}, cop0r{rd}", reg(rt)),
+            0x04 => format!("mtc0 {}, cop0r{rd}", reg(rt)),
+            0x10 => "rfe".into(),
+            _ => format!(".word {w:#010x}"),
+        },
+        0x12 => format!("cop2 {:#09x}", w & 0x01FF_FFFF),
+        0x20 => mem("lb"),
+        0x21 => mem("lh"),
+        0x22 => mem("lwl"),
+        0x23 => mem("lw"),
+        0x24 => mem("lbu"),
+        0x25 => mem("lhu"),
+        0x26 => mem("lwr"),
+        0x28 => mem("sb"),
+        0x29 => mem("sh"),
+        0x2A => mem("swl"),
+        0x2B => mem("sw"),
+        0x2E => mem("swr"),
+        0x32 => format!("lwc2 cop2r{rt}, {simm}({})", reg(rs)),
+        0x3A => format!("swc2 cop2r{rt}, {simm}({})", reg(rs)),
+        _ => format!(".word {w:#010x}"),
     }
 }
