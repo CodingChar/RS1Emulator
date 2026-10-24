@@ -164,45 +164,75 @@ fn blend(back: u16, front: u16, mode: u8) -> u16 {
     channel(0) | channel(5) | channel(10)
 }
 
-/// Fetch one texel (a 15-bit colour, 0 meaning transparent).
-fn sample_texture(vram: &Vram, window: &TextureWindow, texture: &Texture, u: u32, v: u32) -> u16 {
-    let u = (u & !(window.mask_x * 8)) | ((window.offset_x & window.mask_x) * 8);
-    let v = (v & !(window.mask_y * 8)) | ((window.offset_y & window.mask_y) * 8);
-    let (px, py) = (texture.page_x as usize, texture.page_y as usize + v as usize);
-    let (clut_x, clut_y) = (texture.clut_x as usize, texture.clut_y as usize);
+/// Texel lookup with the texture window and the palette position worked out
+/// once per primitive instead of once per pixel.
+#[derive(Clone, Copy)]
+struct Sampler {
+    keep_u: u32,
+    force_u: u32,
+    keep_v: u32,
+    force_v: u32,
+    page_x: usize,
+    page_y: usize,
+    clut_x: usize,
+    clut_y: usize,
+    depth: TextureDepth,
+}
 
-    match texture.depth {
-        TextureDepth::Bits4 => {
-            let word = vram.get(px + (u / 4) as usize, py);
-            let index = (word >> ((u % 4) * 4)) & 0xF;
-            vram.get(clut_x + index as usize, clut_y)
+impl Sampler {
+    fn new(window: &TextureWindow, texture: &Texture) -> Self {
+        Self {
+            keep_u: !(window.mask_x * 8),
+            force_u: (window.offset_x & window.mask_x) * 8,
+            keep_v: !(window.mask_y * 8),
+            force_v: (window.offset_y & window.mask_y) * 8,
+            page_x: texture.page_x as usize,
+            page_y: texture.page_y as usize,
+            clut_x: texture.clut_x as usize,
+            clut_y: texture.clut_y as usize,
+            depth: texture.depth,
         }
-        TextureDepth::Bits8 => {
-            let word = vram.get(px + (u / 2) as usize, py);
-            let index = (word >> ((u % 2) * 8)) & 0xFF;
-            vram.get(clut_x + index as usize, clut_y)
+    }
+
+    /// Fetch one texel (a 15-bit colour, 0 meaning transparent).
+    #[inline(always)]
+    fn sample(&self, vram: &Vram, u: u32, v: u32) -> u16 {
+        let u = (u & self.keep_u) | self.force_u;
+        let v = (v & self.keep_v) | self.force_v;
+        let py = self.page_y + v as usize;
+        match self.depth {
+            TextureDepth::Bits4 => {
+                let word = vram.get(self.page_x + (u / 4) as usize, py);
+                let index = (word >> ((u % 4) * 4)) & 0xF;
+                vram.get(self.clut_x + index as usize, self.clut_y)
+            }
+            TextureDepth::Bits8 => {
+                let word = vram.get(self.page_x + (u / 2) as usize, py);
+                let index = (word >> ((u % 2) * 8)) & 0xFF;
+                vram.get(self.clut_x + index as usize, self.clut_y)
+            }
+            TextureDepth::Bits15 => vram.get(self.page_x + u as usize, py),
         }
-        TextureDepth::Bits15 => vram.get(px + u as usize, py),
     }
 }
 
-/// Shade and write one pixel. `color` is the interpolated vertex colour
-/// (0..=255); `uv` is the texel coordinate for textured primitives.
-fn put_pixel(
+/// Shade and write the pixel at `(x, y)`, which must be inside VRAM and the
+/// drawing area. `color` is the interpolated vertex colour (0..=255); `u` and
+/// `v` are the texel coordinate for textured primitives.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn shade_pixel(
     vram: &mut Vram,
     settings: &DrawSettings,
     attrs: &Attributes,
-    x: i32,
-    y: i32,
+    sampler: &Sampler,
+    x: usize,
+    y: usize,
     color: [i32; 3],
-    uv: (u32, u32),
+    u: u32,
+    v: u32,
 ) {
-    let area = &settings.area;
-    if x < area.left || x > area.right || y < area.top || y > area.bottom {
-        return;
-    }
-    let (xu, yu) = (x as usize & (VRAM_WIDTH - 1), y as usize & (VRAM_HEIGHT - 1));
-    let back = vram.get(xu, yu);
+    let back = vram.get(x, y);
     if settings.check_mask && back & 0x8000 != 0 {
         return;
     }
@@ -211,7 +241,7 @@ fn put_pixel(
     let mut semi = attrs.semi_transparent;
     let mut modulated = false;
     if attrs.textured {
-        let texel = sample_texture(vram, &settings.window, &attrs.texture, uv.0, uv.1);
+        let texel = sampler.sample(vram, u, v);
         if texel == 0 {
             return; // fully transparent
         }
@@ -236,7 +266,7 @@ fn put_pixel(
     }
 
     if settings.dither && (attrs.gouraud || modulated) {
-        let offset = DITHER[yu & 3][xu & 3];
+        let offset = DITHER[y & 3][x & 3];
         for c in rgb.iter_mut() {
             *c = (*c + offset).clamp(0, 255);
         }
@@ -249,7 +279,27 @@ fn put_pixel(
     if settings.set_mask {
         pixel |= 0x8000;
     }
-    vram.set(xu, yu, pixel);
+    vram.set(x, y, pixel);
+}
+
+/// Shade and write one pixel, if it is inside the drawing area.
+#[allow(clippy::too_many_arguments)]
+fn put_pixel(
+    vram: &mut Vram,
+    settings: &DrawSettings,
+    attrs: &Attributes,
+    sampler: &Sampler,
+    x: i32,
+    y: i32,
+    color: [i32; 3],
+    uv: (u32, u32),
+) {
+    let area = &settings.area;
+    if x < area.left || x > area.right || y < area.top || y > area.bottom {
+        return;
+    }
+    let (xu, yu) = (x as usize & (VRAM_WIDTH - 1), y as usize & (VRAM_HEIGHT - 1));
+    shade_pixel(vram, settings, attrs, sampler, xu, yu, color, uv.0, uv.1);
 }
 
 // ----- Triangles -----
@@ -269,7 +319,37 @@ fn too_big(a: &Vertex, b: &Vertex) -> bool {
     (a.x - b.x).abs() > MAX_PRIMITIVE_WIDTH || (a.y - b.y).abs() > MAX_PRIMITIVE_HEIGHT
 }
 
+/// Exact `n / d` for the small numerators of the interpolation, as a
+/// multiplication: with `m = ceil(2^64 / d)`, `floor(n * m / 2^64) = n / d`
+/// whenever `n < 2^64 / d`. The numerators here are below `255 * d` and `d`
+/// (twice the triangle's area) below 2^21, so this always holds.
+#[derive(Clone, Copy)]
+struct Divider {
+    reciprocal: u64,
+    divisor_is_one: bool,
+}
+
+impl Divider {
+    fn new(divisor: u64) -> Self {
+        Self { reciprocal: u64::MAX / divisor + 1, divisor_is_one: divisor == 1 }
+    }
+
+    #[inline(always)]
+    fn divide(&self, numerator: u64) -> u64 {
+        if self.divisor_is_one {
+            numerator
+        } else {
+            ((numerator as u128 * self.reciprocal as u128) >> 64) as u64
+        }
+    }
+}
+
 /// Draw a triangle. Vertex coordinates are before the drawing offset.
+///
+/// The edge functions are stepped incrementally, each scanline's covered span
+/// is found directly from them, and the interpolated values are stepped the
+/// same way, so a pixel costs a couple of additions instead of a dozen
+/// multiplications and divisions.
 pub fn draw_triangle(vram: &mut Vram, settings: &DrawSettings, attrs: &Attributes, vertices: [Vertex; 3]) {
     let [mut v0, mut v1, mut v2] = vertices;
     if too_big(&v0, &v1) || too_big(&v1, &v2) || too_big(&v2, &v0) {
@@ -294,37 +374,101 @@ pub fn draw_triangle(vram: &mut Vram, settings: &DrawSettings, attrs: &Attribute
     let max_x = v0.x.max(v1.x).max(v2.x).min(clip.right);
     let min_y = v0.y.min(v1.y).min(v2.y).max(clip.top);
     let max_y = v0.y.max(v1.y).max(v2.y).min(clip.bottom);
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
 
-    let top_left = [is_top_left(&v1, &v2), is_top_left(&v2, &v0), is_top_left(&v0, &v1)];
+    // Edge i is (v1,v2), (v2,v0), (v0,v1): its function is the weight of the
+    // opposite vertex. A pixel is inside when every weight is positive, or
+    // zero on a top/left edge: `weight >= bias`.
+    let edges = [(&v1, &v2), (&v2, &v0), (&v0, &v1)];
+    let mut step_x = [0i64; 3];
+    let mut step_y = [0i64; 3];
+    let mut bias = [0i64; 3];
+    let mut row_weight = [0i64; 3];
+    for (i, (a, b)) in edges.iter().enumerate() {
+        step_x[i] = -((b.y - a.y) as i64);
+        step_y[i] = (b.x - a.x) as i64;
+        bias[i] = if is_top_left(a, b) { 0 } else { 1 };
+        row_weight[i] = edge(a, b, min_x, min_y);
+    }
 
+    let divider = Divider::new(area as u64);
+    let sampler = Sampler::new(&settings.window, &attrs.texture);
+    let flat = [v0.color[0] as i32, v0.color[1] as i32, v0.color[2] as i32];
+    // Values interpolated across the triangle: R, G, B, U, V.
+    let channels: [[i64; 3]; 5] = [
+        [v0.color[0] as i64, v1.color[0] as i64, v2.color[0] as i64],
+        [v0.color[1] as i64, v1.color[1] as i64, v2.color[1] as i64],
+        [v0.color[2] as i64, v1.color[2] as i64, v2.color[2] as i64],
+        [v0.u as i64, v1.u as i64, v2.u as i64],
+        [v0.v as i64, v1.v as i64, v2.v as i64],
+    ];
+    let mut channel_step = [0i64; 5];
+    for (c, values) in channels.iter().enumerate() {
+        channel_step[c] = (0..3).map(|i| step_x[i] * values[i]).sum();
+    }
+
+    let width = (max_x - min_x) as i64;
     for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            let w = [edge(&v1, &v2, x, y), edge(&v2, &v0, x, y), edge(&v0, &v1, x, y)];
-            let inside = (0..3).all(|i| w[i] > 0 || (w[i] == 0 && top_left[i]));
-            if !inside {
-                continue;
+        let weights = row_weight;
+        for i in 0..3 {
+            row_weight[i] += step_y[i];
+        }
+
+        // The span of this row where every edge function passes.
+        let (mut first, mut last) = (0i64, width);
+        let mut empty = false;
+        for i in 0..3 {
+            let (w, step) = (weights[i], step_x[i]);
+            if step == 0 {
+                empty |= w < bias[i];
+            } else if step > 0 {
+                let need = bias[i] - w;
+                if need > 0 {
+                    first = first.max((need + step - 1) / step);
+                }
+            } else {
+                let room = w - bias[i];
+                if room < 0 {
+                    empty = true;
+                } else {
+                    last = last.min(room / -step);
+                }
             }
-            let lerp = |a: i32, b: i32, c: i32| -> i32 {
-                ((w[0] * a as i64 + w[1] * b as i64 + w[2] * c as i64) / area) as i32
-            };
+        }
+        if empty || first > last {
+            continue;
+        }
+
+        let yu = y as usize & (VRAM_HEIGHT - 1);
+        let mut numerators = [0i64; 5];
+        for (c, values) in channels.iter().enumerate() {
+            numerators[c] = (0..3).map(|i| (weights[i] + first * step_x[i]) * values[i]).sum();
+        }
+        for k in first..=last {
+            let x = min_x + k as i32;
             let color = if attrs.gouraud {
                 [
-                    lerp(v0.color[0] as i32, v1.color[0] as i32, v2.color[0] as i32),
-                    lerp(v0.color[1] as i32, v1.color[1] as i32, v2.color[1] as i32),
-                    lerp(v0.color[2] as i32, v1.color[2] as i32, v2.color[2] as i32),
+                    divider.divide(numerators[0] as u64) as i32,
+                    divider.divide(numerators[1] as u64) as i32,
+                    divider.divide(numerators[2] as u64) as i32,
                 ]
             } else {
-                [v0.color[0] as i32, v0.color[1] as i32, v0.color[2] as i32]
+                flat
             };
-            let uv = if attrs.textured {
+            let (u, v) = if attrs.textured {
                 (
-                    lerp(v0.u as i32, v1.u as i32, v2.u as i32).clamp(0, 255) as u32,
-                    lerp(v0.v as i32, v1.v as i32, v2.v as i32).clamp(0, 255) as u32,
+                    divider.divide(numerators[3] as u64).min(255) as u32,
+                    divider.divide(numerators[4] as u64).min(255) as u32,
                 )
             } else {
                 (0, 0)
             };
-            put_pixel(vram, settings, attrs, x, y, color, uv);
+            shade_pixel(vram, settings, attrs, &sampler, x as usize & (VRAM_WIDTH - 1), yu, color, u, v);
+            for c in 0..5 {
+                numerators[c] += channel_step[c];
+            }
         }
     }
 }
@@ -352,20 +496,47 @@ pub fn draw_rectangle(
     let (x, y) = (x + settings.offset_x, y + settings.offset_y);
     let clip = &settings.area;
     let color = [color[0] as i32, color[1] as i32, color[2] as i32];
+    let sampler = Sampler::new(&settings.window, &attrs.texture);
+
+    // The columns that survive the clip, found once for every row.
+    let first = (clip.left - x).max(0);
+    let last = (clip.right - x).min(width - 1);
+    if first > last {
+        return;
+    }
+
+    // Opaque flat rectangles (clears, backgrounds) are a plain row fill.
+    let solid = !attrs.textured
+        && !attrs.semi_transparent
+        && !attrs.gouraud
+        && !settings.check_mask
+        && clip.left >= 0
+        && clip.right < VRAM_WIDTH as i32;
+    let solid_pixel = || {
+        ((color[0] >> 3) as u16)
+            | (((color[1] >> 3) as u16) << 5)
+            | (((color[2] >> 3) as u16) << 10)
+            | if settings.set_mask { 0x8000 } else { 0 }
+    };
 
     for dy in 0..height {
         let py = y + dy;
         if py < clip.top || py > clip.bottom {
             continue;
         }
+        let yu = py as usize & (VRAM_HEIGHT - 1);
+        if solid {
+            let start = yu * VRAM_WIDTH + ((x + first) as usize & (VRAM_WIDTH - 1));
+            let count = (last - first + 1) as usize;
+            // The clip rectangle is inside VRAM, so the row cannot wrap.
+            vram.pixels[start..start + count].fill(solid_pixel());
+            continue;
+        }
         let tv = (if flip_y { v as i32 - dy } else { v as i32 + dy }) as u32 & 0xFF;
-        for dx in 0..width {
-            let px = x + dx;
-            if px < clip.left || px > clip.right {
-                continue;
-            }
+        for dx in first..=last {
+            let xu = (x + dx) as usize & (VRAM_WIDTH - 1);
             let tu = (if flip_x { u as i32 - dx } else { u as i32 + dx }) as u32 & 0xFF;
-            put_pixel(vram, settings, attrs, px, py, color, (tu, tv));
+            shade_pixel(vram, settings, attrs, &sampler, xu, yu, color, tu, tv);
         }
     }
 }
@@ -380,6 +551,7 @@ pub fn draw_line(vram: &mut Vram, settings: &DrawSettings, attrs: &Attributes, a
     let (ax, ay) = (a.x + settings.offset_x, a.y + settings.offset_y);
     let (bx, by) = (b.x + settings.offset_x, b.y + settings.offset_y);
     let steps = (bx - ax).abs().max((by - ay).abs());
+    let sampler = Sampler::new(&settings.window, &attrs.texture);
 
     for i in 0..=steps {
         let (x, y, color) = if steps == 0 {
@@ -400,7 +572,7 @@ pub fn draw_line(vram: &mut Vram, settings: &DrawSettings, attrs: &Attributes, a
             (mix(ax, bx), mix(ay, by), color)
         };
         let color = [color[0] as i32, color[1] as i32, color[2] as i32];
-        put_pixel(vram, settings, attrs, x, y, color, (0, 0));
+        put_pixel(vram, settings, attrs, &sampler, x, y, color, (0, 0));
     }
 }
 
@@ -416,8 +588,14 @@ pub fn fill_rectangle(vram: &mut Vram, x: u32, y: u32, width: u32, height: u32, 
     let height = (height & 0x1FF) as usize;
     let pixel = rgb888_to_15(color);
     for dy in 0..height {
-        for dx in 0..width {
-            vram.set(x + dx, y + dy, pixel);
+        let row = ((y + dy) % VRAM_HEIGHT) * VRAM_WIDTH;
+        let end = x + width;
+        if end <= VRAM_WIDTH {
+            vram.pixels[row + x..row + end].fill(pixel);
+        } else {
+            // The row wraps around to its start.
+            vram.pixels[row + x..row + VRAM_WIDTH].fill(pixel);
+            vram.pixels[row..row + end - VRAM_WIDTH].fill(pixel);
         }
     }
 }
@@ -440,10 +618,35 @@ pub fn copy_rectangle(
     size: (u32, u32),
 ) {
     let (width, height) = (transfer_width(size.0), transfer_height(size.1));
+    let (sx, sy) = (src.0 as usize, src.1 as usize);
+    let (dx0, dy0) = (dst.0 as usize, dst.1 as usize);
+
+    // Whole rows can be moved at once when nothing wraps, the destination
+    // does not overlap the source (which would change what later pixels
+    // read) and no pixel needs the mask check.
+    let wraps = sx + width > VRAM_WIDTH
+        || dx0 + width > VRAM_WIDTH
+        || sy + height > VRAM_HEIGHT
+        || dy0 + height > VRAM_HEIGHT;
+    let disjoint = sx + width <= dx0 || dx0 + width <= sx || sy + height <= dy0 || dy0 + height <= sy;
+    if !wraps && disjoint && !settings.check_mask {
+        for dy in 0..height {
+            let from = (sy + dy) * VRAM_WIDTH + sx;
+            let to = (dy0 + dy) * VRAM_WIDTH + dx0;
+            vram.pixels.copy_within(from..from + width, to);
+            if settings.set_mask {
+                for pixel in &mut vram.pixels[to..to + width] {
+                    *pixel |= 0x8000;
+                }
+            }
+        }
+        return;
+    }
+
     for dy in 0..height {
         for dx in 0..width {
-            let pixel = vram.get(src.0 as usize + dx, src.1 as usize + dy);
-            let (x, y) = (dst.0 as usize + dx, dst.1 as usize + dy);
+            let pixel = vram.get(sx + dx, sy + dy);
+            let (x, y) = (dx0 + dx, dy0 + dy);
             if settings.check_mask && vram.get(x, y) & 0x8000 != 0 {
                 continue;
             }
@@ -465,5 +668,9 @@ pub fn rgb888_to_15(color: [u8; 3]) -> u16 {
     ((color[0] >> 3) as u16) | (((color[1] >> 3) as u16) << 5) | (((color[2] >> 3) as u16) << 10)
 }
 
+#[cfg(test)]
+mod equivalence;
+#[cfg(test)]
+mod reference;
 #[cfg(test)]
 mod tests;
