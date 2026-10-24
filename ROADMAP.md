@@ -3,10 +3,10 @@
 Estado actual: la CPU (R3000A) y el GTE están completos; el bus mapea RAM, BIOS,
 scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
 contadores reales, DMA, el controlador del CD-ROM con lectura de BIN/CUE, el puerto serie
-SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (353 tests
+SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (369 tests
 unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS muestra su logo, identifica el
 disco, carga el ejecutable del juego y se lo cede; Resident Evil (USA) muestra el logo de
-CAPCOM y su pantalla de título (~1.200 M de instrucciones). Faltan SPU y MDEC (FMV), y el
+CAPCOM y su pantalla de título (~1.200 M de instrucciones). El MDEC decodifica el FMV de introducción (Resident Evil lo muestra entero antes del título). Falta la SPU (audio) y el
 intérprete va a ~15 M instr/s en nativo, la mitad del tiempo real.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
@@ -115,7 +115,8 @@ Archivo: `dma.rs`
 - [x] Registros por canal (MADR, BCR, CHCR), DPCR, DICR e IRQ.
 - [x] Modos: bloque, slice y lista enlazada (GPU); las transferencias terminan al instante.
 - [x] Canales: OTC, GPU (a/desde RAM y lista enlazada), SPU (memoria de sonido) y CD-ROM (FIFO de datos del sector).
-- [ ] Canales MDEC in/out y PIO.
+- [x] Canales MDEC in/out (Fase 11).
+- [ ] Canal PIO.
 - [ ] Prioridad entre canales, troceado (chopping) y duración real de las transferencias (hoy no detienen a la CPU).
 
 ## Fase 7 — CD-ROM y formatos de disco
@@ -172,7 +173,12 @@ Archivo: `spu.rs`
 
 ## Fase 11 — MDEC (vídeos FMV)
 
-- [ ] Módulo nuevo `mdec.rs`: decodificación de macrobloques, tablas IDCT, canal DMA in/out.
+- [x] Módulo `mdec.rs`: comandos (decodificar, tablas de cuantización, tabla de escala), registros de datos/estado/control, decodificación RLE, desfase DC/AC con zigzag, IDCT con la tabla subida por el juego, conversión YCbCr→RGB a 24/15 bpp y salida monocroma a 8/4 bpp.
+- [x] Canales DMA 0 (entrada) y 1 (salida); una salida lanzada antes de que el decodificador tenga los datos espera y termina al llegar.
+- [x] Hito: el vídeo de introducción de Resident Evil se ve entero (capturas con `--shots-every`).
+- [ ] Decodificación temporizada (hoy es instantánea) y bits de estado de bloque actual / FIFO exactos.
+- [ ] Verificar el redondeo del IDCT y la indexación de la tabla de cuantización contra una referencia (líneas verticales tenues en el vídeo).
+- [ ] Incluir el MDEC en el guardado de estados.
 
 ## Fase 12 — Frontend web y herramientas
 
