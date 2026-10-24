@@ -41,6 +41,8 @@ struct Args {
     /// (`--shots-every N --shots-prefix PREFIX`).
     shots_every: u64,
     shots_prefix: Option<PathBuf>,
+    /// Record the SPU output into a 44.1 kHz stereo WAV file (`--wav`).
+    wav: Option<PathBuf>,
     /// Addresses to count executions of (`--watch-pc`).
     watch: Vec<u32>,
     /// Save the displayed frame as a PNG after the run (`--screenshot`).
@@ -50,7 +52,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -74,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--shots-every: {e}"))?
             }
+            "--wav" => args.wav = Some(PathBuf::from(value("--wav")?)),
             "--shots-prefix" => args.shots_prefix = Some(PathBuf::from(value("--shots-prefix")?)),
             "--watch-pc" => {
                 let text = value("--watch-pc")?;
@@ -232,6 +235,8 @@ fn run_bios(
     let mut last_post = 0u8;
     let mut executed = 0u64;
     let mut failure = None;
+    // Audio drained from the SPU, as interleaved 16-bit samples.
+    let mut audio: Vec<i16> = Vec::new();
     // For each watched address: (address, times executed, step of the first execution).
     let mut watched: Vec<(u32, u64, Option<u64>)> = args.watch.iter().map(|a| (*a, 0, None)).collect();
 
@@ -260,12 +265,31 @@ fn run_bios(
                 }
             }
         }
+        if args.wav.is_some() && executed % 65_536 == 0 {
+            audio.extend(sys.bus.spu.output_buffer.drain(..).map(|s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16));
+        }
         if sys.bus.post_code != last_post {
             last_post = sys.bus.post_code;
             println!("  [{executed:>10}] POST code {last_post:#04X}");
         }
     }
 
+    if let Some(path) = &args.wav {
+        audio.extend(sys.bus.spu.output_buffer.drain(..).map(|s| (s * 32768.0).clamp(-32768.0, 32767.0) as i16));
+        match write_wav(path, &audio) {
+            Ok(()) => println!("wrote {} ({} s of audio)", path.display(), audio.len() / 2 / 44_100),
+            Err(e) => eprintln!("wav: {e}"),
+        }
+        // RMS level of every second of audio, to see where there is sound.
+        let levels: Vec<String> = audio
+            .chunks(44_100 * 2)
+            .map(|c| {
+                let sum: f64 = c.iter().map(|s| (*s as f64) * (*s as f64)).sum();
+                format!("{:.0}", (sum / c.len() as f64).sqrt())
+            })
+            .collect();
+        println!("audio RMS per second: {}", levels.join(" "));
+    }
     for (addr, count, first) in &watched {
         match first {
             Some(step) => println!("watch {addr:#010X}: executed {count} times, first at step {step}"),
@@ -489,6 +513,27 @@ fn disasm(pc: u32, w: u32) -> String {
 }
 
 // ----- PNG output (uncompressed, no dependencies) -----
+
+fn write_wav(path: &Path, samples: &[i16]) -> Result<(), String> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    out.extend_from_slice(&44_100u32.to_le_bytes());
+    out.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    std::fs::write(path, out).map_err(|e| e.to_string())
+}
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;

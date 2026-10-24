@@ -22,6 +22,7 @@ pub mod settings;
 pub mod spu;
 pub mod timers;
 pub mod system;
+pub mod xa;
 
 pub use system::System;
 pub use types::{Ps1Error, Ps1Result};

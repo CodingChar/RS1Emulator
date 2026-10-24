@@ -4,7 +4,7 @@ use crate::controllers::ControllerManager;
 use crate::dma::{Dma, CHANNEL_MDEC_IN, CHANNEL_MDEC_OUT};
 use crate::gpu::Gpu;
 use crate::interrupt::{
-    InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_GPU, IRQ_VBLANK,
+    InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_GPU, IRQ_SPU, IRQ_VBLANK,
 };
 use crate::io::{extract, merge, read_le, write_le, StubRegs};
 use crate::mdec::Mdec;
@@ -208,7 +208,10 @@ impl Bus {
 
         self.gpu.step();
         self.forward_gpu_irq();
-        self.spu.step();
+        self.spu.step(&mut self.cdrom);
+        if self.spu.take_irq() {
+            self.interrupt.raise(IRQ_SPU);
+        }
         self.cdrom.step();
         self.forward_cdrom_irq();
         self.sio0.step(&mut self.controllers);

@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 
 use crate::disc::{
-    from_bcd, lba_to_msf, to_bcd, Disc, DATA_SECTOR_SIZE, LEAD_IN_SECTORS, RAW_SECTOR_SIZE,
-    SECTORS_PER_MINUTE, SECTORS_PER_SECOND,
+    from_bcd, lba_to_msf, to_bcd, Disc, TrackKind, DATA_SECTOR_SIZE, LEAD_IN_SECTORS,
+    RAW_SECTOR_SIZE, SECTORS_PER_MINUTE, SECTORS_PER_SECOND,
 };
 use crate::types::Ps1Result;
+use crate::xa::{self, Frame, XaDecoder};
 
 // ----- Status byte returned by most commands -----
 const STAT_ERROR: u8 = 0x01;
@@ -12,6 +13,7 @@ const STAT_MOTOR_ON: u8 = 0x02;
 const STAT_ID_ERROR: u8 = 0x08;
 const STAT_READING: u8 = 0x20;
 const STAT_SEEKING: u8 = 0x40;
+const STAT_PLAYING: u8 = 0x80;
 
 // ----- Interrupt numbers (bits 0-2 of the interrupt flag register) -----
 /// A sector of data is ready.
@@ -36,6 +38,10 @@ const ERROR_NOT_READY: u8 = 0x80;
 // ----- Mode register (Setmode) -----
 /// Sectors hold the full 2340 bytes after the sync pattern instead of 2048.
 const MODE_WHOLE_SECTOR: u8 = 1 << 5;
+/// Decode XA-ADPCM audio sectors instead of delivering them.
+const MODE_XA_ENABLE: u8 = 1 << 6;
+/// Only decode XA sectors matching the Setfilter file and channel.
+const MODE_XA_FILTER: u8 = 1 << 3;
 /// Double speed (150 sectors per second).
 const MODE_DOUBLE_SPEED: u8 = 1 << 7;
 
@@ -58,6 +64,11 @@ const FIFO_SIZE: usize = 16;
 
 /// BIOS version reported by `Test 20h`: 1994-09-19, version C0 (SCPH-1001).
 const CONTROLLER_VERSION: [u8; 4] = [0x94, 0x09, 0x19, 0xC0];
+
+/// A CD-DA sector holds 588 stereo frames.
+const AUDIO_FRAMES_PER_SECTOR: usize = RAW_SECTOR_SIZE / 4;
+/// Upper bound on queued audio frames (about two seconds).
+const AUDIO_QUEUE_LIMIT: usize = 44_100 * 2;
 
 /// Keep at most this many entries in [`CdRom::command_log`].
 const COMMAND_LOG_LIMIT: usize = 256;
@@ -124,6 +135,16 @@ pub struct CdRom {
     sector_buffer: Vec<u8>,
     /// Header and subheader of the latest sector (for GetlocL).
     last_header: Option<[u8; 8]>,
+
+    // Audio output towards the SPU, at 44.1 kHz.
+    audio: VecDeque<Frame>,
+    xa: XaDecoder,
+    /// A CD-DA track is playing; `play_sector` is the next sector to read.
+    playing: bool,
+    play_sector: u32,
+    play_countdown: u32,
+    /// CD to SPU volume matrix, 0x80 = 1.0: left-left, left-right, right-left, right-right.
+    volume: [u8; 4],
 }
 
 impl CdRom {
@@ -155,6 +176,12 @@ impl CdRom {
             read_countdown: 0,
             sector_buffer: Vec::new(),
             last_header: None,
+            audio: VecDeque::new(),
+            xa: XaDecoder::new(),
+            playing: false,
+            play_sector: 0,
+            play_countdown: 0,
+            volume: [0x80, 0, 0, 0x80],
         }
     }
 
@@ -269,7 +296,11 @@ impl CdRom {
                 }
                 self.update_irq_line();
             }
-            // Sound map and audio volume registers are not emulated.
+            // Audio volume matrix: CD left/right into the SPU left/right inputs.
+            (2, 2) => self.volume[0] = value,
+            (3, 2) => self.volume[1] = value,
+            (2, 3) => self.volume[2] = value,
+            (1, 3) => self.volume[3] = value,
             _ => {}
         }
     }
@@ -297,6 +328,14 @@ impl CdRom {
             // A new interrupt waits until the previous one is acknowledged.
             if self.countdown == 0 && self.interrupt_flag == 0 {
                 self.deliver_next_response();
+            }
+        }
+
+        if self.playing {
+            if self.play_countdown > 0 {
+                self.play_countdown -= 1;
+            } else {
+                self.deliver_audio_sector();
             }
         }
 
@@ -355,6 +394,18 @@ impl CdRom {
             return;
         }
 
+        // XA audio sectors are decoded for the SPU instead of being delivered.
+        if self.mode & MODE_XA_ENABLE != 0 && xa::is_audio_sector(&raw) {
+            let selected = self.mode & MODE_XA_FILTER == 0
+                || (raw[16] == self.filter_file && raw[17] == self.filter_channel);
+            if selected && self.audio.len() < AUDIO_QUEUE_LIMIT {
+                self.xa.decode_sector(&raw, &mut self.audio);
+            }
+            self.current_sector += 1;
+            self.read_countdown = self.cycles_per_sector();
+            return;
+        }
+
         let mut header = [0u8; 8];
         header.copy_from_slice(&raw[12..20]);
         self.last_header = Some(header);
@@ -370,6 +421,43 @@ impl CdRom {
         self.set_response(INT1_DATA_READY, &[stat]);
     }
 
+    /// Read the next CD-DA sector under the play head into the audio queue.
+    fn deliver_audio_sector(&mut self) {
+        let lba = self.play_sector;
+        let mut raw = [0u8; RAW_SECTOR_SIZE];
+        let readable = self.disc.as_mut().is_some_and(|disc| {
+            lba < disc.total_sectors()
+                && disc.track_at(lba).kind == TrackKind::Audio
+                && disc.read_raw_sector(lba, &mut raw)
+        });
+        if !readable {
+            self.playing = false;
+            return;
+        }
+        if self.audio.len() < AUDIO_QUEUE_LIMIT {
+            for i in 0..AUDIO_FRAMES_PER_SECTOR {
+                let left = i16::from_le_bytes([raw[i * 4], raw[i * 4 + 1]]);
+                let right = i16::from_le_bytes([raw[i * 4 + 2], raw[i * 4 + 3]]);
+                self.audio.push_back((left, right));
+            }
+        }
+        self.play_sector += 1;
+        self.current_sector = self.play_sector;
+        self.play_countdown = self.cycles_per_sector();
+    }
+
+    /// The next frame of CD audio (CD-DA or XA) for the SPU, with the drive
+    /// volume matrix applied; silence when nothing is playing.
+    pub fn pop_audio_frame(&mut self) -> Frame {
+        let Some((left, right)) = self.audio.pop_front() else {
+            return (0, 0);
+        };
+        let [ll, lr, rl, rr] = self.volume.map(|v| v as i32);
+        let out_left = (left as i32 * ll + right as i32 * rl) >> 7;
+        let out_right = (left as i32 * lr + right as i32 * rr) >> 7;
+        (out_left.clamp(-0x8000, 0x7FFF) as i16, out_right.clamp(-0x8000, 0x7FFF) as i16)
+    }
+
     // ----- Commands -----
 
     /// The status byte most responses start with.
@@ -380,6 +468,9 @@ impl CdRom {
         }
         if self.reading {
             stat |= STAT_READING;
+        }
+        if self.playing {
+            stat |= STAT_PLAYING;
         }
         stat
     }
@@ -443,8 +534,26 @@ impl CdRom {
                 }
                 None => self.fail(ERROR_INVALID_ARGUMENT),
             },
-            // Play, Forward, Backward: audio playback is not emulated.
-            0x03 | 0x04 | 0x05 => self.acknowledge(vec![stat]),
+            // Play: CD-DA playback from a track, the Setloc position or the head
+            0x03 => {
+                if self.disc.is_none() {
+                    return self.fail(ERROR_NOT_READY);
+                }
+                let track_start = params.first().filter(|t| **t != 0).and_then(|t| {
+                    let number = from_bcd(*t)?;
+                    self.disc.as_ref()?.tracks().iter().find(|t| t.number == number).map(|t| t.start_lba)
+                });
+                self.play_sector = track_start
+                    .or_else(|| self.seek_target.take())
+                    .unwrap_or(self.current_sector);
+                self.seek_target = None;
+                self.playing = true;
+                self.reading = false;
+                self.play_countdown = ACK_DELAY + READ_START_DELAY;
+                self.acknowledge(vec![self.stat()]);
+            }
+            // Forward, Backward: fast-forward is not emulated.
+            0x04 | 0x05 => self.acknowledge(vec![stat]),
             // ReadN, ReadS
             0x06 | 0x1B => {
                 if self.disc.is_none() {
@@ -453,6 +562,7 @@ impl CdRom {
                 if let Some(target) = self.seek_target.take() {
                     self.current_sector = target;
                 }
+                self.playing = false;
                 self.reading = true;
                 self.read_countdown = ACK_DELAY + READ_START_DELAY;
                 self.acknowledge(vec![self.stat()]);
@@ -466,6 +576,7 @@ impl CdRom {
             // Stop
             0x08 => {
                 self.reading = false;
+                self.playing = false;
                 self.acknowledge(vec![stat]);
                 self.motor_on = false;
                 self.complete(MOTOR_DELAY, vec![self.stat()]);
@@ -474,6 +585,7 @@ impl CdRom {
             0x09 => {
                 let delay = if self.reading { PAUSE_DELAY_WHILE_READING } else { PAUSE_DELAY_IDLE };
                 self.reading = false;
+                self.playing = false;
                 self.acknowledge(vec![stat]);
                 self.complete(delay, vec![self.stat()]);
             }
@@ -481,6 +593,7 @@ impl CdRom {
             0x0A => {
                 self.motor_on = true;
                 self.reading = false;
+                self.playing = false;
                 self.mode = 0;
                 self.acknowledge(vec![self.stat()]);
                 self.complete(INIT_COMPLETE_DELAY, vec![self.stat()]);
@@ -559,6 +672,7 @@ impl CdRom {
                     return self.fail(ERROR_NOT_READY);
                 }
                 self.reading = false;
+                self.playing = false;
                 if let Some(target) = self.seek_target.take() {
                     self.current_sector = target;
                 }

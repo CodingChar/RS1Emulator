@@ -59,6 +59,16 @@ impl Ps1 {
         self.inner.bus.gpu.display_height() as u32
     }
 
+    /// Take the audio produced since the last call: interleaved stereo f32
+    /// samples in -1.0..1.0 at `audio_sample_rate()`.
+    pub fn drain_audio(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.inner.bus.spu.output_buffer)
+    }
+
+    pub fn audio_sample_rate(&self) -> u32 {
+        self.inner.bus.spu.sample_rate
+    }
+
     /// Set controller input for a port.
     pub fn set_input(
         &mut self,

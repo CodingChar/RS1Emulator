@@ -3,10 +3,10 @@
 Estado actual: la CPU (R3000A) y el GTE están completos; el bus mapea RAM, BIOS,
 scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
 contadores reales, DMA, el controlador del CD-ROM con lectura de BIN/CUE, el puerto serie
-SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (369 tests
+SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (407 tests
 unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS muestra su logo, identifica el
 disco, carga el ejecutable del juego y se lo cede; Resident Evil (USA) muestra el logo de
-CAPCOM y su pantalla de título (~1.200 M de instrucciones). El MDEC decodifica el FMV de introducción (Resident Evil lo muestra entero antes del título). Falta la SPU (audio) y el
+CAPCOM y su pantalla de título (~1.200 M de instrucciones). El MDEC decodifica el FMV de introducción (Resident Evil lo muestra entero antes del título). La SPU mezcla 24 voces con ADSR, ruido, FM, reverb y el audio del CD (XA y CD-DA); la intro de Resident Evil suena con su voz y música. Falta el
 intérprete va a ~15 M instr/s en nativo, la mitad del tiempo real.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
@@ -129,7 +129,8 @@ Archivo: `disc.rs` (imágenes)
 - [x] Lectura de sectores (2048, 2336 y 2352 bytes), pistas, TOC y tiempo MSF; detección de región por el sector de licencia.
 - [x] Controlador del CD-ROM: registros, FIFOs de parámetros/respuesta/datos, interrupciones INT1–INT5 con retardos, comandos Getstat, Setloc, ReadN/ReadS, Pause, Stop, MotorOn, Init, Setmode, Setfilter, Getparam, GetlocL/P, GetTN, GetTD, SeekL/P, Test, GetID, ReadTOC, SetSession, y velocidad simple/doble.
 - [x] Registro de comandos (`CdRom::command_log`) y salida en el harness.
-- [ ] Pistas de audio: Play/Forward/Backward solo responden, no reproducen; CDDA y XA-ADPCM.
+- [x] Pistas de audio: Play reproduce CD-DA y los sectores XA-ADPCM (Setmode bit 6, filtro de archivo/canal) se decodifican hacia la SPU.
+- [ ] Forward/Backward solo responden; faltan los informes de posición de CD-DA (Setmode bit 2) y XA de 8 bits.
 - [ ] Filtro XA real (Setfilter solo guarda los valores), modo de informe (Report) y auto-pausa.
 - [ ] `PREGAP`/`POSTGAP` de las hojas CUE y subcanal Q (GetlocP aproxima la posición).
 - [ ] Tiempos de búsqueda realistas según la distancia; hoy son retardos fijos.
@@ -163,13 +164,20 @@ Archivos: `controllers/mod.rs`, `controllers/pad.rs`
 
 ## Fase 10 — Audio (SPU)
 
-Archivo: `spu.rs`
+Archivos: `spu/mod.rs` (registros y mezclador), `spu/voice.rs` (ADPCM, ADSR, volúmenes), `spu/reverb.rs`, `xa.rs`
 
-- [ ] Registros SPU (voces, volúmenes, ADSR, control, estado) mapeados en el bus; unificar `sound_ram` con `Memory::spu_ram` (hoy están duplicadas).
-- [ ] Decodificación ADPCM, mezcla de 24 voces, envolventes, ruido, FM.
-- [ ] Reverb.
-- [ ] Mezcla de CD-DA/XA.
-- [ ] Salida a Web Audio API (AudioWorklet) desde `ps1-wasm`/`ps1-web`.
+- [x] Registros SPU (voces, volúmenes, ADSR, KON/KOFF, ENDX, control, estado, IRQ) y transferencias a la RAM de sonido por FIFO y DMA; `Memory::spu_ram` duplicada eliminada.
+- [x] Decodificación ADPCM con los cinco filtros, bucles (flags de inicio/fin/repetición), 24 voces a 44,1 kHz (768 ciclos por muestra).
+- [x] Envolvente ADSR (ataque/decaimiento/sostenido/liberación, lineal y exponencial), volúmenes fijos y con barrido, ruido (LFSR), modulación de tono.
+- [x] Reverb (peines y filtros paso-todo en la RAM de sonido, a 22,05 kHz).
+- [x] Mezcla de CD-DA/XA con la matriz de volumen del CD y los volúmenes de la SPU.
+- [x] IRQ de la SPU por acceso a la dirección vigilada (voces y transferencias).
+- [x] `Ps1::drain_audio()` / `audio_sample_rate()` en `ps1-wasm`; el harness graba un WAV (`--wav`).
+- [x] Hito: la intro de Resident Evil genera ~35 s de audio sin recortes y con espectro de música/voz, no de ruido (comprobado por análisis espectral con el harness, no de oídas).
+- [ ] Interpolación gaussiana de la SPU (hoy es cúbica Catmull-Rom) y filtros FIR de entrada/salida del reverb.
+- [ ] Buffers de captura de la SPU y los efectos de ancho de banda de las transferencias (FIFO real).
+- [ ] Guardar el estado de las voces, el reverb y el audio del CD en los save states (hoy solo se guardan los registros).
+- [ ] Reproducir en el navegador con Web Audio (AudioWorklet) en `ps1-web` (Fase 12).
 
 ## Fase 11 — MDEC (vídeos FMV)
 
