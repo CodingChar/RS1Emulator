@@ -140,6 +140,20 @@ impl Ps1 {
     /// Insert the disc made of the files received so far. With a CUE sheet the
     /// files it names are used; without one there must be exactly one image.
     pub fn insert_disc_files(&mut self, cue: Option<String>) -> Result<(), JsValue> {
+        let disc = self.take_disc(cue)?;
+        self.inner.insert_disc_image(disc);
+        Ok(())
+    }
+
+    /// Like `insert_disc_files`, for a console that is running: the drive
+    /// reports the lid as opened and the game decides what to do.
+    pub fn swap_disc_files(&mut self, cue: Option<String>) -> Result<(), JsValue> {
+        let disc = self.take_disc(cue)?;
+        self.inner.swap_disc_image(disc);
+        Ok(())
+    }
+
+    fn take_disc(&mut self, cue: Option<String>) -> Result<Disc, JsValue> {
         self.end_disc_file();
         let mut files = std::mem::take(&mut self.disc_files);
         let to_js = |e: ps1_core::Ps1Error| JsValue::from_str(&e.to_string());
@@ -162,8 +176,7 @@ impl Ps1 {
                 Disc::from_image_source(file.into_source()).map_err(to_js)?
             }
         };
-        self.inner.insert_disc_image(disc);
-        Ok(())
+        Ok(disc)
     }
 
     /// Queue a PS-X EXE program to run instead of the BIOS shell (the BIOS

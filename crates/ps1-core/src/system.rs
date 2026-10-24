@@ -144,6 +144,14 @@ impl System {
         self.disc_inserted = true;
     }
 
+    /// Swap the disc without resetting, like opening the lid of a running
+    /// console. The game has to notice and handle it (multi-disc games do).
+    pub fn swap_disc_image(&mut self, disc: crate::disc::Disc) {
+        self.sync();
+        self.bus.cdrom.change_disc(disc);
+        self.disc_inserted = true;
+    }
+
     /// Power on / reset the system.
     pub fn reset(&mut self) -> Ps1Result<()> {
         if !self.bios_loaded {

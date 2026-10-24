@@ -113,8 +113,10 @@ function loadExe(file) {
     return true;
 }
 
-function loadDisc(files) {
-    if (files.length === 1 && /\.(exe|psx|ps-exe)$/i.test(files[0].name)) {
+/// Open the disc made of `files`. With `swap` the console keeps running and
+/// the game sees the lid being opened; otherwise it is a fresh insertion.
+function loadDisc(files, swap = false) {
+    if (!swap && files.length === 1 && /\.(exe|psx|ps-exe)$/i.test(files[0].name)) {
         loadExe(files[0]);
         return;
     }
@@ -128,7 +130,9 @@ function loadDisc(files) {
         for (const file of data) {
             ps1.add_lazy_disc_file(file.name, file.size, makeReader(file));
         }
-        ps1.insert_disc_files(cue ? new FileReaderSync().readAsText(cue) : undefined);
+        const cueText = cue ? new FileReaderSync().readAsText(cue) : undefined;
+        if (swap) ps1.swap_disc_files(cueText);
+        else ps1.insert_disc_files(cueText);
     } catch (error) {
         ps1.discard_disc_files();
         say(`No se pudo cargar el disco: ${error}`, true);
@@ -373,6 +377,10 @@ onmessage = async (event) => {
             loadDisc(message.files);
             if (discLoaded && biosLoaded) startConsole();
             else publishState();
+            return;
+        case 'swap-disc':
+            loadDisc(message.files, true);
+            say('Disco cambiado: el juego tiene que darse cuenta (los de varios discos lo piden).');
             return;
         case 'start': return startConsole();
         case 'pause':

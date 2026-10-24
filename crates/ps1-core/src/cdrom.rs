@@ -13,6 +13,7 @@ const STAT_ERROR: u8 = 0x01;
 const STAT_MOTOR_ON: u8 = 0x02;
 const STAT_ID_ERROR: u8 = 0x08;
 const STAT_READING: u8 = 0x20;
+const STAT_SHELL_OPEN: u8 = 0x10;
 const STAT_SEEKING: u8 = 0x40;
 const STAT_PLAYING: u8 = 0x80;
 
@@ -142,6 +143,8 @@ pub struct CdRom {
     sector_buffer: Vec<u8>,
     /// Header and subheader of the latest sector (for GetlocL).
     last_header: Option<[u8; 8]>,
+    /// The lid was opened to swap the disc and no Getstat has seen it yet.
+    shell_open: bool,
 
     // Audio output towards the SPU, at 44.1 kHz.
     audio: VecDeque<Frame>,
@@ -183,6 +186,7 @@ impl CdRom {
             read_countdown: 0,
             sector_buffer: Vec::new(),
             last_header: None,
+            shell_open: false,
             audio: VecDeque::new(),
             xa: XaDecoder::new(),
             playing: false,
@@ -196,6 +200,23 @@ impl CdRom {
     pub fn insert_image(&mut self, data: Vec<u8>) -> Ps1Result<()> {
         self.insert_disc(Disc::from_image(data)?);
         Ok(())
+    }
+
+    /// Swap the disc while the console runs, as a player does by opening the
+    /// lid: whatever the drive was doing stops and the status reports the
+    /// shell as open until the next Getstat.
+    pub fn change_disc(&mut self, disc: Disc) {
+        self.reading = false;
+        self.playing = false;
+        self.queue.clear();
+        self.seek_target = None;
+        self.last_header = None;
+        self.data.clear();
+        self.data_pos = 0;
+        self.busy = false;
+        self.audio.clear();
+        self.insert_disc(disc);
+        self.shell_open = true;
     }
 
     pub fn insert_disc(&mut self, disc: Disc) {
@@ -550,6 +571,9 @@ impl CdRom {
         if self.playing {
             stat |= STAT_PLAYING;
         }
+        if self.shell_open {
+            stat |= STAT_SHELL_OPEN;
+        }
         stat
     }
 
@@ -602,8 +626,11 @@ impl CdRom {
         }
 
         match command {
-            // Getstat
-            0x01 => self.acknowledge(vec![stat]),
+            // Getstat: also tells the drive the lid state was noticed.
+            0x01 => {
+                self.shell_open = false;
+                self.acknowledge(vec![stat]);
+            }
             // Setloc
             0x02 => match Self::parse_location(&params) {
                 Some(lba) => {
@@ -1429,5 +1456,27 @@ mod tests {
         drive.run(0x1B, &[]);
         assert_eq!(drive.wait_interrupt_within(10_000_000), INT1_DATA_READY);
         assert!(drive.cd.audio.iter().all(|f| *f == (0, 0)), "channel 5 was filtered out");
+    }
+
+    #[test]
+    fn changing_the_disc_opens_the_shell_until_getstat_and_stops_the_drive() {
+        let mut drive = Drive::with_disc(40);
+        drive.enable_interrupts();
+        drive.run(0x02, &[0x00, 0x02, 0x10]);
+        drive.run(0x06, &[]); // ReadN: the drive is busy reading
+        drive.cd.change_disc(us_disc(10));
+        drive.ack();
+
+        let (_, response) = drive.run(0x01, &[]);
+        assert_eq!(response[0] & STAT_READING, 0, "reading stopped");
+        assert_ne!(response[0] & STAT_SHELL_OPEN, 0, "the first status shows the lid was opened");
+        let (_, response) = drive.run(0x01, &[]);
+        assert_eq!(response[0] & STAT_SHELL_OPEN, 0, "and only the first");
+
+        // The new disc is the one that gets identified.
+        let (int, _) = drive.run(0x1A, &[]);
+        assert_eq!(int, INT3_ACKNOWLEDGE);
+        assert_eq!(drive.wait_interrupt(), INT2_COMPLETE);
+        assert_eq!(drive.cd.total_sectors, 10);
     }
 }

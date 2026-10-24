@@ -3,6 +3,7 @@
 
 import { AudioOutput } from './audio.js';
 import { Input, BUTTON_LABELS, keyName } from './input.js';
+import { loadSettings, saveSettings } from './settings.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -18,7 +19,9 @@ const buttons = {
     saveState: $('btn-save-state'),
     loadState: $('btn-load-state'),
     biosForget: $('btn-bios-forget'),
+    swap: $('btn-swap'),
 };
+const settings = loadSettings();
 
 const input = new Input();
 const audio = new AudioOutput();
@@ -58,6 +61,7 @@ function refreshButtons() {
     buttons.saveState.disabled = !running && !paused;
     buttons.loadState.disabled = !running && !paused;
     buttons.biosForget.disabled = !biosLoaded;
+    buttons.swap.disabled = !running && !paused;
 }
 
 // ----- Talking to the worker -----
@@ -80,6 +84,7 @@ function onWorkerMessage(event) {
     switch (message.type) {
         case 'ready':
             ready = true;
+            applySpeed(settings.speed);
             if (!message.persistent) {
                 setState('cards-state', 'Este navegador no permite guardar datos: las tarjetas se pierden al recargar. Usa Exportar.');
             }
@@ -196,19 +201,50 @@ $('btn-fullscreen').addEventListener('click', () => {
     else wrap.requestFullscreen?.();
 });
 
-$('speed').addEventListener('change', (event) => {
-    const value = event.target.value === 'max' ? 'max' : Number(event.target.value);
+function applySpeed(choice) {
+    const value = choice === 'max' ? 'max' : Number(choice);
     worker.postMessage({ type: 'speed', value });
+}
+
+function applyMuted(muted) {
+    const button = $('btn-mute');
+    button.setAttribute('aria-pressed', String(muted));
+    button.textContent = muted ? 'Activar sonido' : 'Silenciar';
+    audio.setMuted(muted);
+}
+
+$('speed').addEventListener('change', (event) => {
+    settings.speed = event.target.value;
+    saveSettings(settings);
+    applySpeed(settings.speed);
 });
 
-$('volume').addEventListener('input', (event) => audio.setVolume(Number(event.target.value) / 100));
+$('volume').addEventListener('input', (event) => {
+    settings.volume = Number(event.target.value);
+    saveSettings(settings);
+    audio.setVolume(settings.volume / 100);
+});
 
 $('btn-mute').addEventListener('click', (event) => {
-    const muted = event.currentTarget.getAttribute('aria-pressed') !== 'true';
-    event.currentTarget.setAttribute('aria-pressed', String(muted));
-    event.currentTarget.textContent = muted ? 'Activar sonido' : 'Silenciar';
-    audio.setMuted(muted);
+    settings.muted = event.currentTarget.getAttribute('aria-pressed') !== 'true';
+    saveSettings(settings);
+    applyMuted(settings.muted);
 });
+
+buttons.swap.addEventListener('click', () => $('swap-input').click());
+$('swap-input').addEventListener('change', (event) => {
+    const files = [...event.target.files];
+    event.target.value = '';
+    if (files.length > 0) worker.postMessage({ type: 'swap-disc', files });
+});
+
+/// Show the saved preferences and hand them to the audio output and the worker.
+function restoreSettings() {
+    $('volume').value = settings.volume;
+    $('speed').value = settings.speed;
+    audio.setVolume(settings.volume / 100);
+    applyMuted(settings.muted);
+}
 
 buttons.saveState.addEventListener('click', () => {
     worker.postMessage({ type: 'save-state', slot: Number($('slot').value) });
@@ -325,6 +361,7 @@ window.addEventListener('pagehide', () => {
 renderKeys();
 refreshButtons();
 setupCardControls();
+restoreSettings();
 startWorker();
 pollInput();
 say('Cargando el emulador…');
