@@ -29,7 +29,7 @@ let biosLoaded = false;
 let discLoaded = false;
 let running = false;
 let paused = false;
-let sentMask = 0;
+let sentInput = '';
 /// Used only when the browser cannot hand the canvas to the worker.
 let fallbackContext = null;
 
@@ -105,6 +105,9 @@ function onWorkerMessage(event) {
         }
         case 'frame':
             drawFallbackFrame(message);
+            break;
+        case 'rumble':
+            applyRumble(message);
             break;
         case 'card-export': {
             const url = URL.createObjectURL(new Blob([message.data], { type: 'application/octet-stream' }));
@@ -215,13 +218,35 @@ buttons.loadState.addEventListener('click', () => {
     worker.postMessage({ type: 'load-state', slot: Number($('slot').value) });
 });
 
-/// Send the pad state to the worker when it changes.
+/// Send the pads' state to the worker when it changes, and show the analog LED.
 function pollInput() {
     requestAnimationFrame(pollInput);
-    const mask = input.mask();
-    if (mask !== sentMask && worker) {
-        sentMask = mask;
-        worker.postMessage({ type: 'input', mask });
+    const state = input.poll();
+    const key = JSON.stringify(state);
+    if (key !== sentInput && worker) {
+        sentInput = key;
+        worker.postMessage({ type: 'input', ...state });
+        $('analog-state').textContent = state.analog[0]
+            ? 'Modo analógico: encendido (F9 o botón Home del mando para cambiarlo)'
+            : 'Modo analógico: apagado (F9 o botón Home del mando para cambiarlo)';
+    }
+}
+
+/// Vibrate the gamepad that drives `port` the way the game asks.
+function applyRumble({ port, small, large }) {
+    const pad = input.gamepads()[port];
+    const actuator = pad && pad.vibrationActuator;
+    if (!actuator) return;
+    if (small === 0 && large === 0) {
+        actuator.reset?.();
+    } else {
+        actuator
+            .playEffect('dual-rumble', {
+                duration: 5000,
+                weakMagnitude: small / 255,
+                strongMagnitude: large / 255,
+            })
+            .catch(() => {});
     }
 }
 

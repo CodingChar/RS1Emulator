@@ -241,6 +241,23 @@ impl Ps1 {
         );
     }
 
+    /// Switch a pad between digital and analog mode, like the Analog button.
+    pub fn set_analog_mode(&mut self, port: u32, analog: bool) {
+        self.inner.bus.controllers.set_analog_mode(port as usize, analog);
+    }
+
+    /// Plug a pad into a slot (slot 0 is plugged in from the start) or take it out.
+    pub fn set_pad_connected(&mut self, port: u32, connected: bool) {
+        self.inner.bus.controllers.set_connected(port as usize, connected);
+    }
+
+    /// What the game asks the vibration motors to do: the small motor
+    /// (0 or 255) in bits 8-15 and the large motor (0-255) in bits 0-7.
+    pub fn rumble(&self, port: u32) -> u32 {
+        let (small, large) = self.inner.bus.controllers.rumble(port as usize);
+        ((small as u32) << 8) | large as u32
+    }
+
     /// Save state as bytes (Uint8Array from JS).
     pub fn save_state(&mut self) -> Vec<u8> {
         self.inner.save_state()

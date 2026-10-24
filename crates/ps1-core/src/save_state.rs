@@ -32,7 +32,7 @@ use crate::types::{Ps1Error, Ps1Result};
 /// Starts every save state.
 const MAGIC: [u8; 4] = *b"RS1S";
 /// Bumped whenever the layout of the state changes.
-pub const SAVE_STATE_VERSION: u32 = 6;
+pub const SAVE_STATE_VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize)]
 struct Header {

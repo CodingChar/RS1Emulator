@@ -44,7 +44,7 @@ mod buttons_bits {
 }
 
 /// State of a single controller port.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControllerState {
     /// Whether a pad is plugged in.
     pub connected: bool,
@@ -54,6 +54,39 @@ pub struct ControllerState {
     pub left_stick_y: i8,
     pub right_stick_x: i8,
     pub right_stick_y: i8,
+    /// A DualShock (understands the configuration commands) rather than a
+    /// plain digital pad.
+    pub dualshock: bool,
+    /// The analog mode (the red LED): sticks are reported.
+    pub analog_mode: bool,
+    /// The game locked the mode, so the Analog button no longer toggles it.
+    pub analog_locked: bool,
+    /// In the DualShock configuration mode (replies start with `0xF3`).
+    pub config_mode: bool,
+    /// What each data byte of a poll does to the vibration motors: 0 small
+    /// motor, 1 large motor, anything else nothing.
+    pub rumble_map: [u8; 6],
+    /// Current motor strengths: (small, large).
+    pub rumble: [u8; 2],
+}
+
+impl Default for ControllerState {
+    fn default() -> Self {
+        Self {
+            connected: false,
+            buttons: Buttons::empty(),
+            left_stick_x: 0,
+            left_stick_y: 0,
+            right_stick_x: 0,
+            right_stick_y: 0,
+            dualshock: true,
+            analog_mode: false,
+            analog_locked: false,
+            config_mode: false,
+            rumble_map: [0xFF; 6],
+            rumble: [0; 2],
+        }
+    }
 }
 
 /// Where a serial exchange with a port's device currently stands.
@@ -61,8 +94,8 @@ pub struct ControllerState {
 enum Session {
     /// Waiting for the address byte that picks pad or memory card.
     Start,
-    /// A digital pad poll; `step` is the next byte of the sequence.
-    Pad { step: usize },
+    /// A pad conversation: the command and the next byte of the sequence.
+    Pad(pad::PadExchange),
     Card(CardSession),
     /// Nothing is listening until the port is deselected.
     Silent,
@@ -105,6 +138,35 @@ impl ControllerManager {
         }
     }
 
+    /// Switch the pad between digital and analog mode, as the Analog button
+    /// does. Ignored while the game has locked the mode.
+    pub fn set_analog_mode(&mut self, port: usize, analog: bool) {
+        if let Some(state) = self.ports.get_mut(port) {
+            if !state.analog_locked {
+                state.analog_mode = analog;
+            }
+        }
+    }
+
+    /// Plug a pad into a slot or take it out.
+    pub fn set_connected(&mut self, port: usize, connected: bool) {
+        if let Some(state) = self.ports.get_mut(port) {
+            state.connected = connected;
+        }
+    }
+
+    /// Choose between a DualShock and a plain digital pad.
+    pub fn set_dualshock(&mut self, port: usize, dualshock: bool) {
+        if let Some(state) = self.ports.get_mut(port) {
+            state.dualshock = dualshock;
+        }
+    }
+
+    /// The strength of the vibration motors the game asked for: (small, large).
+    pub fn rumble(&self, port: usize) -> (u8, u8) {
+        self.ports.get(port).map_or((0, 0), |p| (p.rumble[0], p.rumble[1]))
+    }
+
     pub fn state(&self, port: usize) -> Option<&ControllerState> {
         self.ports.get(port)
     }
@@ -138,7 +200,7 @@ impl ControllerManager {
         match std::mem::replace(&mut self.session, Session::Silent) {
             Session::Start => match tx {
                 0x01 if self.ports[port].connected => {
-                    self.session = Session::Pad { step: 1 };
+                    self.session = Session::Pad(pad::PadExchange::new());
                     Some((0xFF, true))
                 }
                 0x81 if self.memory_cards[port].is_some() => {
@@ -147,10 +209,10 @@ impl ControllerManager {
                 }
                 _ => None,
             },
-            Session::Pad { step } => {
-                let response = pad::digital_exchange(step, &self.ports[port].buttons);
-                if !pad::is_last_step(step) {
-                    self.session = Session::Pad { step: step + 1 };
+            Session::Pad(mut exchange) => {
+                let response = self.ports[port].pad_exchange(&mut exchange, tx);
+                if !exchange.finished() {
+                    self.session = Session::Pad(exchange);
                 }
                 response
             }

@@ -31,7 +31,14 @@ let discLoaded = false;
 let running = false;
 let paused = false;
 let speed = 1;
-let inputMask = 0;
+let pads = [
+    { connected: true, mask: 0, lx: 0, ly: 0, rx: 0, ry: 0 },
+    { connected: false, mask: 0, lx: 0, ly: 0, rx: 0, ry: 0 },
+];
+let analog = [false, false];
+const appliedAnalog = [null, null];
+const appliedConnected = [null, null];
+const lastRumble = [0, 0];
 
 let lastFrameTime = 0;
 let accumulator = 0;
@@ -181,6 +188,33 @@ async function persistCards(now, force = false) {
     }
 }
 
+/// Give the pads' state to the console, touching only what changed.
+function applyInput() {
+    for (let port = 0; port < 2; port++) {
+        const pad = pads[port];
+        if (appliedConnected[port] !== pad.connected) {
+            appliedConnected[port] = pad.connected;
+            ps1.set_pad_connected(port, pad.connected);
+        }
+        if (appliedAnalog[port] !== analog[port]) {
+            appliedAnalog[port] = analog[port];
+            ps1.set_analog_mode(port, analog[port]);
+        }
+        ps1.set_input(port, pad.mask, pad.lx, pad.ly, pad.rx, pad.ry);
+    }
+}
+
+/// Tell the page when the game changes how the pads vibrate.
+function reportRumble() {
+    for (let port = 0; port < 2; port++) {
+        const value = ps1.rumble(port);
+        if (value !== lastRumble[port]) {
+            lastRumble[port] = value;
+            post({ type: 'rumble', port, small: (value >> 8) & 0xFF, large: value & 0xFF });
+        }
+    }
+}
+
 function tick() {
     setTimeout(tick, TICK_MS);
     if (!running) {
@@ -189,7 +223,7 @@ function tick() {
     }
     try {
         const now = performance.now();
-        ps1.set_input(0, inputMask, 0, 0, 0, 0);
+        applyInput();
         let frames = 0;
         if (speed === 'max') {
             do {
@@ -214,6 +248,7 @@ function tick() {
                 audioPort.postMessage(samples, [samples.buffer]);
             }
         }
+        if (frames > 0) reportRumble();
         updateStats(now, frames);
         persistCards(now);
     } catch (error) {
@@ -335,7 +370,10 @@ onmessage = async (event) => {
             say('En marcha.');
             return publishState();
         case 'speed': speed = message.value; return;
-        case 'input': inputMask = message.mask; return;
+        case 'input':
+            pads = message.pads;
+            analog = message.analog;
+            return;
         case 'audio-port': audioPort = message.port; return;
         case 'card': return cardCommand(message);
         case 'save-state': return saveState(message.slot);
