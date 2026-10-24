@@ -17,6 +17,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use ps1_core::disc::{Disc, FileSource, SectorSource};
 use ps1_core::System;
 
 const RAW_SECTOR: u64 = 2352;
@@ -89,7 +90,7 @@ fn main() {
     }
 
     match &args.bios {
-        Some(bios) => run_bios(bios, args.steps, &args.peek, &args.disasm),
+        Some(bios) => run_bios(bios, args.disc.as_deref(), args.steps, &args.peek, &args.disasm),
         None => println!("\nNo --bios given: skipping CPU boot (a BIOS dump is required)."),
     }
 }
@@ -153,7 +154,19 @@ fn inspect_disc(cue: &Path) -> Result<(), String> {
 
 // ----- CPU boot -----
 
-fn run_bios(path: &Path, steps: u64, peek: &[u32], ranges: &[(u32, u32)]) {
+/// Open a CUE sheet, reading its BIN files lazily.
+fn open_disc(cue: &Path) -> Result<Disc, String> {
+    let text = std::fs::read_to_string(cue).map_err(|e| format!("{}: {e}", cue.display()))?;
+    let dir = cue.parent().unwrap_or(Path::new(".")).to_path_buf();
+    Disc::from_cue(&text, |name| {
+        FileSource::open(&dir.join(name))
+            .map(|f| Box::new(f) as Box<dyn SectorSource>)
+            .map_err(|e| e.to_string())
+    })
+    .map_err(|e| e.to_string())
+}
+
+fn run_bios(path: &Path, cue: Option<&Path>, steps: u64, peek: &[u32], ranges: &[(u32, u32)]) {
     let bios = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
@@ -165,6 +178,18 @@ fn run_bios(path: &Path, steps: u64, peek: &[u32], ranges: &[(u32, u32)]) {
 
     let mut sys = System::new();
     sys.load_bios(&bios).expect("BIOS image too large");
+    if let Some(cue) = cue {
+        match open_disc(cue) {
+            Ok(mut disc) => {
+                println!("Disc:   inserted, region {:?}", disc.region());
+                sys.insert_disc_image(disc);
+            }
+            Err(e) => {
+                eprintln!("disc: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     sys.reset().expect("reset");
 
     let mut recent_pcs = vec![0u32; 16];
@@ -212,6 +237,14 @@ fn run_bios(path: &Path, steps: u64, peek: &[u32], ranges: &[(u32, u32)]) {
         }
     }
 
+    println!(
+        "CD-ROM commands issued: {} (first {} shown)",
+        sys.bus.cdrom.command_count,
+        sys.bus.cdrom.command_log.len().min(40)
+    );
+    for record in sys.bus.cdrom.command_log.iter().take(40) {
+        println!("  {:#04x} {:02X?}", record.command, record.parameters);
+    }
     println!("registers:");
     for row in 0..8 {
         let cells: Vec<String> = (0..4)

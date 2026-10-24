@@ -2,9 +2,10 @@
 
 Estado actual: la CPU (R3000A) está completa salvo el GTE; el bus mapea RAM, BIOS,
 scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
-contadores reales y DMA (120 tests unitarios). Con una BIOS SCPH1001 real la CPU supera el
-POST 7 y llega al `VSync` del kernel; ahí se queda porque el controlador del CD-ROM
-(Fase 7) todavía es un stub que solo devuelve lo escrito. GPU, SPU, GTE y MDEC siguen sin
+contadores reales, DMA y el controlador del CD-ROM con lectura de BIN/CUE (157 tests
+unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS recorre el POST, identifica el
+disco (GetID → SCEA), lee su área de licencia y sigue arrancando hasta la primera
+instrucción del GTE (`ctc2`), que aún no existe. GPU, SPU, GTE y MDEC siguen sin
 implementar, y el framebuffer siempre está en negro.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
@@ -83,7 +84,8 @@ Hito: la BIOS llega a la pantalla de arranque / shell.
 - [x] Harness `examples/boot.rs`: ejecuta N instrucciones, imprime los códigos POST, los últimos `pc` y los accesos a I/O sin dispositivo.
 - [x] Desensamblador y listado de bucles calientes en el harness (`--disasm`, `--peek`).
 - [ ] Traza de ejecución (cpu trace, opcional detrás de feature flag).
-- [x] Hito parcial: con `SCPH1001.BIN` la BIOS recorre los POST 0x01–0x07, instala el kernel en RAM, usa DMA/VBlank y empieza a inicializar el CD-ROM.
+- [x] Hito parcial: con `SCPH1001.BIN` la BIOS recorre los POST 0x01–0x07, instala el kernel en RAM, usa DMA/VBlank, inicializa el CD-ROM y reconoce el disco (GetID, lectura de los sectores de licencia).
+- [ ] Siguiente bloqueo: la BIOS ejecuta `ctc2 t0, cop2r29` (GTE) tras ~137 M de instrucciones (Fase 8).
 - [ ] Hito: la BIOS muestra el logo de arranque (necesita CD-ROM y GPU).
 - [ ] Soporte para ejecutables PS-EXE para pruebas sin disco.
 
@@ -104,7 +106,7 @@ Archivo: `dma.rs`
 
 - [x] Registros por canal (MADR, BCR, CHCR), DPCR, DICR e IRQ.
 - [x] Modos: bloque, slice y lista enlazada (GPU); las transferencias terminan al instante.
-- [x] Canales: OTC, GPU (a/desde RAM y lista enlazada) y SPU (memoria de sonido). CD-ROM devuelve ceros hasta la Fase 7.
+- [x] Canales: OTC, GPU (a/desde RAM y lista enlazada), SPU (memoria de sonido) y CD-ROM (FIFO de datos del sector).
 - [ ] Canales MDEC in/out y PIO.
 - [ ] Prioridad entre canales, troceado (chopping) y duración real de las transferencias (hoy no detienen a la CPU).
 
@@ -112,10 +114,18 @@ Archivo: `dma.rs`
 
 Archivo: `cdrom.rs`
 
-- [ ] Parser de imágenes: ISO, BIN+CUE (hoy `insert_image` no parsea nada y `total_sectors = 0`).
-- [ ] Lectura de sectores (2048 y 2352 bytes), TOC y tiempo MSF.
-- [ ] Controlador del CD-ROM: registros, FIFOs de parámetros/respuesta, comandos (Getstat, Setloc, ReadN, Pause, Init, Setmode, GetID, Seek, ...), IRQs con retardos.
-- [ ] Soporte posterior: PBP, CCD, multi-disco, XA-ADPCM.
+Archivo: `disc.rs` (imágenes)
+
+- [x] Parser de imágenes: BIN crudo (2352), ISO (2048) y hojas CUE con uno o varios archivos (`Disc::from_cue`); `FileSource` lee los sectores bajo demanda, sin cargar 680 MB en memoria.
+- [x] Lectura de sectores (2048, 2336 y 2352 bytes), pistas, TOC y tiempo MSF; detección de región por el sector de licencia.
+- [x] Controlador del CD-ROM: registros, FIFOs de parámetros/respuesta/datos, interrupciones INT1–INT5 con retardos, comandos Getstat, Setloc, ReadN/ReadS, Pause, Stop, MotorOn, Init, Setmode, Setfilter, Getparam, GetlocL/P, GetTN, GetTD, SeekL/P, Test, GetID, ReadTOC, SetSession, y velocidad simple/doble.
+- [x] Registro de comandos (`CdRom::command_log`) y salida en el harness.
+- [ ] Pistas de audio: Play/Forward/Backward solo responden, no reproducen; CDDA y XA-ADPCM.
+- [ ] Filtro XA real (Setfilter solo guarda los valores), modo de informe (Report) y auto-pausa.
+- [ ] `PREGAP`/`POSTGAP` de las hojas CUE y subcanal Q (GetlocP aproxima la posición).
+- [ ] Tiempos de búsqueda realistas según la distancia; hoy son retardos fijos.
+- [ ] Cargar el disco desde el navegador sin copiar todo el archivo a memoria (lectura por trozos con `File.slice`).
+- [ ] Soporte posterior: PBP, CCD, CHD, multi-disco, protección LibCrypt (SBI).
 
 ## Fase 8 — GTE (coprocesador 2)
 

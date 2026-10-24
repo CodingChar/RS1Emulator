@@ -2,7 +2,7 @@ use crate::cdrom::CdRom;
 use crate::controllers::ControllerManager;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::interrupt::{InterruptController, IRQ_DMA, IRQ_VBLANK};
+use crate::interrupt::{InterruptController, IRQ_CDROM, IRQ_DMA, IRQ_VBLANK};
 use crate::io::{extract, merge, read_le, write_le, StubRegs};
 use crate::memory::Memory;
 use crate::spu::Spu;
@@ -203,6 +203,7 @@ impl Bus {
         self.gpu.step();
         self.spu.step();
         self.cdrom.step();
+        self.forward_cdrom_irq();
     }
 
     fn decode(addr: u32) -> Target {
@@ -337,7 +338,10 @@ impl Bus {
                 self.forward_dma_irq();
             }
             TIMERS..=TIMERS_END => self.timers.write(phys - TIMERS, width, value),
-            CDROM..=CDROM_END => self.cdrom.write(phys - CDROM, width, value),
+            CDROM..=CDROM_END => {
+                self.cdrom.write(phys - CDROM, width, value);
+                self.forward_cdrom_irq();
+            }
             GPU..=GPU_END => self.gpu.write(phys - GPU, width, value),
             MDEC..=MDEC_END => self.mdec.write(phys - MDEC, width, value),
             SPU..=SPU_END => self.spu.write(phys - SPU, width, value),
@@ -357,6 +361,12 @@ impl Bus {
                 &mut self.spu,
                 &mut self.cdrom,
             );
+        }
+    }
+
+    fn forward_cdrom_irq(&mut self) {
+        if self.cdrom.take_irq() {
+            self.interrupt.raise(IRQ_CDROM);
         }
     }
 

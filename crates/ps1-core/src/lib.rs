@@ -9,6 +9,7 @@ pub mod bus;
 pub mod cpu;
 pub mod controllers;
 pub mod cdrom;
+pub mod disc;
 pub mod dma;
 pub mod gte;
 pub mod gpu;

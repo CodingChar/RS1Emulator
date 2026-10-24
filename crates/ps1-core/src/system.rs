@@ -60,6 +60,12 @@ impl System {
         Ok(())
     }
 
+    /// Insert an already-parsed disc (for example one read lazily from a file).
+    pub fn insert_disc_image(&mut self, disc: crate::disc::Disc) {
+        self.bus.cdrom.insert_disc(disc);
+        self.disc_inserted = true;
+    }
+
     /// Power on / reset the system.
     pub fn reset(&mut self) -> Ps1Result<()> {
         if !self.bios_loaded {
