@@ -1,12 +1,12 @@
 # RS1Emu — Roadmap
 
-Estado actual: la CPU (R3000A) está completa salvo el GTE; el bus mapea RAM, BIOS,
+Estado actual: la CPU (R3000A) y el GTE están completos; el bus mapea RAM, BIOS,
 scratchpad y todos los registros de I/O; hay temporización de vídeo (VBlank), timers con
-contadores reales, DMA y el controlador del CD-ROM con lectura de BIN/CUE (157 tests
-unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS recorre el POST, identifica el
-disco (GetID → SCEA), lee su área de licencia y sigue arrancando hasta la primera
-instrucción del GTE (`ctc2`), que aún no existe. GPU, SPU, GTE y MDEC siguen sin
-implementar, y el framebuffer siempre está en negro.
+contadores reales, DMA y el controlador del CD-ROM con lectura de BIN/CUE (222 tests
+unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS arranca entera: identifica el
+disco (GetID → SCEA), lee su sistema de archivos y el ejecutable, llega al POST 0x09 y se
+queda esperando un byte del pad por el puerto serie (SIO0, Fase 9), que sigue siendo un
+stub. GPU, SPU y MDEC no existen todavía, así que el framebuffer sigue en negro.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
 Marca `[x]` al completar cada ítem.
@@ -21,7 +21,7 @@ Marca `[x]` al completar cada ítem.
 - [ ] Integrar ROMs de test de CPU de dominio público (p. ej. `psxtest_cpu`, suite de `amidog`), sin incluir BIOS ni juegos.
 - [ ] CI básico: `cargo check`, `cargo test` y build wasm.
 
-## Fase 1 — CPU (R3000A) · HECHA (salvo GTE y temporización)
+## Fase 1 — CPU (R3000A) · HECHA (salvo temporización)
 
 Archivo: `crates/ps1-core/src/cpu/interpreter.rs`
 
@@ -49,7 +49,7 @@ Archivo: `crates/ps1-core/src/cpu/interpreter.rs`
 - [x] `UnimplementedOpcode` queda solo para COP2/GTE con `SR.CU2` activo; los opcodes reservados ahora lanzan la excepción RI. Los fallos del bus (`MemoryOutOfRange`) siguen siendo errores fatales del emulador.
 - [ ] Contar ciclos por instrucción (base para la temporización de la Fase 3).
 - [ ] Temporización de `mult`/`div` y de los accesos a memoria; interlocks de HI/LO.
-- [ ] Instrucciones COP2 y `lwc2`/`swc2` (dependen de la Fase 8).
+- [x] Instrucciones COP2 y `lwc2`/`swc2` (Fase 8).
 
 ## Fase 2 — Bus y mapa de memoria · HECHA (faltan excepciones de bus)
 
@@ -85,7 +85,8 @@ Hito: la BIOS llega a la pantalla de arranque / shell.
 - [x] Desensamblador y listado de bucles calientes en el harness (`--disasm`, `--peek`).
 - [ ] Traza de ejecución (cpu trace, opcional detrás de feature flag).
 - [x] Hito parcial: con `SCPH1001.BIN` la BIOS recorre los POST 0x01–0x07, instala el kernel en RAM, usa DMA/VBlank, inicializa el CD-ROM y reconoce el disco (GetID, lectura de los sectores de licencia).
-- [ ] Siguiente bloqueo: la BIOS ejecuta `ctc2 t0, cop2r29` (GTE) tras ~137 M de instrucciones (Fase 8).
+- [x] El bloqueo del GTE (`ctc2 t0, cop2r29`, tras ~137 M de instrucciones) quedó resuelto en la Fase 8; la BIOS alcanza el POST 0x09 (~172 M de instrucciones).
+- [ ] Siguiente bloqueo: bucle de espera en `JOY_STAT` (SIO0, Fase 9): el stub nunca marca "byte recibido".
 - [ ] Hito: la BIOS muestra el logo de arranque (necesita CD-ROM y GPU).
 - [ ] Soporte para ejecutables PS-EXE para pruebas sin disco.
 
@@ -131,10 +132,12 @@ Archivo: `disc.rs` (imágenes)
 
 Archivo: `gte.rs`
 
-- [ ] Registros de datos y control del COP2 (hoy `regs: [u32; 32]` solo cubre uno de los dos bancos).
-- [ ] `mfc2`/`cfc2`/`mtc2`/`ctc2`/`lwc2`/`swc2`.
-- [ ] Instrucciones: RTPS/RTPT, NCLIP, MVMVA, AVSZ3/4, OP, GPF/GPL, DPCS, INTPL, SQR, NCS/NCT, NCDS/NCDT, NCCS/NCCT, CC, CDP, DCPL, DPCT, y tablas UNR.
-- [ ] Flags de saturación y tests contra resultados conocidos.
+- [x] Registros de datos y control del COP2 (32 + 32) con sus particularidades de lectura/escritura (registros de 16 bits con signo, FIFO de SXYP, IRGB/ORGB, LZCS/LZCR, bit 31 de FLAG).
+- [x] `mfc2`/`cfc2`/`mtc2`/`ctc2`/`lwc2`/`swc2`, todas condicionadas a `SR.CU2`.
+- [x] Instrucciones: RTPS/RTPT, NCLIP, MVMVA (con el fallo del color lejano y la matriz basura), AVSZ3/4, OP, GPF/GPL, DPCS, INTPL, SQR, NCS/NCT, NCDS/NCDT, NCCS/NCCT, CC, CDP, DCPL, DPCT, y la tabla UNR del divisor.
+- [x] Acumuladores MAC de 44 bits y todos los flags de saturación.
+- [ ] Validar contra una suite de pruebas del GTE de dominio público (los tests actuales usan valores calculados a mano; hay detalles de redondeo y de flags, como IR3 en RTPS o el uso de MAC0 en OTZ, que solo una suite o un juego pueden confirmar).
+- [ ] Comandos con efectos indefinidos (opcodes sin asignar) y el retardo en ciclos de cada comando.
 
 ## Fase 9 — Entrada (SIO / pads / memory cards)
 
