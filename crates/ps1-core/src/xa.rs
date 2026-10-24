@@ -46,31 +46,32 @@ impl XaDecoder {
     pub fn decode_sector(&mut self, raw: &[u8], out: &mut VecDeque<Frame>) {
         let coding = raw[19];
         let stereo = coding & CODING_STEREO != 0;
-        if coding & CODING_8BIT != 0 {
-            return; // 8-bit XA is not used by any known game
-        }
+        let eight_bit = coding & CODING_8BIT != 0;
         let rate = if coding & CODING_HALF_RATE != 0 { 18_900 } else { 37_800 };
+        // 4-bit sound groups hold eight blocks of samples, 8-bit ones four.
+        let block_count = if eight_bit { 4 } else { 8 };
 
         let mut frames: Vec<Frame> = Vec::with_capacity(GROUPS_PER_SECTOR * 8 * SAMPLES_PER_BLOCK);
         for group in 0..GROUPS_PER_SECTOR {
             let start = DATA_OFFSET + group * GROUP_BYTES;
             let group_data = &raw[start..start + GROUP_BYTES];
             let mut blocks = [[0i16; SAMPLES_PER_BLOCK]; 8];
-            for (b, block) in blocks.iter_mut().enumerate() {
-                // Blocks 0-3 take their parameters from bytes 0-3, blocks 4-7
-                // from bytes 8-11 (the bytes in between are copies).
-                let param = group_data[(b & 3) + (b >> 2) * 8];
+            for (b, block) in blocks.iter_mut().enumerate().take(block_count) {
+                // 4-bit: blocks 0-3 take their parameters from bytes 0-3, blocks
+                // 4-7 from bytes 8-11 (the bytes in between are copies). 8-bit:
+                // blocks 0-3 from bytes 0-3.
+                let param = if eight_bit { group_data[b] } else { group_data[(b & 3) + (b >> 2) * 8] };
                 let channel = if stereo { b & 1 } else { 0 };
-                self.decode_block(group_data, b, param, channel, block);
+                self.decode_block(group_data, b, param, channel, eight_bit, block);
             }
             if stereo {
-                for pair in 0..4 {
+                for pair in 0..block_count / 2 {
                     for k in 0..SAMPLES_PER_BLOCK {
                         frames.push((blocks[pair * 2][k], blocks[pair * 2 + 1][k]));
                     }
                 }
             } else {
-                for block in &blocks {
+                for block in &blocks[..block_count] {
                     for &s in block {
                         frames.push((s, s));
                     }
@@ -86,18 +87,28 @@ impl XaDecoder {
         block: usize,
         param: u8,
         channel: usize,
+        eight_bit: bool,
         out: &mut [i16; SAMPLES_PER_BLOCK],
     ) {
+        // The shift is applied to the sample in the top bits of a halfword;
+        // out-of-range values behave like the largest the format uses.
         let shift = {
             let s = (param & 0xF) as u32;
-            if s > 12 { 9 } else { s }
+            let largest = if eight_bit { 8 } else { 12 };
+            if s > largest { if eight_bit { 8 } else { 9 } } else { s }
         };
         let filter = ((param >> 4) & 3) as usize;
         let [mut old1, mut old2] = self.history[channel];
         for (k, slot) in out.iter_mut().enumerate() {
-            let byte = group[16 + k * 4 + (block >> 1)];
-            let nibble = (byte >> ((block & 1) * 4)) & 0xF;
-            let mut sample = (((nibble as u16) << 12) as i16 as i32) >> shift;
+            let raw_sample = if eight_bit {
+                // One byte per sample, the four blocks interleaved.
+                ((group[16 + k * 4 + block] as u16) << 8) as i16
+            } else {
+                let byte = group[16 + k * 4 + (block >> 1)];
+                let nibble = (byte >> ((block & 1) * 4)) & 0xF;
+                ((nibble as u16) << 12) as i16
+            };
+            let mut sample = (raw_sample as i32) >> shift;
             sample += (old1 * FILTER_POSITIVE[filter] + old2 * FILTER_NEGATIVE[filter] + 32) >> 6;
             let sample = sample.clamp(-0x8000, 0x7FFF);
             old2 = old1;
@@ -179,6 +190,25 @@ mod tests {
         let mut video = sector(1);
         video[18] = 0x62;
         assert!(!is_audio_sector(&video), "video sectors are delivered as data");
+    }
+
+    #[test]
+    fn eight_bit_sectors_decode_one_byte_per_sample() {
+        let mut raw = sector(CODING_8BIT);
+        // Group 0, block 0: shift 0, filter 0; samples are the bytes shifted
+        // up to the top of a halfword.
+        raw[DATA_OFFSET] = 0x00;
+        raw[DATA_OFFSET + 16] = 0x10; // sample 0 of block 0
+        raw[DATA_OFFSET + 16 + 4] = 0xF0; // sample 1 of block 0 (-16)
+        let mut decoder = XaDecoder::new();
+        let mut out = VecDeque::new();
+        decoder.decode_sector(&raw, &mut out);
+        // Mono: every frame is (s, s). The resampler keeps the shape.
+        assert!(out.iter().any(|f| f.0 > 3000), "the positive sample shows up");
+        assert!(out.iter().any(|f| f.0 < -1000), "the negative sample shows up");
+        // 8-bit groups carry half the samples: 18 * 4 * 28 frames at 37.8 kHz.
+        let expected = 18 * 4 * 28 * 44_100 / 37_800;
+        assert!((expected as i32 - out.len() as i32).abs() <= 2, "{} vs {expected}", out.len());
     }
 
     #[test]

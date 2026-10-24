@@ -43,6 +43,8 @@ const MODE_WHOLE_SECTOR: u8 = 1 << 5;
 const MODE_XA_ENABLE: u8 = 1 << 6;
 /// Only decode XA sectors matching the Setfilter file and channel.
 const MODE_XA_FILTER: u8 = 1 << 3;
+/// Report the position of CD-DA sectors with an INT1 each.
+const MODE_REPORT: u8 = 1 << 2;
 /// Double speed (150 sectors per second).
 const MODE_DOUBLE_SPEED: u8 = 1 << 7;
 
@@ -479,7 +481,12 @@ impl CdRom {
                 && disc.read_raw_sector(lba, &mut raw)
         });
         if !readable {
+            // The end of the audio (or of the disc): the drive stops.
             self.playing = false;
+            if self.interrupt_flag == 0 {
+                let stat = self.stat();
+                self.set_response(INT4_DATA_END, &[stat]);
+            }
             return;
         }
         if self.audio.len() < AUDIO_QUEUE_LIMIT {
@@ -488,6 +495,29 @@ impl CdRom {
                 let right = i16::from_le_bytes([raw[i * 4 + 2], raw[i * 4 + 3]]);
                 self.audio.push_back((left, right));
             }
+        }
+        // With "report" on, every sector brings its position (INT1), the
+        // relative time on one and the absolute time on the next.
+        if self.mode & MODE_REPORT != 0 && self.interrupt_flag == 0 {
+            let (track, relative, absolute) = match &self.disc {
+                Some(disc) => {
+                    let track = disc.track_at(lba);
+                    (track.number, lba - track.start_lba, lba + LEAD_IN_SECTORS)
+                }
+                None => (1, 0, lba + LEAD_IN_SECTORS),
+            };
+            let (mm, ss, ff, ss_flag) = if lba & 0x10 != 0 {
+                let (m, s, f) = lba_to_msf(relative);
+                (m, s, f, 0x80)
+            } else {
+                let (m, s, f) = lba_to_msf(absolute);
+                (m, s, f, 0)
+            };
+            let stat = self.stat();
+            self.set_response(
+                INT1_DATA_READY,
+                &[stat, to_bcd(track), 0x01, to_bcd(mm), to_bcd(ss) | ss_flag, to_bcd(ff), 0, 0],
+            );
         }
         self.play_sector += 1;
         self.current_sector = self.play_sector;
@@ -1275,5 +1305,129 @@ mod tests {
         assert!(cd.insert_image(vec![0; 3]).is_err());
         cd.insert_image(vec![0; 6 * DATA_SECTOR_SIZE]).unwrap();
         assert_eq!(cd.total_sectors, 6);
+    }
+
+    // ----- Audio -----
+
+    /// A data track followed by an audio track of four sectors whose samples
+    /// count up: sector s, frame f is `(s * 1000 + f, -(s * 1000 + f))`.
+    fn audio_disc() -> Disc {
+        use crate::disc::{MemorySource, SectorSource};
+        let data = vec![0u8; 8 * RAW_SECTOR_SIZE];
+        let mut audio = vec![0u8; 4 * RAW_SECTOR_SIZE];
+        for s in 0..4usize {
+            for f in 0..AUDIO_FRAMES_PER_SECTOR {
+                let v = (s * 1000 + f) as i16;
+                let at = s * RAW_SECTOR_SIZE + f * 4;
+                audio[at..at + 2].copy_from_slice(&v.to_le_bytes());
+                audio[at + 2..at + 4].copy_from_slice(&(-v).to_le_bytes());
+            }
+        }
+        let cue = "FILE \"d.bin\" BINARY\n TRACK 01 MODE2/2352\n  INDEX 01 00:00:00\nFILE \"a.bin\" BINARY\n TRACK 02 AUDIO\n  INDEX 01 00:00:00\n";
+        Disc::from_cue(cue, |name| {
+            let bytes = if name == "d.bin" { data.clone() } else { audio.clone() };
+            Ok(Box::new(MemorySource(bytes)) as Box<dyn SectorSource>)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn cd_da_tracks_play_into_the_audio_queue() {
+        let mut drive = Drive::new();
+        drive.cd.insert_disc(audio_disc());
+        drive.enable_interrupts();
+        let (int, response) = drive.run(0x03, &[0x02]);
+        assert_eq!(int, INT3_ACKNOWLEDGE);
+        assert_ne!(response[0] & STAT_PLAYING, 0, "the status says it is playing");
+
+        let sector = (CPU_CLOCK / SECTORS_PER_SECOND) as u64;
+        for _ in 0..(ACK_DELAY + READ_START_DELAY) as u64 + 3 * sector {
+            drive.cd.step();
+        }
+        let first: Vec<Frame> = (0..3).map(|_| drive.cd.pop_audio_frame()).collect();
+        assert_eq!(first, vec![(0, 0), (1, -1), (2, -2)]);
+        for _ in 3..AUDIO_FRAMES_PER_SECTOR {
+            drive.cd.pop_audio_frame();
+        }
+        assert_eq!(drive.cd.pop_audio_frame(), (1000, -1000), "the next sector follows");
+    }
+
+    #[test]
+    fn the_volume_matrix_scales_and_mixes_the_channels() {
+        let mut drive = Drive::new();
+        drive.cd.audio.push_back((1000, 2000));
+        drive.cd.volume = [0x40, 0x00, 0x00, 0x80]; // left at half, right at full, no crossing
+        assert_eq!(drive.cd.pop_audio_frame(), (500, 2000));
+        drive.cd.audio.push_back((1000, 2000));
+        drive.cd.volume = [0x00, 0x80, 0x80, 0x00]; // channels swapped
+        assert_eq!(drive.cd.pop_audio_frame(), (2000, 1000));
+    }
+
+    #[test]
+    fn report_mode_announces_the_position_of_every_audio_sector() {
+        let mut drive = Drive::new();
+        drive.cd.insert_disc(audio_disc());
+        drive.enable_interrupts();
+        drive.run(0x0E, &[MODE_REPORT]);
+        drive.run(0x03, &[0x02]);
+        assert_eq!(drive.wait_interrupt_within(5_000_000), INT1_DATA_READY);
+        let report = drive.response();
+        // Status, track 2, index 1, then the absolute time of sector 8: 00:02:08.
+        assert_eq!(&report[1..6], &[0x02, 0x01, 0x00, 0x02, 0x08]);
+        assert_eq!(report.len(), 8);
+    }
+
+    #[test]
+    fn playing_past_the_end_stops_the_drive_with_a_data_end() {
+        let mut drive = Drive::new();
+        drive.cd.insert_disc(audio_disc());
+        drive.enable_interrupts();
+        drive.run(0x03, &[0x02]);
+        assert_eq!(drive.wait_interrupt_within(10_000_000), INT4_DATA_END);
+        assert_eq!(drive.response()[0] & STAT_PLAYING, 0);
+    }
+
+    #[test]
+    fn xa_audio_sectors_are_decoded_instead_of_delivered() {
+        // 30 raw sectors: sector 20 is XA audio (stereo, 4-bit), 21 is data.
+        let mut data = vec![0u8; 30 * RAW_SECTOR_SIZE];
+        let audio = 20 * RAW_SECTOR_SIZE;
+        data[audio + 16] = 1; // file
+        data[audio + 17] = 1; // channel
+        data[audio + 18] = 0x24; // audio + form 2
+        data[audio + 19] = 0x01; // stereo, 37.8 kHz, 4 bit
+        data[audio + 24] = 0x00; // group 0, block 0: shift 0, filter 0
+        data[audio + 24 + 16] = 0x01; // first sample of block 0
+        let mut drive = Drive::new();
+        drive.cd.insert_disc(Disc::from_image(data).unwrap());
+        drive.enable_interrupts();
+        drive.run(0x0E, &[MODE_XA_ENABLE]);
+        drive.run(0x02, &[0x00, 0x02, 0x20]);
+        let (int, _) = drive.run(0x1B, &[]);
+        assert_eq!(int, INT3_ACKNOWLEDGE);
+        // The first INT1 is the data sector after the audio one.
+        assert_eq!(drive.wait_interrupt_within(10_000_000), INT1_DATA_READY);
+        assert!(drive.cd.audio.iter().any(|f| f.0 != 0), "the audio sector went to the SPU");
+        assert_eq!(drive.cd.current_sector, 22, "sectors 20 and 21 were read");
+    }
+
+    #[test]
+    fn xa_filtering_skips_other_channels() {
+        let mut data = vec![0u8; 30 * RAW_SECTOR_SIZE];
+        let audio = 20 * RAW_SECTOR_SIZE;
+        data[audio + 16] = 1;
+        data[audio + 17] = 5; // channel 5
+        data[audio + 18] = 0x24;
+        data[audio + 19] = 0x01;
+        data[audio + 24 + 16] = 0x01;
+        let mut drive = Drive::new();
+        drive.cd.insert_disc(Disc::from_image(data).unwrap());
+        drive.enable_interrupts();
+        drive.run(0x0E, &[MODE_XA_ENABLE | MODE_XA_FILTER]);
+        drive.run(0x0D, &[1, 3]); // only file 1, channel 3
+        drive.run(0x02, &[0x00, 0x02, 0x20]);
+        drive.run(0x1B, &[]);
+        assert_eq!(drive.wait_interrupt_within(10_000_000), INT1_DATA_READY);
+        assert!(drive.cd.audio.iter().all(|f| *f == (0, 0)), "channel 5 was filtered out");
     }
 }
