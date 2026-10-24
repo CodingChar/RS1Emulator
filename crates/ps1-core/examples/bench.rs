@@ -125,20 +125,23 @@ fn main() {
         }
         steps = sys.cycles;
     } else {
-        // Scripted button presses are applied every 4096 steps.
+        // Scripted button presses are checked every 4096 instructions.
         let mut held = 0u16;
-        for i in 0..steps {
-            if i % 4096 == 0 && !presses.is_empty() {
+        let mut done = 0u64;
+        while done < steps {
+            if !presses.is_empty() {
                 let mask = presses
                     .iter()
-                    .filter(|(_, first, last)| i >= *first && i < *last)
+                    .filter(|(_, first, last)| done >= *first && done < *last)
                     .fold(0, |m, (bits, _, _)| m | bits);
                 if mask != held {
                     held = mask;
                     sys.set_input(0, held, 0, 0, 0, 0);
                 }
             }
-            sys.step().expect("step");
+            let chunk = (steps - done).min(4096);
+            sys.run_cycles(chunk).expect("run");
+            done += chunk;
         }
     }
     sys.sync();

@@ -187,6 +187,39 @@ impl Interpreter {
     /// handled inside the emulated CPU and return `Ok`. Only emulator-level
     /// failures are returned as errors.
     pub fn step(&mut self, bus: &mut Bus) -> Ps1Result<()> {
+        match self.step_inner(bus) {
+            Ok(()) => Ok(()),
+            Err(trap) => self.handle_trap(trap),
+        }
+    }
+
+    /// Run `count` instructions, each followed by one cycle of the devices
+    /// (see `Bus::tick`), with the interrupt line sampled before each one.
+    /// Returns how many were executed and why it stopped early, if it did.
+    ///
+    /// This is the same as calling [`Interpreter::step`] in a loop but keeps
+    /// the whole interpreter in a single hot loop, which is what makes it fast.
+    pub fn run(&mut self, bus: &mut Bus, count: u64) -> (u64, Ps1Result<()>) {
+        let mut irq_line = bus.interrupt.pending();
+        self.set_irq(irq_line);
+        for executed in 0..count {
+            let line = bus.interrupt.pending();
+            if line != irq_line {
+                irq_line = line;
+                self.set_irq(line);
+            }
+            if let Err(trap) = self.step_inner(bus) {
+                if let Err(e) = self.handle_trap(trap) {
+                    return (executed, Err(e));
+                }
+            }
+            bus.tick(1);
+        }
+        (count, Ok(()))
+    }
+
+    #[inline(always)]
+    fn step_inner(&mut self, bus: &mut Bus) -> Exec {
         self.current_pc = self.pc;
         self.in_delay_slot = self.branch_pending;
         self.branch_pending = false;
@@ -204,24 +237,31 @@ impl Interpreter {
             self.regs[reg] = value;
             self.pending_load.0 = 0;
         }
-        self.regs[0] = 0;
+        result
+    }
 
-        match result {
-            Ok(()) => Ok(()),
-            Err(Trap::Exception { code, bad_vaddr, cop }) => {
+    /// Deal with the outcome of an instruction that did not complete: take the
+    /// MIPS exception, or report an emulator-level failure.
+    #[cold]
+    #[inline(never)]
+    fn handle_trap(&mut self, trap: Trap) -> Ps1Result<()> {
+        match trap {
+            Trap::Exception { code, bad_vaddr, cop } => {
                 self.raise_exception(code, bad_vaddr, cop);
                 Ok(())
             }
-            Err(Trap::Unmapped(addr)) => Err(Ps1Error::MemoryOutOfRange(addr)),
-            Err(Trap::Fatal(e)) => Err(*e),
+            Trap::Unmapped(addr) => Err(Ps1Error::MemoryOutOfRange(addr)),
+            Trap::Fatal(e) => Err(*e),
         }
     }
 
+    #[inline(always)]
     fn interrupt_pending(&self) -> bool {
         let sr = self.cp0[COP0_SR];
         sr & SR_IEC != 0 && sr & self.cp0[COP0_CAUSE] & CAUSE_IP_MASK != 0
     }
 
+    #[inline(always)]
     fn fetch_and_execute(&mut self, bus: &mut Bus) -> Exec {
         let pc = self.pc;
         if pc & 3 != 0 || self.is_forbidden_address(pc) {
@@ -271,6 +311,7 @@ impl Interpreter {
     // ----- Register helpers -----
 
     /// Write a register immediately (also cancels a pending load to it).
+    #[inline(always)]
     fn set_reg(&mut self, reg: usize, value: u32) {
         if reg != 0 {
             if self.pending_load.0 == reg {
@@ -281,6 +322,7 @@ impl Interpreter {
     }
 
     /// Issue a load: the register changes after the next instruction.
+    #[inline(always)]
     fn load_reg(&mut self, reg: usize, value: u32) {
         if reg != 0 {
             if self.pending_load.0 == reg {
@@ -302,11 +344,13 @@ impl Interpreter {
 
     // ----- Memory access (alignment, privilege, cache isolation) -----
 
+    #[inline(always)]
     fn is_forbidden_address(&self, addr: u32) -> bool {
         // User mode may only touch KUSEG.
         self.cp0[COP0_SR] & SR_KUC != 0 && addr & 0x8000_0000 != 0
     }
 
+    #[inline(always)]
     fn read8(&self, bus: &mut Bus, addr: u32) -> Result<u8, Trap> {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
@@ -314,6 +358,7 @@ impl Interpreter {
         bus.load(addr, 1).map(|v| v as u8).ok_or(Trap::Unmapped(addr))
     }
 
+    #[inline(always)]
     fn read16(&self, bus: &mut Bus, addr: u32) -> Result<u16, Trap> {
         if addr & 1 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
@@ -321,6 +366,7 @@ impl Interpreter {
         bus.load(addr, 2).map(|v| v as u16).ok_or(Trap::Unmapped(addr))
     }
 
+    #[inline(always)]
     fn read32(&self, bus: &mut Bus, addr: u32) -> Result<u32, Trap> {
         if addr & 3 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
@@ -329,6 +375,7 @@ impl Interpreter {
     }
 
     /// Aligned word read used by LWL/LWR/SWL/SWR (no alignment fault).
+    #[inline(never)]
     fn read32_unaligned_base(&self, bus: &mut Bus, addr: u32) -> Result<u32, Trap> {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
@@ -340,6 +387,7 @@ impl Interpreter {
         self.cp0[COP0_SR] & SR_ISC != 0
     }
 
+    #[inline(always)]
     fn write8(&self, bus: &mut Bus, addr: u32, value: u8) -> Exec {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
@@ -350,6 +398,7 @@ impl Interpreter {
         Self::stored(bus.store(addr, 1, value as u32), addr)
     }
 
+    #[inline(always)]
     fn write16(&self, bus: &mut Bus, addr: u32, value: u16) -> Exec {
         if addr & 1 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
@@ -360,6 +409,7 @@ impl Interpreter {
         Self::stored(bus.store(addr, 2, value as u32), addr)
     }
 
+    #[inline(always)]
     fn write32(&self, bus: &mut Bus, addr: u32, value: u32) -> Exec {
         if addr & 3 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
@@ -375,6 +425,7 @@ impl Interpreter {
     }
 
     /// Aligned word write used by SWL/SWR (no alignment fault).
+    #[inline(never)]
     fn write32_unaligned_base(&self, bus: &mut Bus, addr: u32, value: u32) -> Exec {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
@@ -390,11 +441,13 @@ impl Interpreter {
     // When an instruction executes, `pc` already points at its delay slot, so
     // relative targets are computed from `pc`.
 
+    #[inline(always)]
     fn jump(&mut self, target: u32) {
         self.next_pc = target;
         self.branch_pending = true;
     }
 
+    #[inline(always)]
     fn branch_if(&mut self, condition: bool, imm: u32) {
         if condition {
             self.next_pc = self.pc.wrapping_add(sign_extend16(imm) << 2);
@@ -405,6 +458,7 @@ impl Interpreter {
 
     // ----- Instruction decode / execute -----
 
+    #[inline(always)]
     fn execute(&mut self, instr: u32, bus: &mut Bus) -> Exec {
         let rs = ((instr >> 21) & 0x1F) as usize;
         let rt = ((instr >> 16) & 0x1F) as usize;
@@ -569,6 +623,7 @@ impl Interpreter {
         Ok(())
     }
 
+    #[inline(always)]
     fn execute_special(&mut self, instr: u32) -> Exec {
         let rs = ((instr >> 21) & 0x1F) as usize;
         let rt = ((instr >> 16) & 0x1F) as usize;
@@ -640,6 +695,7 @@ impl Interpreter {
         Ok(())
     }
 
+    #[inline(never)]
     fn execute_cop2(&mut self, instr: u32) -> Exec {
         self.require_cop2()?;
 
@@ -669,6 +725,7 @@ impl Interpreter {
         Ok(())
     }
 
+    #[inline(never)]
     fn execute_cop0(&mut self, instr: u32) -> Exec {
         // COP0 is usable in kernel mode, or in user mode only if SR.CU0 is set.
         let sr = self.cp0[COP0_SR];
@@ -724,6 +781,7 @@ impl Interpreter {
 
     // Results for the cases real hardware doesn't trap on, as documented in
     // the "CPU division by zero / overflow" notes.
+    #[inline(never)]
     fn divide_signed(&mut self, a: i32, b: i32) {
         if b == 0 {
             self.lo = if a >= 0 { 0xFFFF_FFFF } else { 1 };
@@ -737,6 +795,7 @@ impl Interpreter {
         }
     }
 
+    #[inline(never)]
     fn divide_unsigned(&mut self, a: u32, b: u32) {
         if b == 0 {
             self.lo = 0xFFFF_FFFF;

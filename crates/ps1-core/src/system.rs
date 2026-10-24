@@ -132,25 +132,23 @@ impl System {
         Ok(())
     }
 
+    /// Run `count` CPU cycles (one instruction each) with the devices following.
+    pub fn run_cycles(&mut self, count: u64) -> Ps1Result<()> {
+        if !self.running {
+            return Ok(());
+        }
+        let (executed, result) = self.cpu.run(&mut self.bus, count);
+        self.cycles += executed;
+        result
+    }
+
     /// Run exactly one video frame's worth of cycles.
     pub fn run_frame(&mut self) -> Ps1Result<()> {
         self.cycles_per_frame = self.bus.gpu.cycles_per_frame();
         if !self.running {
             return Ok(());
         }
-        // The same as calling `step` once per cycle, without its bookkeeping.
-        let mut executed = 0;
-        let result = loop {
-            if executed == self.cycles_per_frame {
-                break Ok(());
-            }
-            self.cpu.set_irq(self.bus.interrupt.pending());
-            if let Err(e) = self.cpu.step(&mut self.bus) {
-                break Err(e);
-            }
-            self.bus.tick(1);
-            executed += 1;
-        };
+        let (executed, result) = self.cpu.run(&mut self.bus, self.cycles_per_frame);
         self.cycles += executed;
         self.frame_cycles_remaining = self.cycles_per_frame - executed;
         self.sync();
