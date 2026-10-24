@@ -1,0 +1,42 @@
+# Rust
+/target/
+/**/*.rs.bak
+Cargo.lock
+
+# WASM / Trunk
+dist/
+pkg/
+.trunk/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Copyrighted / user-supplied material: never commit these.
+# Test ROMs, disc images, BIOS dumps and memory cards stay local.
+/rom_test/
+*.bin
+*.cue
+*.iso
+*.img
+*.ccd
+*.sub
+*.mdf
+*.mds
+*.pbp
+*.chd
+*.ecm
+*.sbi
+*.m3u
+*.rom
+scph*
+*.mcr
+*.mcd
+*.srm

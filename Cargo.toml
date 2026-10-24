@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ps1-core",
+    "crates/ps1-wasm",
+    "crates/ps1-web",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["RS1Emu Contributors"]
+description = "PlayStation 1 emulator written in Rust, targeting WebAssembly for the web"
+license = "MIT"
+repository = "https://github.com/RS1Emu/rs1-emu"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

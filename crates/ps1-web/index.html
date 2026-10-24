@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RS1Emu — PS1 Emulator (Rust + WASM)</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #111;
+            color: #eee;
+            font-family: system-ui, -apple-system, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            gap: 1rem;
+        }
+        #emu-canvas {
+            image-rendering: pixelated;
+            border: 4px solid #333;
+            background: #000;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        .controls {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        button {
+            padding: 0.6rem 1.2rem;
+            font-size: 1rem;
+            background: #444;
+            color: #eee;
+            border: 1px solid #666;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        button:hover { background: #555; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        input[type="file"] { color: #eee; }
+        #status {
+            margin-top: 0.5rem;
+            font-size: 0.9rem;
+            color: #aaa;
+        }
+        .hint {
+            font-size: 0.85rem;
+            color: #888;
+            margin-top: 0.5rem;
+            max-width: 600px;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>RS1Emu — PlayStation 1 (Rust + WASM)</h1>
+
+    <canvas id="emu-canvas" width="320" height="240"></canvas>
+
+    <div class="controls">
+        <input type="file" id="bios-file" accept=".bin,.rom,.bios" />
+        <input type="file" id="game-file" accept=".bin,.cue,.iso,.pbp,.img" />
+        <button id="btn-reset">Reset</button>
+        <button id="btn-save">Guardar estado</button>
+        <button id="btn-load">Cargar estado</button>
+    </div>
+
+    <div id="status">Listo. Carga una BIOS y un juego para comenzar.</div>
+    <p class="hint">Nota: la BIOS y los juegos son material con derechos de autor. Proporciona tus propias copias de respaldo.</p>
+
+    <script type="module">
+        import init, { Ps1 } from './pkg/ps1_wasm.js';
+
+        const canvas = document.getElementById('emu-canvas');
+        const ctx = canvas.getContext('2d');
+        const status = document.getElementById('status');
+        const btnReset = document.getElementById('btn-reset');
+        const btnSave = document.getElementById('btn-save');
+        const btnLoad = document.getElementById('btn-load');
+        const biosInput = document.getElementById('bios-file');
+        const gameInput = document.getElementById('game-file');
+
+        let ps1 = null;
+        let imageData = null;
+        let running = false;
+
+        async function main() {
+            await init();
+            ps1 = new Ps1();
+            imageData = ctx.createImageData(ps1.framebuffer_width(), ps1.framebuffer_height());
+
+            function loop() {
+                if (!running) return;
+                ps1.run_frame();
+                const fb = ps1.framebuffer();
+                imageData.data.set(fb);
+                ctx.putImageData(imageData, 0, 0);
+                requestAnimationFrame(loop);
+            }
+
+            requestAnimationFrame(loop);
+            running = true;
+        }
+
+        async function readFileAsArrayBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        biosInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const bytes = new Uint8Array(await readFileAsArrayBuffer(file));
+            try {
+                await ps1.load_bios(bytes);
+                status.textContent = `BIOS cargada: ${file.name} (${bytes.length} bytes)`;
+            } catch (err) {
+                status.textContent = `Error BIOS: ${err}`;
+            }
+        });
+
+        gameInput.addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const bytes = new Uint8Array(await readFileAsArrayBuffer(file));
+            try {
+                await ps1.insert_disc(bytes);
+                await ps1.reset();
+                status.textContent = `Juego insertado: ${file.name} (${bytes.length} bytes)`;
+            } catch (err) {
+                status.textContent = `Error juego: ${err}`;
+            }
+        });
+
+        btnReset.addEventListener('click', async () => {
+            try {
+                await ps1.reset();
+                status.textContent = 'Sistema reseteado.';
+            } catch (err) {
+                status.textContent = `Error reset: ${err}`;
+            }
+        });
+
+        btnSave.addEventListener('click', async () => {
+            const state = ps1.save_state();
+            localStorage.setItem('rs1_save_slot_1', btoa(String.fromCharCode(...state)));
+            status.textContent = 'Estado guardado en slot 1.';
+        });
+
+        btnLoad.addEventListener('click', async () => {
+            const b64 = localStorage.getItem('rs1_save_slot_1');
+            if (!b64) { status.textContent = 'No hay guardado en slot 1.'; return; }
+            const bytes = new Uint8Array(atob(b64).split('').map(c => c.charCodeAt(0)));
+            try {
+                await ps1.load_state(bytes);
+                status.textContent = 'Estado cargado desde slot 1.';
+            } catch (err) {
+                status.textContent = `Error cargando estado: ${err}`;
+            }
+        });
+
+        main();
+    </script>
+</body>
+</html>

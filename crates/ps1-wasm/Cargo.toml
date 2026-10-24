@@ -1,0 +1,18 @@
+[package]
+name = "ps1-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ps1-core = { path = "../ps1-core" }
+
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+] }
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

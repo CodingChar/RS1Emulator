@@ -1,0 +1,706 @@
+use crate::bus::Bus;
+use crate::memory::Memory;
+use crate::types::{Ps1Error, Ps1Result};
+
+/// Address the CPU starts executing from after reset (start of the BIOS, KSEG1).
+pub const RESET_VECTOR: u32 = 0xBFC0_0000;
+
+const EXCEPTION_VECTOR_RAM: u32 = 0x8000_0080;
+const EXCEPTION_VECTOR_BIOS: u32 = 0xBFC0_0180;
+
+// COP0 register indices.
+const COP0_BPC: usize = 3;
+const COP0_BDA: usize = 5;
+const COP0_JUMPDEST: usize = 6;
+const COP0_DCIC: usize = 7;
+const COP0_BADVADDR: usize = 8;
+const COP0_BDAM: usize = 9;
+const COP0_BPCM: usize = 11;
+const COP0_SR: usize = 12;
+const COP0_CAUSE: usize = 13;
+const COP0_EPC: usize = 14;
+const COP0_PRID: usize = 15;
+
+// Status register bits.
+const SR_IEC: u32 = 1 << 0;
+const SR_KUC: u32 = 1 << 1;
+const SR_ISC: u32 = 1 << 16;
+const SR_BEV: u32 = 1 << 22;
+const SR_CU0: u32 = 1 << 28;
+const SR_CU2: u32 = 1 << 30;
+/// Bits of SR that software can change.
+const SR_WRITE_MASK: u32 = 0xF27F_FF3F;
+
+// Cause register bits.
+const CAUSE_IP_MASK: u32 = 0xFF00;
+const CAUSE_IP2: u32 = 1 << 10;
+const CAUSE_SOFT_IRQ_MASK: u32 = 0x0300;
+const CAUSE_EXC_CODE_MASK: u32 = 0x7C;
+const CAUSE_CE_MASK: u32 = 0x3000_0000;
+const CAUSE_BD: u32 = 1 << 31;
+
+const PRID_R3000A: u32 = 0x0000_0002;
+/// SR value after reset: BEV and TS set.
+const SR_RESET: u32 = 0x0060_0000;
+
+/// COP0 exception codes (Cause.ExcCode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exception {
+    Interrupt = 0,
+    AddressErrorLoad = 4,
+    AddressErrorStore = 5,
+    BusErrorFetch = 6,
+    BusErrorData = 7,
+    Syscall = 8,
+    Breakpoint = 9,
+    ReservedInstruction = 10,
+    CoprocessorUnusable = 11,
+    Overflow = 12,
+}
+
+/// Why executing an instruction did not complete normally.
+enum Trap {
+    /// A MIPS exception: the CPU vectors to the exception handler.
+    Exception {
+        code: Exception,
+        bad_vaddr: Option<u32>,
+        cop: u8,
+    },
+    /// An emulator-level failure (unmapped memory, unimplemented opcode...).
+    Fatal(Ps1Error),
+}
+
+impl Trap {
+    fn exception(code: Exception) -> Self {
+        Trap::Exception { code, bad_vaddr: None, cop: 0 }
+    }
+
+    fn address_error(code: Exception, addr: u32) -> Self {
+        Trap::Exception { code, bad_vaddr: Some(addr), cop: 0 }
+    }
+
+    fn coprocessor_unusable(cop: u8) -> Self {
+        Trap::Exception { code: Exception::CoprocessorUnusable, bad_vaddr: None, cop }
+    }
+}
+
+impl From<Ps1Error> for Trap {
+    fn from(e: Ps1Error) -> Self {
+        Trap::Fatal(e)
+    }
+}
+
+type Exec = Result<(), Trap>;
+
+/// MIPS R3000A CPU interpreter.
+///
+/// Executes PS1 CPU instructions one at a time. This is intentionally a simple
+/// threaded interpreter; a dynamic recompiler (like DuckStation's) is a future
+/// optimization and is not directly portable to WASM anyway.
+///
+/// Models the R3000A's pipeline visible behaviour:
+/// - **branch delay slot**: the instruction after a branch/jump always runs
+///   before control transfers (`pc`/`next_pc` pair);
+/// - **load delay slot**: a loaded register only changes after the following
+///   instruction has executed;
+/// - **COP0 exceptions**, with the 3-deep KU/IE mode stack in `SR`.
+pub struct Interpreter {
+    /// General-purpose registers r0–r31 (r0 is hardwired to 0).
+    pub regs: [u32; 32],
+    /// Address of the next instruction to fetch.
+    pub pc: u32,
+    /// Address of the instruction after `pc` (differs from `pc + 4` while a
+    /// branch is in flight).
+    pub next_pc: u32,
+    /// HI / LO registers for multiply/divide.
+    pub hi: u32,
+    pub lo: u32,
+    /// Coprocessor 0 registers.
+    pub cp0: [u32; 32],
+
+    /// Address of the instruction being executed (for EPC).
+    current_pc: u32,
+    /// The instruction being executed sits in a branch delay slot.
+    in_delay_slot: bool,
+    /// The instruction just executed was a branch/jump.
+    branch_pending: bool,
+    /// Load issued by the previous instruction; lands after the current one.
+    pending_load: Option<(usize, u32)>,
+    /// Load issued by the current instruction; becomes `pending_load`.
+    next_load: Option<(usize, u32)>,
+}
+
+impl Interpreter {
+    pub fn new() -> Self {
+        let mut cpu = Self {
+            regs: [0u32; 32],
+            pc: RESET_VECTOR,
+            next_pc: RESET_VECTOR.wrapping_add(4),
+            hi: 0,
+            lo: 0,
+            cp0: [0u32; 32],
+            current_pc: RESET_VECTOR,
+            in_delay_slot: false,
+            branch_pending: false,
+            pending_load: None,
+            next_load: None,
+        };
+        cpu.cp0[COP0_SR] = SR_RESET;
+        cpu.cp0[COP0_PRID] = PRID_R3000A;
+        cpu
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Jump to `pc`, discarding any branch in flight.
+    pub fn set_pc(&mut self, pc: u32) {
+        self.pc = pc;
+        self.next_pc = pc.wrapping_add(4);
+        self.branch_pending = false;
+    }
+
+    /// Drive the external interrupt line (Cause.IP2), fed by the interrupt
+    /// controller.
+    pub fn set_irq(&mut self, asserted: bool) {
+        if asserted {
+            self.cp0[COP0_CAUSE] |= CAUSE_IP2;
+        } else {
+            self.cp0[COP0_CAUSE] &= !CAUSE_IP2;
+        }
+    }
+
+    /// Execute one instruction.
+    ///
+    /// MIPS exceptions (overflow, syscall, address errors, interrupts...) are
+    /// handled inside the emulated CPU and return `Ok`. Only emulator-level
+    /// failures are returned as errors.
+    pub fn step(&mut self, bus: &mut Bus, memory: &mut Memory) -> Ps1Result<()> {
+        self.current_pc = self.pc;
+        self.in_delay_slot = self.branch_pending;
+        self.branch_pending = false;
+        self.pending_load = self.next_load.take();
+
+        let result = if self.interrupt_pending() {
+            Err(Trap::exception(Exception::Interrupt))
+        } else {
+            self.fetch_and_execute(bus, memory)
+        };
+
+        // The delayed load lands now, unless the instruction overwrote it.
+        if let Some((reg, value)) = self.pending_load.take() {
+            self.regs[reg] = value;
+        }
+        self.regs[0] = 0;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(Trap::Exception { code, bad_vaddr, cop }) => {
+                self.raise_exception(code, bad_vaddr, cop);
+                Ok(())
+            }
+            Err(Trap::Fatal(e)) => Err(e),
+        }
+    }
+
+    fn interrupt_pending(&self) -> bool {
+        let sr = self.cp0[COP0_SR];
+        sr & SR_IEC != 0 && sr & self.cp0[COP0_CAUSE] & CAUSE_IP_MASK != 0
+    }
+
+    fn fetch_and_execute(&mut self, bus: &mut Bus, memory: &mut Memory) -> Exec {
+        let pc = self.pc;
+        if pc & 3 != 0 || self.is_forbidden_address(pc) {
+            return Err(Trap::address_error(Exception::AddressErrorLoad, pc));
+        }
+        let instr = bus.read32(pc, memory)?;
+        self.pc = self.next_pc;
+        self.next_pc = self.next_pc.wrapping_add(4);
+        self.execute(instr, bus, memory)
+    }
+
+    /// Enter the exception handler.
+    fn raise_exception(&mut self, code: Exception, bad_vaddr: Option<u32>, cop: u8) {
+        let sr = self.cp0[COP0_SR];
+        let handler = if sr & SR_BEV != 0 {
+            EXCEPTION_VECTOR_BIOS
+        } else {
+            EXCEPTION_VECTOR_RAM
+        };
+
+        // Push the KU/IE mode stack; the new mode is kernel with IRQs off.
+        self.cp0[COP0_SR] = (sr & !0x3F) | ((sr << 2) & 0x3F);
+
+        let mut cause = self.cp0[COP0_CAUSE] & !(CAUSE_EXC_CODE_MASK | CAUSE_CE_MASK | CAUSE_BD);
+        cause |= (code as u32) << 2;
+        if code == Exception::CoprocessorUnusable {
+            cause |= (cop as u32) << 28;
+        }
+        if self.in_delay_slot {
+            cause |= CAUSE_BD;
+            self.cp0[COP0_EPC] = self.current_pc.wrapping_sub(4);
+        } else {
+            self.cp0[COP0_EPC] = self.current_pc;
+        }
+        self.cp0[COP0_CAUSE] = cause;
+
+        if let Some(addr) = bad_vaddr {
+            self.cp0[COP0_BADVADDR] = addr;
+        }
+
+        self.pc = handler;
+        self.next_pc = handler.wrapping_add(4);
+        self.branch_pending = false;
+    }
+
+    // ----- Register helpers -----
+
+    /// Write a register immediately (also cancels a pending load to it).
+    fn set_reg(&mut self, reg: usize, value: u32) {
+        if reg != 0 {
+            if matches!(self.pending_load, Some((r, _)) if r == reg) {
+                self.pending_load = None;
+            }
+            self.regs[reg] = value;
+        }
+    }
+
+    /// Issue a load: the register changes after the next instruction.
+    fn load_reg(&mut self, reg: usize, value: u32) {
+        if reg != 0 {
+            if matches!(self.pending_load, Some((r, _)) if r == reg) {
+                self.pending_load = None;
+            }
+            self.next_load = Some((reg, value));
+        }
+    }
+
+    /// Current value of a register as seen by LWL/LWR, which can read the
+    /// result of a load still in flight.
+    fn reg_for_merge(&self, reg: usize) -> u32 {
+        match self.pending_load {
+            Some((r, v)) if r == reg => v,
+            _ => self.regs[reg],
+        }
+    }
+
+    // ----- Memory access (alignment, privilege, cache isolation) -----
+
+    fn is_forbidden_address(&self, addr: u32) -> bool {
+        // User mode may only touch KUSEG.
+        self.cp0[COP0_SR] & SR_KUC != 0 && addr & 0x8000_0000 != 0
+    }
+
+    fn read8(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u8, Trap> {
+        if self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
+        }
+        Ok(bus.read8(addr, memory)?)
+    }
+
+    fn read16(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u16, Trap> {
+        if addr & 1 != 0 || self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
+        }
+        Ok(bus.read16(addr, memory)?)
+    }
+
+    fn read32(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u32, Trap> {
+        if addr & 3 != 0 || self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
+        }
+        Ok(bus.read32(addr, memory)?)
+    }
+
+    /// Aligned word read used by LWL/LWR/SWL/SWR (no alignment fault).
+    fn read32_unaligned_base(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u32, Trap> {
+        if self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
+        }
+        Ok(bus.read32(addr & !3, memory)?)
+    }
+
+    fn cache_isolated(&self) -> bool {
+        self.cp0[COP0_SR] & SR_ISC != 0
+    }
+
+    fn write8(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u8) -> Exec {
+        if self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorStore, addr));
+        }
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        Ok(bus.write8(addr, value, memory)?)
+    }
+
+    fn write16(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u16) -> Exec {
+        if addr & 1 != 0 || self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorStore, addr));
+        }
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        Ok(bus.write16(addr, value, memory)?)
+    }
+
+    fn write32(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u32) -> Exec {
+        if addr & 3 != 0 || self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorStore, addr));
+        }
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        Ok(bus.write32(addr, value, memory)?)
+    }
+
+    /// Aligned word write used by SWL/SWR (no alignment fault).
+    fn write32_unaligned_base(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u32) -> Exec {
+        if self.is_forbidden_address(addr) {
+            return Err(Trap::address_error(Exception::AddressErrorStore, addr));
+        }
+        if self.cache_isolated() {
+            return Ok(());
+        }
+        Ok(bus.write32(addr & !3, value, memory)?)
+    }
+
+    // ----- Branch helpers -----
+    //
+    // When an instruction executes, `pc` already points at its delay slot, so
+    // relative targets are computed from `pc`.
+
+    fn jump(&mut self, target: u32) {
+        self.next_pc = target;
+        self.branch_pending = true;
+    }
+
+    fn branch_if(&mut self, condition: bool, imm: u32) {
+        if condition {
+            self.next_pc = self.pc.wrapping_add(sign_extend16(imm) << 2);
+        }
+        // A delay slot follows even when the branch is not taken.
+        self.branch_pending = true;
+    }
+
+    // ----- Instruction decode / execute -----
+
+    fn execute(&mut self, instr: u32, bus: &mut Bus, memory: &mut Memory) -> Exec {
+        let rs = ((instr >> 21) & 0x1F) as usize;
+        let rt = ((instr >> 16) & 0x1F) as usize;
+        let imm = instr & 0xFFFF;
+        let simm = sign_extend16(imm);
+
+        match instr >> 26 {
+            0x00 => self.execute_special(instr)?,
+            0x01 => {
+                // REGIMM: bit 0 of rt selects >= / <, bit 4 selects "and link".
+                // Decoded this way (not as an exact match) as the hardware does.
+                let is_bgez = rt & 1 != 0;
+                let link = rt & 0x1E == 0x10;
+                let negative = (self.regs[rs] as i32) < 0;
+                let taken = negative != is_bgez;
+                if link {
+                    // The return address is written even if not taken.
+                    let ret = self.next_pc;
+                    self.set_reg(31, ret);
+                }
+                self.branch_if(taken, imm);
+            }
+            0x02 => {
+                let target = (self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
+                self.jump(target);
+            }
+            0x03 => {
+                let target = (self.pc & 0xF000_0000) | ((instr & 0x03FF_FFFF) << 2);
+                let ret = self.next_pc;
+                self.set_reg(31, ret);
+                self.jump(target);
+            }
+            0x04 => self.branch_if(self.regs[rs] == self.regs[rt], imm),
+            0x05 => self.branch_if(self.regs[rs] != self.regs[rt], imm),
+            0x06 => self.branch_if((self.regs[rs] as i32) <= 0, imm),
+            0x07 => self.branch_if((self.regs[rs] as i32) > 0, imm),
+            0x08 => {
+                let value = (self.regs[rs] as i32)
+                    .checked_add(simm as i32)
+                    .ok_or_else(|| Trap::exception(Exception::Overflow))?;
+                self.set_reg(rt, value as u32);
+            }
+            0x09 => self.set_reg(rt, self.regs[rs].wrapping_add(simm)),
+            0x0A => self.set_reg(rt, ((self.regs[rs] as i32) < (simm as i32)) as u32),
+            0x0B => self.set_reg(rt, (self.regs[rs] < simm) as u32),
+            0x0C => self.set_reg(rt, self.regs[rs] & imm),
+            0x0D => self.set_reg(rt, self.regs[rs] | imm),
+            0x0E => self.set_reg(rt, self.regs[rs] ^ imm),
+            0x0F => self.set_reg(rt, imm << 16),
+            0x10 => self.execute_cop0(instr)?,
+            0x11 => return Err(Trap::coprocessor_unusable(1)),
+            0x12 => {
+                if self.cp0[COP0_SR] & SR_CU2 == 0 {
+                    return Err(Trap::coprocessor_unusable(2));
+                }
+                // TODO: GTE (COP2) instructions.
+                return Err(Trap::Fatal(Ps1Error::UnimplementedOpcode(instr)));
+            }
+            0x13 => return Err(Trap::coprocessor_unusable(3)),
+            0x20 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                let value = self.read8(bus, memory, addr)? as i8 as i32 as u32;
+                self.load_reg(rt, value);
+            }
+            0x21 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                let value = self.read16(bus, memory, addr)? as i16 as i32 as u32;
+                self.load_reg(rt, value);
+            }
+            0x22 => {
+                // LWL
+                let addr = self.regs[rs].wrapping_add(simm);
+                let word = self.read32_unaligned_base(bus, memory, addr)?;
+                let cur = self.reg_for_merge(rt);
+                let value = match addr & 3 {
+                    0 => (cur & 0x00FF_FFFF) | (word << 24),
+                    1 => (cur & 0x0000_FFFF) | (word << 16),
+                    2 => (cur & 0x0000_00FF) | (word << 8),
+                    _ => word,
+                };
+                self.load_reg(rt, value);
+            }
+            0x23 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                let value = self.read32(bus, memory, addr)?;
+                self.load_reg(rt, value);
+            }
+            0x24 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                let value = self.read8(bus, memory, addr)? as u32;
+                self.load_reg(rt, value);
+            }
+            0x25 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                let value = self.read16(bus, memory, addr)? as u32;
+                self.load_reg(rt, value);
+            }
+            0x26 => {
+                // LWR
+                let addr = self.regs[rs].wrapping_add(simm);
+                let word = self.read32_unaligned_base(bus, memory, addr)?;
+                let cur = self.reg_for_merge(rt);
+                let value = match addr & 3 {
+                    0 => word,
+                    1 => (cur & 0xFF00_0000) | (word >> 8),
+                    2 => (cur & 0xFFFF_0000) | (word >> 16),
+                    _ => (cur & 0xFFFF_FF00) | (word >> 24),
+                };
+                self.load_reg(rt, value);
+            }
+            0x28 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                self.write8(bus, memory, addr, self.regs[rt] as u8)?;
+            }
+            0x29 => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                self.write16(bus, memory, addr, self.regs[rt] as u16)?;
+            }
+            0x2A => {
+                // SWL
+                let addr = self.regs[rs].wrapping_add(simm);
+                let mem = self.read32_unaligned_base(bus, memory, addr)?;
+                let reg = self.regs[rt];
+                let value = match addr & 3 {
+                    0 => (mem & 0xFFFF_FF00) | (reg >> 24),
+                    1 => (mem & 0xFFFF_0000) | (reg >> 16),
+                    2 => (mem & 0xFF00_0000) | (reg >> 8),
+                    _ => reg,
+                };
+                self.write32_unaligned_base(bus, memory, addr, value)?;
+            }
+            0x2B => {
+                let addr = self.regs[rs].wrapping_add(simm);
+                self.write32(bus, memory, addr, self.regs[rt])?;
+            }
+            0x2E => {
+                // SWR
+                let addr = self.regs[rs].wrapping_add(simm);
+                let mem = self.read32_unaligned_base(bus, memory, addr)?;
+                let reg = self.regs[rt];
+                let value = match addr & 3 {
+                    0 => reg,
+                    1 => (mem & 0x0000_00FF) | (reg << 8),
+                    2 => (mem & 0x0000_FFFF) | (reg << 16),
+                    _ => (mem & 0x00FF_FFFF) | (reg << 24),
+                };
+                self.write32_unaligned_base(bus, memory, addr, value)?;
+            }
+            // LWC0/LWC1/LWC3 and SWC0/SWC1/SWC3: coprocessor not present.
+            0x30 | 0x38 => return Err(Trap::coprocessor_unusable(0)),
+            0x31 | 0x39 => return Err(Trap::coprocessor_unusable(1)),
+            0x33 | 0x3B => return Err(Trap::coprocessor_unusable(3)),
+            0x32 | 0x3A => {
+                if self.cp0[COP0_SR] & SR_CU2 == 0 {
+                    return Err(Trap::coprocessor_unusable(2));
+                }
+                // TODO: GTE register loads/stores.
+                return Err(Trap::Fatal(Ps1Error::UnimplementedOpcode(instr)));
+            }
+            _ => return Err(Trap::exception(Exception::ReservedInstruction)),
+        }
+        Ok(())
+    }
+
+    fn execute_special(&mut self, instr: u32) -> Exec {
+        let rs = ((instr >> 21) & 0x1F) as usize;
+        let rt = ((instr >> 16) & 0x1F) as usize;
+        let rd = ((instr >> 11) & 0x1F) as usize;
+        let shamt = (instr >> 6) & 0x1F;
+        let (a, b) = (self.regs[rs], self.regs[rt]);
+
+        match instr & 0x3F {
+            0x00 => self.set_reg(rd, b << shamt),
+            0x02 => self.set_reg(rd, b >> shamt),
+            0x03 => self.set_reg(rd, ((b as i32) >> shamt) as u32),
+            0x04 => self.set_reg(rd, b << (a & 0x1F)),
+            0x06 => self.set_reg(rd, b >> (a & 0x1F)),
+            0x07 => self.set_reg(rd, ((b as i32) >> (a & 0x1F)) as u32),
+            0x08 => self.jump(a),
+            0x09 => {
+                let ret = self.next_pc;
+                self.set_reg(rd, ret);
+                self.jump(a);
+            }
+            0x0C => return Err(Trap::exception(Exception::Syscall)),
+            0x0D => return Err(Trap::exception(Exception::Breakpoint)),
+            0x10 => self.set_reg(rd, self.hi),
+            0x11 => self.hi = a,
+            0x12 => self.set_reg(rd, self.lo),
+            0x13 => self.lo = a,
+            0x18 => {
+                let prod = (a as i32 as i64) * (b as i32 as i64);
+                self.lo = prod as u32;
+                self.hi = (prod >> 32) as u32;
+            }
+            0x19 => {
+                let prod = (a as u64) * (b as u64);
+                self.lo = prod as u32;
+                self.hi = (prod >> 32) as u32;
+            }
+            0x1A => self.divide_signed(a as i32, b as i32),
+            0x1B => self.divide_unsigned(a, b),
+            0x20 => {
+                let value = (a as i32)
+                    .checked_add(b as i32)
+                    .ok_or_else(|| Trap::exception(Exception::Overflow))?;
+                self.set_reg(rd, value as u32);
+            }
+            0x21 => self.set_reg(rd, a.wrapping_add(b)),
+            0x22 => {
+                let value = (a as i32)
+                    .checked_sub(b as i32)
+                    .ok_or_else(|| Trap::exception(Exception::Overflow))?;
+                self.set_reg(rd, value as u32);
+            }
+            0x23 => self.set_reg(rd, a.wrapping_sub(b)),
+            0x24 => self.set_reg(rd, a & b),
+            0x25 => self.set_reg(rd, a | b),
+            0x26 => self.set_reg(rd, a ^ b),
+            0x27 => self.set_reg(rd, !(a | b)),
+            0x2A => self.set_reg(rd, ((a as i32) < (b as i32)) as u32),
+            0x2B => self.set_reg(rd, (a < b) as u32),
+            _ => return Err(Trap::exception(Exception::ReservedInstruction)),
+        }
+        Ok(())
+    }
+
+    fn execute_cop0(&mut self, instr: u32) -> Exec {
+        // COP0 is usable in kernel mode, or in user mode only if SR.CU0 is set.
+        let sr = self.cp0[COP0_SR];
+        if sr & SR_KUC != 0 && sr & SR_CU0 == 0 {
+            return Err(Trap::coprocessor_unusable(0));
+        }
+
+        let rt = ((instr >> 16) & 0x1F) as usize;
+        let rd = ((instr >> 11) & 0x1F) as usize;
+
+        match (instr >> 21) & 0x1F {
+            0x00 => {
+                // MFC0
+                match rd {
+                    COP0_BPC | COP0_BDA | COP0_JUMPDEST | COP0_DCIC | COP0_BADVADDR
+                    | COP0_BDAM | COP0_BPCM | COP0_SR | COP0_CAUSE | COP0_EPC | COP0_PRID => {
+                        let value = self.cp0[rd];
+                        self.load_reg(rt, value);
+                    }
+                    _ => return Err(Trap::exception(Exception::ReservedInstruction)),
+                }
+            }
+            0x04 => {
+                // MTC0
+                let value = self.regs[rt];
+                match rd {
+                    COP0_BPC | COP0_BDA | COP0_JUMPDEST | COP0_DCIC | COP0_BDAM | COP0_BPCM => {
+                        self.cp0[rd] = value;
+                    }
+                    COP0_SR => self.cp0[COP0_SR] = value & SR_WRITE_MASK,
+                    COP0_CAUSE => {
+                        // Only the two software interrupt bits are writable.
+                        let cause = self.cp0[COP0_CAUSE];
+                        self.cp0[COP0_CAUSE] =
+                            (cause & !CAUSE_SOFT_IRQ_MASK) | (value & CAUSE_SOFT_IRQ_MASK);
+                    }
+                    // BadVAddr, EPC and PRId are read-only; writes are ignored.
+                    COP0_BADVADDR | COP0_EPC | COP0_PRID => {}
+                    _ => return Err(Trap::exception(Exception::ReservedInstruction)),
+                }
+            }
+            0x10 if instr & 0x3F == 0x10 => {
+                // RFE: pop the KU/IE mode stack.
+                let sr = self.cp0[COP0_SR];
+                self.cp0[COP0_SR] = (sr & !0x0F) | ((sr >> 2) & 0x0F);
+            }
+            _ => return Err(Trap::exception(Exception::ReservedInstruction)),
+        }
+        Ok(())
+    }
+
+    // ----- Multiply/divide helpers -----
+
+    // Results for the cases real hardware doesn't trap on, as documented in
+    // the "CPU division by zero / overflow" notes.
+    fn divide_signed(&mut self, a: i32, b: i32) {
+        if b == 0 {
+            self.lo = if a >= 0 { 0xFFFF_FFFF } else { 1 };
+            self.hi = a as u32;
+        } else if a == i32::MIN && b == -1 {
+            self.lo = 0x8000_0000;
+            self.hi = 0;
+        } else {
+            self.lo = (a / b) as u32;
+            self.hi = (a % b) as u32;
+        }
+    }
+
+    fn divide_unsigned(&mut self, a: u32, b: u32) {
+        if b == 0 {
+            self.lo = 0xFFFF_FFFF;
+            self.hi = a;
+        } else {
+            self.lo = a / b;
+            self.hi = a % b;
+        }
+    }
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn sign_extend16(imm: u32) -> u32 {
+    imm as u16 as i16 as i32 as u32
+}
+
+#[cfg(test)]
+mod tests;
