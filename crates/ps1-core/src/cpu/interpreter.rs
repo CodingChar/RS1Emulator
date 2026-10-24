@@ -66,8 +66,10 @@ enum Trap {
         bad_vaddr: Option<u32>,
         cop: u8,
     },
-    /// An emulator-level failure (unmapped memory, unimplemented opcode...).
-    Fatal(Ps1Error),
+    /// Nothing is mapped at this address.
+    Unmapped(u32),
+    /// Any other emulator-level failure (boxed to keep `Trap` small).
+    Fatal(Box<Ps1Error>),
 }
 
 impl Trap {
@@ -86,7 +88,7 @@ impl Trap {
 
 impl From<Ps1Error> for Trap {
     fn from(e: Ps1Error) -> Self {
-        Trap::Fatal(e)
+        Trap::Fatal(Box::new(e))
     }
 }
 
@@ -207,7 +209,8 @@ impl Interpreter {
                 self.raise_exception(code, bad_vaddr, cop);
                 Ok(())
             }
-            Err(Trap::Fatal(e)) => Err(e),
+            Err(Trap::Unmapped(addr)) => Err(Ps1Error::MemoryOutOfRange(addr)),
+            Err(Trap::Fatal(e)) => Err(*e),
         }
     }
 
@@ -221,7 +224,7 @@ impl Interpreter {
         if pc & 3 != 0 || self.is_forbidden_address(pc) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, pc));
         }
-        let instr = bus.read32(pc)?;
+        let instr = bus.load(pc, 4).ok_or(Trap::Unmapped(pc))?;
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
         self.execute(instr, bus)
@@ -304,21 +307,21 @@ impl Interpreter {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read8(addr)?)
+        bus.load(addr, 1).map(|v| v as u8).ok_or(Trap::Unmapped(addr))
     }
 
     fn read16(&self, bus: &mut Bus, addr: u32) -> Result<u16, Trap> {
         if addr & 1 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read16(addr)?)
+        bus.load(addr, 2).map(|v| v as u16).ok_or(Trap::Unmapped(addr))
     }
 
     fn read32(&self, bus: &mut Bus, addr: u32) -> Result<u32, Trap> {
         if addr & 3 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read32(addr)?)
+        bus.load(addr, 4).ok_or(Trap::Unmapped(addr))
     }
 
     /// Aligned word read used by LWL/LWR/SWL/SWR (no alignment fault).
@@ -326,7 +329,7 @@ impl Interpreter {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read32(addr & !3)?)
+        bus.load(addr & !3, 4).ok_or(Trap::Unmapped(addr & !3))
     }
 
     fn cache_isolated(&self) -> bool {
@@ -340,7 +343,7 @@ impl Interpreter {
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write8(addr, value)?)
+        Self::stored(bus.store(addr, 1, value as u32), addr)
     }
 
     fn write16(&self, bus: &mut Bus, addr: u32, value: u16) -> Exec {
@@ -350,7 +353,7 @@ impl Interpreter {
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write16(addr, value)?)
+        Self::stored(bus.store(addr, 2, value as u32), addr)
     }
 
     fn write32(&self, bus: &mut Bus, addr: u32, value: u32) -> Exec {
@@ -360,7 +363,11 @@ impl Interpreter {
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write32(addr, value)?)
+        Self::stored(bus.store(addr, 4, value), addr)
+    }
+
+    fn stored(ok: bool, addr: u32) -> Exec {
+        if ok { Ok(()) } else { Err(Trap::Unmapped(addr)) }
     }
 
     /// Aligned word write used by SWL/SWR (no alignment fault).
@@ -371,7 +378,7 @@ impl Interpreter {
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write32(addr & !3, value)?)
+        Self::stored(bus.store(addr & !3, 4, value), addr & !3)
     }
 
     // ----- Branch helpers -----

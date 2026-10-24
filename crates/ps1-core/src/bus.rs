@@ -142,6 +142,8 @@ pub struct Bus {
 
     /// CPU cycles run since the devices were last brought up to date.
     pending_cycles: u32,
+    pub dbg_syncs: u64,
+    pub dbg_mmio: u64,
     /// Cycles after which a device may have something to report.
     deadline: u32,
 }
@@ -169,6 +171,8 @@ impl Bus {
             unhandled_io: Vec::new(),
             unhandled_io_count: 0,
             pending_cycles: 0,
+            dbg_syncs: 0,
+            dbg_mmio: 0,
             deadline: 1,
         }
         .with_deadline()
@@ -237,33 +241,41 @@ impl Bus {
 
     /// Bring every device up to date with the CPU.
     pub fn sync_devices(&mut self) {
+        self.dbg_syncs += 1;
         let cycles = std::mem::take(&mut self.pending_cycles);
-        if cycles > 0 {
-            self.advance_devices(cycles);
+        if cycles == 0 {
+            return;
         }
-        self.deadline = self.compute_deadline();
+        if cycles < self.deadline {
+            // Nothing can happen yet: skip ahead and keep the (shorter) deadline.
+            self.skip_devices(cycles);
+            self.deadline -= cycles;
+        } else {
+            // The last cycle is where the event may happen: run it exactly.
+            self.skip_devices(cycles - 1);
+            self.step_devices();
+            self.deadline = self.compute_deadline();
+        }
     }
 
-    /// Run the devices for `cycles` CPU cycles: the first `cycles - 1` in one
-    /// go (nothing happens in them) and the last one exactly.
-    fn advance_devices(&mut self, cycles: u32) {
-        if cycles > 1 {
-            let skipped = cycles - 1;
-            let video = self.gpu.advance(skipped);
-            if video.vblank_started {
-                self.interrupt.raise(IRQ_VBLANK);
-            }
-            let clocks = TimerClocks {
-                sysclk: skipped,
-                dotclock: video.dot_ticks,
-                hblank: video.hblanks,
-            };
-            self.timers.tick(clocks, &mut self.interrupt);
-            self.cdrom.skip_cycles(skipped);
-            self.sio0.skip_cycles(skipped);
-            self.spu.skip_cycles(skipped);
+    /// Run the devices for `cycles` CPU cycles in which nothing happens.
+    fn skip_devices(&mut self, cycles: u32) {
+        if cycles == 0 {
+            return;
         }
-        self.step_devices();
+        let video = self.gpu.advance(cycles);
+        if video.vblank_started {
+            self.interrupt.raise(IRQ_VBLANK);
+        }
+        let clocks = TimerClocks {
+            sysclk: cycles,
+            dotclock: video.dot_ticks,
+            hblank: video.hblanks,
+        };
+        self.timers.tick(clocks, &mut self.interrupt);
+        self.cdrom.skip_cycles(cycles);
+        self.sio0.skip_cycles(cycles);
+        self.spu.skip_cycles(cycles);
     }
 
     /// Advance all devices by exactly one CPU cycle.
@@ -314,8 +326,55 @@ impl Bus {
         }
     }
 
+    /// Read `width` bytes, or `None` when nothing is mapped at `addr`. This is
+    /// what the CPU uses: RAM, by far the most common target, is checked first.
+    #[inline]
+    pub fn load(&mut self, addr: u32, width: u32) -> Option<u32> {
+        let phys = addr & REGION_MASK[(addr >> 29) as usize];
+        if phys < 0x0080_0000 {
+            let ram = &self.memory.ram;
+            let offset = phys as usize;
+            return Some(match width {
+                4 => ram.read32(offset),
+                2 => ram.read16(offset) as u32,
+                _ => ram.read8(offset) as u32,
+            });
+        }
+        self.load_slow(addr, width)
+    }
+
+    /// Write `width` bytes; false when nothing is mapped at `addr`.
+    #[inline]
+    pub fn store(&mut self, addr: u32, width: u32, value: u32) -> bool {
+        let phys = addr & REGION_MASK[(addr >> 29) as usize];
+        if phys < 0x0080_0000 {
+            let ram = &mut self.memory.ram;
+            let offset = phys as usize;
+            match width {
+                4 => ram.write32(offset, value),
+                2 => ram.write16(offset, value as u16),
+                _ => ram.write8(offset, value as u8),
+            }
+            return true;
+        }
+        self.store_slow(addr, width, value)
+    }
+
     fn read(&mut self, addr: u32, width: u32) -> Ps1Result<u32> {
-        Ok(match Self::decode(addr) {
+        self.load(addr, width).ok_or(Ps1Error::MemoryOutOfRange(addr))
+    }
+
+    fn write(&mut self, addr: u32, width: u32, value: u32) -> Ps1Result<()> {
+        if self.store(addr, width, value) {
+            Ok(())
+        } else {
+            Err(Ps1Error::MemoryOutOfRange(addr))
+        }
+    }
+
+    #[inline(never)]
+    fn load_slow(&mut self, addr: u32, width: u32) -> Option<u32> {
+        Some(match Self::decode(addr) {
             Target::Ram(o) => match width {
                 1 => self.memory.ram.read8(o) as u32,
                 2 => self.memory.ram.read16(o) as u32,
@@ -330,11 +389,12 @@ impl Bus {
             Target::Io(phys) => self.io_read(phys, width),
             Target::Expansion1 => Self::open_bus(width),
             Target::CacheControl => extract(self.cache_control, addr, width),
-            Target::Unmapped => return Err(Ps1Error::MemoryOutOfRange(addr)),
+            Target::Unmapped => return None,
         })
     }
 
-    fn write(&mut self, addr: u32, width: u32, value: u32) -> Ps1Result<()> {
+    #[inline(never)]
+    fn store_slow(&mut self, addr: u32, width: u32, value: u32) -> bool {
         match Self::decode(addr) {
             Target::Ram(o) => match width {
                 1 => self.memory.ram.write8(o, value as u8),
@@ -348,9 +408,9 @@ impl Bus {
             }
             // The BIOS is ROM and expansion 1 has no device: writes are ignored.
             Target::Bios(_) | Target::Expansion1 => {}
-            Target::Unmapped => return Err(Ps1Error::MemoryOutOfRange(addr)),
+            Target::Unmapped => return false,
         }
-        Ok(())
+        true
     }
 
     /// Read a 32-bit word from the bus at the given virtual address.
@@ -386,10 +446,13 @@ impl Bus {
     // ----- Memory-mapped I/O -----
 
     fn io_read(&mut self, phys: u32, width: u32) -> u32 {
+        self.dbg_mmio += 1;
         self.sync_devices();
         let value = self.io_read_synced(phys, width);
-        // Reading can change a device (pop a FIFO, clear a flag).
-        self.deadline = self.compute_deadline();
+        // Reading a serial port or the drive can start something new.
+        if matches!(phys, SIO..=SIO_END | CDROM..=CDROM_END) {
+            self.deadline = self.compute_deadline();
+        }
         value
     }
 
@@ -419,9 +482,19 @@ impl Bus {
     }
 
     fn io_write(&mut self, phys: u32, width: u32, value: u32) {
+        self.dbg_mmio += 1;
         self.sync_devices();
         self.io_write_synced(phys, width, value);
-        self.deadline = self.compute_deadline();
+        if self.spu.take_irq() {
+            self.interrupt.raise(IRQ_SPU);
+        }
+        // Writes to these never change when a device next has something to do.
+        if !matches!(
+            phys,
+            SPU..=SPU_END | MEM_CONTROL1..=MEM_CONTROL1_END | RAM_SIZE..=RAM_SIZE_END | POST_REGISTER
+        ) {
+            self.deadline = self.compute_deadline();
+        }
     }
 
     fn io_write_synced(&mut self, phys: u32, width: u32, value: u32) {

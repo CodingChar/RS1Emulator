@@ -16,30 +16,28 @@ impl Ram {
         self.data.fill(0);
     }
 
+    #[inline(always)]
     pub fn read32(&self, offset: usize) -> u32 {
         let o = offset & (RAM_SIZE - 4);
-        u32::from_le_bytes([self.data[o], self.data[o + 1], self.data[o + 2], self.data[o + 3]])
+        u32::from_le_bytes(self.data[o..o + 4].try_into().unwrap())
     }
 
+    #[inline(always)]
     pub fn write32(&mut self, offset: usize, value: u32) {
         let o = offset & (RAM_SIZE - 4);
-        let bytes = value.to_le_bytes();
-        self.data[o] = bytes[0];
-        self.data[o + 1] = bytes[1];
-        self.data[o + 2] = bytes[2];
-        self.data[o + 3] = bytes[3];
+        self.data[o..o + 4].copy_from_slice(&value.to_le_bytes());
     }
 
+    #[inline(always)]
     pub fn read16(&self, offset: usize) -> u16 {
         let o = offset & (RAM_SIZE - 2);
-        u16::from_le_bytes([self.data[o], self.data[o + 1]])
+        u16::from_le_bytes(self.data[o..o + 2].try_into().unwrap())
     }
 
+    #[inline(always)]
     pub fn write16(&mut self, offset: usize, value: u16) {
         let o = offset & (RAM_SIZE - 2);
-        let bytes = value.to_le_bytes();
-        self.data[o] = bytes[0];
-        self.data[o + 1] = bytes[1];
+        self.data[o..o + 2].copy_from_slice(&value.to_le_bytes());
     }
 
     pub fn read8(&self, offset: usize) -> u8 {

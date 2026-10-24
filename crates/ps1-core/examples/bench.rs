@@ -94,4 +94,5 @@ fn main() {
         steps as f64 / elapsed / 33_868_800.0 * 100.0
     );
     println!("state checksum {hash:016X}");
+    println!("syncs {} mmio {}", sys.bus.dbg_syncs, sys.bus.dbg_mmio);
 }
