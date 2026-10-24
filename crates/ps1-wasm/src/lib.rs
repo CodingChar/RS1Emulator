@@ -13,6 +13,53 @@ pub fn start() {
     set_panic_hook();
 }
 
+/// A disc image file that is read on demand through a JavaScript function
+/// `read(offset, length) -> Uint8Array`, so it never has to fit in memory.
+struct JsSource {
+    read: js_sys::Function,
+    len: u64,
+}
+
+impl SectorSource for JsSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> bool {
+        let result = self.read.call2(
+            &JsValue::NULL,
+            &JsValue::from_f64(offset as f64),
+            &JsValue::from_f64(buf.len() as f64),
+        );
+        match result {
+            Ok(value) => {
+                let bytes = js_sys::Uint8Array::new(&value);
+                if bytes.length() as usize != buf.len() {
+                    return false;
+                }
+                bytes.copy_to(buf);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+/// A disc file waiting to become (part of) a disc.
+enum DiscFile {
+    Memory(Vec<u8>),
+    Lazy(JsSource),
+}
+
+impl DiscFile {
+    fn into_source(self) -> Box<dyn SectorSource> {
+        match self {
+            DiscFile::Memory(data) => Box::new(MemorySource(data)),
+            DiscFile::Lazy(source) => Box::new(source),
+        }
+    }
+}
+
 /// Disc images are matched by file name only, ignoring the folder and case.
 fn base_name(path: &str) -> String {
     path.rsplit(['/', '\\']).next().unwrap_or(path).to_ascii_lowercase()
@@ -25,16 +72,18 @@ fn base_name(path: &str) -> String {
 pub struct Ps1 {
     inner: System,
     /// Disc files received so far (`add_disc_file_*`), waiting for `insert_disc_files`.
-    disc_files: Vec<(String, Vec<u8>)>,
+    disc_files: Vec<(String, DiscFile)>,
     /// The file currently being received.
     incoming: Option<(String, Vec<u8>)>,
+    /// The last rendered frame (RGBA8888), see `render_frame`.
+    frame: Vec<u8>,
 }
 
 #[wasm_bindgen]
 impl Ps1 {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { inner: System::new(), disc_files: Vec::new(), incoming: None }
+        Self { inner: System::new(), disc_files: Vec::new(), incoming: None, frame: Vec::new() }
     }
 
     /// Load the PS1 BIOS ROM (required to boot). Called from JS with a Uint8Array.
@@ -68,9 +117,18 @@ impl Ps1 {
     }
 
     pub fn end_disc_file(&mut self) {
-        if let Some(file) = self.incoming.take() {
-            self.disc_files.push(file);
+        if let Some((name, data)) = self.incoming.take() {
+            self.disc_files.push((name, DiscFile::Memory(data)));
         }
+    }
+
+    /// Add a disc file of `len` bytes that is read on demand by calling
+    /// `read(offset, length)`, which must return a `Uint8Array` of exactly
+    /// that length. Used from a worker with `FileReaderSync`, so a disc of
+    /// hundreds of megabytes costs no memory.
+    pub fn add_lazy_disc_file(&mut self, name: &str, len: f64, read: js_sys::Function) {
+        self.end_disc_file();
+        self.disc_files.push((name.to_string(), DiscFile::Lazy(JsSource { read, len: len as u64 })));
     }
 
     /// Forget every disc file received so far (after a failed load).
@@ -92,16 +150,16 @@ impl Ps1 {
                     .iter()
                     .position(|(file, _)| base_name(file) == wanted)
                     .ok_or_else(|| format!("the file {name} was not provided"))?;
-                let (_, data) = files.swap_remove(position);
-                Ok(Box::new(MemorySource(data)) as Box<dyn SectorSource>)
+                let (_, file) = files.swap_remove(position);
+                Ok(file.into_source())
             })
             .map_err(to_js)?,
             None => {
                 if files.len() != 1 {
                     return Err(JsValue::from_str("select one disc image, or a .cue with its .bin files"));
                 }
-                let (_, data) = files.remove(0);
-                Disc::from_image(data).map_err(to_js)?
+                let (_, file) = files.remove(0);
+                Disc::from_image_source(file.into_source()).map_err(to_js)?
             }
         };
         self.inner.insert_disc_image(disc);
@@ -126,6 +184,21 @@ impl Ps1 {
     /// Copy the GPU framebuffer (RGBA8888) as a Vec<u8>.
     pub fn framebuffer(&self) -> Vec<u8> {
         self.inner.framebuffer()
+    }
+
+    /// Render the display into a buffer inside the module, without copying it
+    /// out: read it with `frame_ptr()` / `frame_len()` as a view of the
+    /// module's memory (valid until the next call that can grow the memory).
+    pub fn render_frame(&mut self) {
+        self.inner.bus.gpu.render_into(&mut self.frame);
+    }
+
+    pub fn frame_ptr(&self) -> *const u8 {
+        self.frame.as_ptr()
+    }
+
+    pub fn frame_len(&self) -> usize {
+        self.frame.len()
     }
 
     /// Dimensions of the framebuffer returned by `framebuffer()`. They change

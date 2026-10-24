@@ -11,7 +11,7 @@ class Ps1AudioProcessor extends AudioWorkletProcessor {
         this.chunks = [];
         this.offset = 0; // read position (in frames) inside chunks[0]
         this.buffered = 0; // frames queued
-        this.port.onmessage = (event) => {
+        const receive = (event) => {
             const samples = event.data;
             if (!(samples instanceof Float32Array) || samples.length === 0) return;
             this.chunks.push(samples);
@@ -20,6 +20,15 @@ class Ps1AudioProcessor extends AudioWorkletProcessor {
                 const dropped = this.chunks.shift();
                 this.buffered -= (dropped.length / 2) - this.offset;
                 this.offset = 0;
+            }
+        };
+        // Samples arrive on this port, or on a channel the page hands over so
+        // that a worker can send them straight here.
+        this.port.onmessage = (event) => {
+            if (event.data && event.data.port) {
+                event.data.port.onmessage = receive;
+            } else {
+                receive(event);
             }
         };
     }

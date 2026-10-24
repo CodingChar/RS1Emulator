@@ -49,6 +49,17 @@ export class AudioOutput {
         this.applyVolume();
     }
 
+    /**
+     * Open a channel that feeds the audio thread directly and return the end
+     * for the producer (to be transferred to the worker running the emulator).
+     */
+    createChannel() {
+        if (!this.node) return null;
+        const channel = new MessageChannel();
+        this.node.port.postMessage({ port: channel.port2 }, [channel.port2]);
+        return channel.port1;
+    }
+
     /** Queue interleaved stereo samples (a Float32Array the callee takes over). */
     push(samples) {
         if (this.node && samples.length > 0) {

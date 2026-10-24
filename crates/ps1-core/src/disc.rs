@@ -152,17 +152,22 @@ impl Disc {
     /// A single-track data disc from a raw image: 2352-byte sectors if the
     /// size allows, otherwise 2048-byte (ISO).
     pub fn from_image(data: Vec<u8>) -> Ps1Result<Disc> {
-        let format = if data.len() % RAW_SECTOR_SIZE == 0 && !data.is_empty() {
+        Self::from_image_source(Box::new(MemorySource(data)))
+    }
+
+    /// Like [`Disc::from_image`] for an image read on demand from any source.
+    pub fn from_image_source(source: Box<dyn SectorSource>) -> Ps1Result<Disc> {
+        let len = source.len();
+        let format = if len % RAW_SECTOR_SIZE as u64 == 0 && len != 0 {
             SectorFormat::Raw2352
-        } else if data.len() % DATA_SECTOR_SIZE == 0 && !data.is_empty() {
+        } else if len % DATA_SECTOR_SIZE as u64 == 0 && len != 0 {
             SectorFormat::Cooked2048
         } else {
             return Err(Ps1Error::InvalidDiscFormat(format!(
-                "{} bytes is not a whole number of 2352- or 2048-byte sectors",
-                data.len()
+                "{len} bytes is not a whole number of 2352- or 2048-byte sectors"
             )));
         };
-        Self::single_track(Box::new(MemorySource(data)), format)
+        Self::single_track(source, format)
     }
 
     /// A single-track data disc from any source.

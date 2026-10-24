@@ -802,40 +802,59 @@ impl Gpu {
     /// Render the displayed part of VRAM as RGBA8888, `display_width() *
     /// display_height() * 4` bytes.
     pub fn framebuffer(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.render_into(&mut out);
+        out
+    }
+
+    /// Convert the displayed part of VRAM to RGBA8888 in `out`, which is
+    /// resized to `display_width() * display_height() * 4` bytes. Reusing the
+    /// same buffer every frame avoids allocating and zeroing one each time.
+    pub fn render_into(&self, out: &mut Vec<u8>) {
         let _area = crate::profile::enter(crate::profile::Area::Display);
         let (width, height) = (self.display_width(), self.display_height());
-        let mut out = vec![0u8; width * height * 4];
-        for pixel in out.chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
+        out.resize(width * height * 4, 0);
         if !self.display_enabled {
-            return out;
+            for pixel in out.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0, 0, 0, 255]);
+            }
+            return;
         }
+
+        // 5-bit channel to 8 bits, replicating the top bits into the low ones.
+        const EXPAND: [u8; 32] = {
+            let mut table = [0u8; 32];
+            let mut c = 0;
+            while c < 32 {
+                table[c] = ((c << 3) | (c >> 2)) as u8;
+                c += 1;
+            }
+            table
+        };
 
         let (start_x, start_y) = (self.display_start.0 as usize, self.display_start.1 as usize);
         let true_color = self.display_mode & (1 << 4) != 0;
-        for y in 0..height {
-            let row = start_y + y;
-            for x in 0..width {
-                let (r, g, b) = if true_color {
-                    // 24-bit mode: three bytes per pixel packed into the row.
-                    let byte = |i: usize| {
-                        let word = self.vram.get(start_x + i / 2, row);
-                        (word >> ((i % 2) * 8)) as u8
-                    };
-                    (byte(x * 3), byte(x * 3 + 1), byte(x * 3 + 2))
-                } else {
-                    let pixel = self.vram.get(start_x + x, row);
-                    let expand = |c: u16| ((c << 3) | (c >> 2)) as u8;
-                    (expand(pixel & 31), expand((pixel >> 5) & 31), expand((pixel >> 10) & 31))
-                };
-                let at = (y * width + x) * 4;
-                out[at] = r;
-                out[at + 1] = g;
-                out[at + 2] = b;
+        let pixels = &self.vram.pixels;
+        for (y, line) in out.chunks_exact_mut(width * 4).enumerate() {
+            let row = ((start_y + y) % sw::VRAM_HEIGHT) * sw::VRAM_WIDTH;
+            if true_color {
+                // 24-bit mode: three bytes per pixel packed into the row.
+                let byte = |i: usize| (pixels[row + (start_x + i / 2) % sw::VRAM_WIDTH] >> ((i % 2) * 8)) as u8;
+                for (x, pixel) in line.chunks_exact_mut(4).enumerate() {
+                    pixel.copy_from_slice(&[byte(x * 3), byte(x * 3 + 1), byte(x * 3 + 2), 255]);
+                }
+            } else {
+                for (x, pixel) in line.chunks_exact_mut(4).enumerate() {
+                    let texel = pixels[row + (start_x + x) % sw::VRAM_WIDTH];
+                    pixel.copy_from_slice(&[
+                        EXPAND[(texel & 31) as usize],
+                        EXPAND[((texel >> 5) & 31) as usize],
+                        EXPAND[((texel >> 10) & 31) as usize],
+                        255,
+                    ]);
+                }
             }
         }
-        out
     }
 
     // ----- Save states -----
