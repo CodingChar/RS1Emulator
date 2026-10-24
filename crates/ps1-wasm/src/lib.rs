@@ -49,12 +49,14 @@ impl Ps1 {
         self.inner.framebuffer()
     }
 
-    /// Framebuffer dimensions.
+    /// Dimensions of the framebuffer returned by `framebuffer()`. They change
+    /// whenever the game switches video mode, so read them every frame.
     pub fn framebuffer_width(&self) -> u32 {
-        ps1_core::gpu::FRAMEBUFFER_WIDTH
+        self.inner.bus.gpu.display_width() as u32
     }
+
     pub fn framebuffer_height(&self) -> u32 {
-        ps1_core::gpu::FRAMEBUFFER_HEIGHT
+        self.inner.bus.gpu.display_height() as u32
     }
 
     /// Set controller input for a port.

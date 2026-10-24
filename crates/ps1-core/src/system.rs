@@ -133,6 +133,7 @@ impl System {
 
     /// Run exactly one video frame's worth of cycles.
     pub fn run_frame(&mut self) -> Ps1Result<()> {
+        self.cycles_per_frame = self.bus.gpu.cycles_per_frame();
         self.frame_cycles_remaining = self.cycles_per_frame;
         while self.frame_cycles_remaining > 0 {
             self.step()?;

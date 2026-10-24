@@ -33,7 +33,7 @@ pub struct SaveState {
     pub controllers: Vec<(u16, i8, i8, i8, i8)>,
 }
 
-const SAVE_STATE_VERSION: u32 = 4;
+const SAVE_STATE_VERSION: u32 = 5;
 
 impl SaveState {
     pub const CURRENT_VERSION: u32 = SAVE_STATE_VERSION;
@@ -49,10 +49,10 @@ impl SaveState {
             cpu_regs: sys.cpu.regs,
             cpu_hi: sys.cpu.hi,
             cpu_lo: sys.cpu.lo,
-            gpu_regs: sys.bus.gpu.regs,
+            gpu_regs: sys.bus.gpu.save_registers(),
             spu_regs: sys.bus.spu.register_file.to_vec(),
             ram_snapshot: sys.bus.memory.ram.as_slice().to_vec(),
-            vram_snapshot: sys.bus.memory.vram.clone(),
+            vram_snapshot: sys.bus.gpu.vram_bytes(),
             dma_regs: sys.bus.dma.registers,
             timer_counters: sys.bus.timers.counter,
             timer_modes: sys.bus.timers.mode,
@@ -84,10 +84,10 @@ impl SaveState {
         sys.cpu.regs = self.cpu_regs;
         sys.cpu.hi = self.cpu_hi;
         sys.cpu.lo = self.cpu_lo;
-        sys.bus.gpu.regs = self.gpu_regs;
+        sys.bus.gpu.load_registers(&self.gpu_regs);
         sys.bus.spu.register_file.copy_from_slice(&self.spu_regs);
         sys.bus.memory.ram.as_mut_slice().copy_from_slice(&self.ram_snapshot);
-        sys.bus.memory.vram.copy_from_slice(&self.vram_snapshot);
+        sys.bus.gpu.load_vram_bytes(&self.vram_snapshot);
         sys.bus.dma.registers = self.dma_regs;
         sys.bus.timers.counter = self.timer_counters;
         sys.bus.timers.mode = self.timer_modes;

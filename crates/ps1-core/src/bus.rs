@@ -3,7 +3,9 @@ use crate::controllers::sio::Sio0;
 use crate::controllers::ControllerManager;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
-use crate::interrupt::{InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_VBLANK};
+use crate::interrupt::{
+    InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_GPU, IRQ_VBLANK,
+};
 use crate::io::{extract, merge, read_le, write_le, StubRegs};
 use crate::memory::Memory;
 use crate::spu::Spu;
@@ -205,6 +207,7 @@ impl Bus {
         self.timers.tick(clocks, &mut self.interrupt);
 
         self.gpu.step();
+        self.forward_gpu_irq();
         self.spu.step();
         self.cdrom.step();
         self.forward_cdrom_irq();
@@ -357,7 +360,10 @@ impl Bus {
                 self.cdrom.write(phys - CDROM, width, value);
                 self.forward_cdrom_irq();
             }
-            GPU..=GPU_END => self.gpu.write(phys - GPU, width, value),
+            GPU..=GPU_END => {
+                self.gpu.write(phys - GPU, width, value);
+                self.forward_gpu_irq();
+            }
             MDEC..=MDEC_END => self.mdec.write(phys - MDEC, width, value),
             SPU..=SPU_END => self.spu.write(phys - SPU, width, value),
             POST_REGISTER => self.post_code = value as u8,
@@ -376,6 +382,12 @@ impl Bus {
                 &mut self.spu,
                 &mut self.cdrom,
             );
+        }
+    }
+
+    fn forward_gpu_irq(&mut self) {
+        if self.gpu.take_irq() {
+            self.interrupt.raise(IRQ_GPU);
         }
     }
 
@@ -660,15 +672,19 @@ mod tests {
     // ----- GPU -----
 
     #[test]
-    fn gpu_reports_ready_and_remembers_command_words() {
+    fn gpu_status_reports_ready_and_tracks_commands() {
         let mut bus = Bus::new();
         let stat = bus.read32(0x1F80_1814).unwrap();
         assert_eq!(stat & 0x1C00_0000, 0x1C00_0000);
-        bus.write32(0x1F80_1810, 0xE100_0000).unwrap();
-        bus.write32(0x1F80_1814, 0x0300_0000).unwrap();
-        assert_eq!(bus.gpu.regs[0], 0xE100_0000);
-        assert_eq!(bus.gpu.regs[1], 0x0300_0000);
+        assert_ne!(stat & (1 << 23), 0, "display starts disabled");
+
+        bus.write32(0x1F80_1814, 0x0300_0000).unwrap(); // GP1: display on
+        bus.write32(0x1F80_1810, 0xE100_0009).unwrap(); // GP0: texture page x = 9
+        let stat = bus.read32(0x1F80_1814).unwrap();
+        assert_eq!(stat & (1 << 23), 0);
+        assert_eq!(stat & 0xF, 9);
     }
+
 
     // ----- SPU -----
 
@@ -848,40 +864,50 @@ mod tests {
     }
 
     #[test]
-    fn gpu_dma_block_mode_sends_every_word_to_gp0() {
+    fn gpu_dma_block_mode_uploads_pixels_to_vram() {
         let mut bus = Bus::new();
         enable_dma_channel(&mut bus, 2);
-        for i in 0..8u32 {
-            bus.write32(0x2000 + i * 4, 0xA000_0000 + i).unwrap();
+        // A CPU-to-VRAM upload of a 4x2 block, plus a trailing NOP: 8 words.
+        let words = [0xA000_0000u32, 0x0000_0010, 0x0002_0004, 0x0002_0001, 0x0004_0003, 0x0006_0005, 0x0008_0007, 0];
+        for (i, word) in words.iter().enumerate() {
+            bus.write32(0x2000 + i as u32 * 4, *word).unwrap();
         }
         bus.write32(dma_reg(2, 0), 0x2000).unwrap();
         bus.write32(dma_reg(2, 1), (2 << 16) | 4).unwrap(); // 2 blocks of 4 words
         bus.write32(dma_reg(2, 2), 0x0100_0201).unwrap(); // request sync, from RAM
         assert_eq!(bus.gpu.gp0_word_count, 8);
-        assert_eq!(bus.gpu.regs[0], 0xA000_0007);
+        for i in 0..4 {
+            assert_eq!(bus.gpu.vram.get(16 + i, 0), 1 + i as u16, "row 0, pixel {i}");
+            assert_eq!(bus.gpu.vram.get(16 + i, 1), 5 + i as u16, "row 1, pixel {i}");
+        }
         assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
         assert_eq!(bus.read32(dma_reg(2, 0)).unwrap(), 0x2020, "MADR advanced by 8 words");
         assert_eq!(bus.read32(dma_reg(2, 1)).unwrap() >> 16, 0, "block counter ran down");
     }
 
+
     #[test]
     fn gpu_dma_linked_list_follows_the_chain() {
         let mut bus = Bus::new();
         enable_dma_channel(&mut bus, 2);
-        // Node A: 2 command words, next = 0x2100.
+        // A VRAM fill command split across two nodes: the GPU sees one word stream.
+        // Node A: 2 words (command, position), next = 0x2100.
         bus.write32(0x2000, (2 << 24) | 0x2100).unwrap();
-        bus.write32(0x2004, 0x1111_1111).unwrap();
-        bus.write32(0x2008, 0x2222_2222).unwrap();
-        // Node B: 1 command word, end of list.
+        bus.write32(0x2004, 0x0200_00FF).unwrap(); // fill, red
+        bus.write32(0x2008, 0x0000_0010).unwrap(); // x = 16, y = 0
+        // Node B: 1 word (size), end of list.
         bus.write32(0x2100, (1 << 24) | 0x00FF_FFFF).unwrap();
-        bus.write32(0x2104, 0x3333_3333).unwrap();
+        bus.write32(0x2104, 0x0001_0010).unwrap(); // 16 x 1
 
         bus.write32(dma_reg(2, 0), 0x2000).unwrap();
         bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap(); // linked-list sync, from RAM
         assert_eq!(bus.gpu.gp0_word_count, 3);
-        assert_eq!(bus.gpu.regs[0], 0x3333_3333);
+        assert_eq!(bus.gpu.vram.get(16, 0), 0x001F, "red in 15-bit");
+        assert_eq!(bus.gpu.vram.get(31, 0), 0x001F);
+        assert_eq!(bus.gpu.vram.get(32, 0), 0);
         assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
     }
+
 
     #[test]
     fn gpu_dma_linked_list_survives_a_cycle() {
@@ -894,17 +920,24 @@ mod tests {
     }
 
     #[test]
-    fn gpu_dma_to_ram_reads_gpuread() {
+    fn gpu_dma_to_ram_downloads_vram() {
         let mut bus = Bus::new();
         enable_dma_channel(&mut bus, 2);
+        bus.gpu.vram.set(8, 3, 0x1234);
+        bus.gpu.vram.set(9, 3, 0x5678);
         bus.write32(0x3000, 0xFFFF_FFFF).unwrap();
-        bus.gpu.regs[2] = 0xCAFE_BABE;
+
+        // GP0: VRAM-to-CPU transfer of a 2x1 block at (8, 3).
+        bus.write32(0x1F80_1810, 0xC000_0000).unwrap();
+        bus.write32(0x1F80_1810, 0x0003_0008).unwrap();
+        bus.write32(0x1F80_1810, 0x0001_0002).unwrap();
+
         bus.write32(dma_reg(2, 0), 0x3000).unwrap();
-        bus.write32(dma_reg(2, 1), (1 << 16) | 2).unwrap();
+        bus.write32(dma_reg(2, 1), (1 << 16) | 1).unwrap();
         bus.write32(dma_reg(2, 2), 0x0100_0200).unwrap(); // request sync, to RAM
-        assert_eq!(bus.read32(0x3000).unwrap(), 0xCAFE_BABE);
-        assert_eq!(bus.read32(0x3004).unwrap(), 0xCAFE_BABE);
+        assert_eq!(bus.read32(0x3000).unwrap(), 0x5678_1234);
     }
+
 
     #[test]
     fn spu_dma_copies_ram_into_sound_ram() {

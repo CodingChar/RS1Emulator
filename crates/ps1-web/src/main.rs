@@ -1,6 +1,7 @@
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::Clamped;
 use wasm_bindgen::JsCast;
-use web_sys::{window, HtmlCanvasElement, CanvasRenderingContext2d};
+use web_sys::{window, CanvasRenderingContext2d, HtmlCanvasElement, ImageData};
 use ps1_wasm::{Ps1, init_panic_hook};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -28,25 +29,22 @@ pub fn run() -> Result<(), JsValue> {
 
     let mut ps1 = Ps1::new();
 
-    // Native PS1 resolution.
-    let fb_w = ps1.framebuffer_width();
-    let fb_h = ps1.framebuffer_height();
-    canvas.set_width(fb_w);
-    canvas.set_height(fb_h);
-
-    let image_data = ctx
-        .create_image_data_with_sw_and_sh(fb_w as f64, fb_h as f64)
-        .map_err(|e| JsValue::from_str(&format!("create_image_data failed: {:?}", e)))?;
-
     let f = Rc::new(RefCell::new(None as Option<Closure<dyn FnMut()>>));
     let g = f.clone();
 
     *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
         let _ = ps1.run_frame();
+
+        // The size follows the game's video mode, so read it every frame.
+        let (fb_w, fb_h) = (ps1.framebuffer_width(), ps1.framebuffer_height());
+        if canvas.width() != fb_w || canvas.height() != fb_h {
+            canvas.set_width(fb_w);
+            canvas.set_height(fb_h);
+        }
         let fb = ps1.framebuffer();
-        let mut data = image_data.data();
-        data.copy_from_slice(&fb);
-        let _ = ctx.put_image_data(&image_data, 0.0, 0.0);
+        if let Ok(image) = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&fb[..]), fb_w, fb_h) {
+            let _ = ctx.put_image_data(&image, 0.0, 0.0);
+        }
 
         let win = window().unwrap();
         let _ = win.request_animation_frame(
