@@ -15,7 +15,7 @@ impl Dma {
         self.registers = [0u32; 16];
     }
 
-    pub fn step(&mut self, _bus: &mut crate::bus::Bus, _memory: &mut crate::memory::Memory) {
+    pub fn step(&mut self, _memory: &mut crate::memory::Memory) {
         // TODO: process DMA channel transfers (GPU, MDEC, SPU, CD-ROM, OTC).
     }
 }

@@ -34,7 +34,7 @@ impl CdRom {
         self.total_sectors = 0;
     }
 
-    pub fn step(&mut self, _bus: &mut crate::bus::Bus, _memory: &mut crate::memory::Memory) {
+    pub fn step(&mut self) {
         // TODO: process CD-ROM command queue, DMA sector transfers.
     }
 

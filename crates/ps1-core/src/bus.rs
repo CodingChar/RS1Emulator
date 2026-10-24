@@ -1,4 +1,11 @@
+use crate::cdrom::CdRom;
+use crate::controllers::ControllerManager;
+use crate::dma::Dma;
+use crate::gpu::Gpu;
+use crate::interrupt::InterruptController;
 use crate::memory::Memory;
+use crate::spu::Spu;
+use crate::timers::Timers;
 use crate::types::{Ps1Error, Ps1Result};
 
 /// Mask applied to a virtual address to obtain the physical address, indexed
@@ -22,17 +29,54 @@ enum Target {
     Unmapped,
 }
 
-/// System bus: routes CPU/memory/device accesses to the correct hardware.
+/// System bus: owns main memory and every memory-mapped device, and routes
+/// CPU accesses to the right one.
 ///
 /// In the PS1, the CPU talks to RAM, BIOS, GPU, SPU, CD-ROM, timers, etc.
 /// through memory-mapped I/O. This struct centralizes those mappings.
 pub struct Bus {
-    // Future: register device address ranges here.
+    pub memory: Memory,
+    pub gpu: Gpu,
+    pub spu: Spu,
+    pub cdrom: CdRom,
+    pub dma: Dma,
+    pub timers: Timers,
+    pub interrupt: InterruptController,
+    pub controllers: ControllerManager,
 }
 
 impl Bus {
     pub fn new() -> Self {
-        Self {}
+        Self {
+            memory: Memory::new(),
+            gpu: Gpu::new(),
+            spu: Spu::new(),
+            cdrom: CdRom::new(),
+            dma: Dma::new(),
+            timers: Timers::new(),
+            interrupt: InterruptController::new(),
+            controllers: ControllerManager::new(),
+        }
+    }
+
+    /// Reset every device and clear RAM/VRAM (the BIOS ROM is kept).
+    pub fn reset(&mut self) {
+        self.gpu.reset();
+        self.spu.reset();
+        self.cdrom.reset();
+        self.dma.reset();
+        self.timers.reset();
+        self.interrupt.reset();
+        self.memory.reset();
+    }
+
+    /// Advance all devices by one cycle.
+    pub fn step_devices(&mut self) {
+        self.dma.step(&mut self.memory);
+        self.timers.step(&mut self.interrupt);
+        self.gpu.step();
+        self.spu.step();
+        self.cdrom.step();
     }
 
     fn decode(addr: u32) -> Target {
@@ -47,10 +91,10 @@ impl Bus {
     }
 
     /// Read a 32-bit word from the bus at the given virtual address.
-    pub fn read32(&self, addr: u32, memory: &Memory) -> Ps1Result<u32> {
+    pub fn read32(&mut self, addr: u32) -> Ps1Result<u32> {
         match Self::decode(addr) {
-            Target::Ram(o) => Ok(memory.ram.read32(o)),
-            Target::Bios(o) => Ok(memory.bios.read32(o)),
+            Target::Ram(o) => Ok(self.memory.ram.read32(o)),
+            Target::Bios(o) => Ok(self.memory.bios.read32(o)),
             // TODO: implement scratchpad
             Target::Scratchpad => Ok(0),
             Target::Unmapped => Err(Ps1Error::MemoryOutOfRange(addr)),
@@ -58,30 +102,30 @@ impl Bus {
     }
 
     /// Read a 16-bit halfword from the bus.
-    pub fn read16(&self, addr: u32, memory: &Memory) -> Ps1Result<u16> {
+    pub fn read16(&mut self, addr: u32) -> Ps1Result<u16> {
         match Self::decode(addr) {
-            Target::Ram(o) => Ok(memory.ram.read16(o)),
-            Target::Bios(o) => Ok(memory.bios.read16(o)),
+            Target::Ram(o) => Ok(self.memory.ram.read16(o)),
+            Target::Bios(o) => Ok(self.memory.bios.read16(o)),
             Target::Scratchpad => Ok(0),
             Target::Unmapped => Err(Ps1Error::MemoryOutOfRange(addr)),
         }
     }
 
     /// Read a byte from the bus.
-    pub fn read8(&self, addr: u32, memory: &Memory) -> Ps1Result<u8> {
+    pub fn read8(&mut self, addr: u32) -> Ps1Result<u8> {
         match Self::decode(addr) {
-            Target::Ram(o) => Ok(memory.ram.read8(o)),
-            Target::Bios(o) => Ok(memory.bios.read8(o)),
+            Target::Ram(o) => Ok(self.memory.ram.read8(o)),
+            Target::Bios(o) => Ok(self.memory.bios.read8(o)),
             Target::Scratchpad => Ok(0),
             Target::Unmapped => Err(Ps1Error::MemoryOutOfRange(addr)),
         }
     }
 
     /// Write a 32-bit word to the bus at the given virtual address.
-    pub fn write32(&mut self, addr: u32, value: u32, memory: &mut Memory) -> Ps1Result<()> {
+    pub fn write32(&mut self, addr: u32, value: u32) -> Ps1Result<()> {
         match Self::decode(addr) {
             Target::Ram(o) => {
-                memory.ram.write32(o, value);
+                self.memory.ram.write32(o, value);
                 Ok(())
             }
             // The BIOS is ROM: writes are ignored.
@@ -92,10 +136,10 @@ impl Bus {
     }
 
     /// Write a 16-bit halfword to the bus.
-    pub fn write16(&mut self, addr: u32, value: u16, memory: &mut Memory) -> Ps1Result<()> {
+    pub fn write16(&mut self, addr: u32, value: u16) -> Ps1Result<()> {
         match Self::decode(addr) {
             Target::Ram(o) => {
-                memory.ram.write16(o, value);
+                self.memory.ram.write16(o, value);
                 Ok(())
             }
             Target::Bios(_) | Target::Scratchpad => Ok(()),
@@ -104,10 +148,10 @@ impl Bus {
     }
 
     /// Write a byte to the bus.
-    pub fn write8(&mut self, addr: u32, value: u8, memory: &mut Memory) -> Ps1Result<()> {
+    pub fn write8(&mut self, addr: u32, value: u8) -> Ps1Result<()> {
         match Self::decode(addr) {
             Target::Ram(o) => {
-                memory.ram.write8(o, value);
+                self.memory.ram.write8(o, value);
                 Ok(())
             }
             Target::Bios(_) | Target::Scratchpad => Ok(()),
@@ -126,61 +170,57 @@ impl Default for Bus {
 mod tests {
     use super::*;
 
-    fn setup() -> (Bus, Memory) {
-        (Bus::new(), Memory::new())
-    }
-
     #[test]
     fn ram_is_visible_through_all_segments() {
-        let (mut bus, mut mem) = setup();
-        bus.write32(0x8000_0100, 0xDEAD_BEEF, &mut mem).unwrap();
-        assert_eq!(bus.read32(0x0000_0100, &mem).unwrap(), 0xDEAD_BEEF); // KUSEG
-        assert_eq!(bus.read32(0x8000_0100, &mem).unwrap(), 0xDEAD_BEEF); // KSEG0
-        assert_eq!(bus.read32(0xA000_0100, &mem).unwrap(), 0xDEAD_BEEF); // KSEG1
+        let mut bus = Bus::new();
+        bus.write32(0x8000_0100, 0xDEAD_BEEF).unwrap();
+        assert_eq!(bus.read32(0x0000_0100).unwrap(), 0xDEAD_BEEF); // KUSEG
+        assert_eq!(bus.read32(0x8000_0100).unwrap(), 0xDEAD_BEEF); // KSEG0
+        assert_eq!(bus.read32(0xA000_0100).unwrap(), 0xDEAD_BEEF); // KSEG1
     }
 
     #[test]
     fn ram_is_mirrored_in_the_first_8mb() {
-        let (mut bus, mut mem) = setup();
-        bus.write32(0x0000_0040, 0x1234_5678, &mut mem).unwrap();
-        assert_eq!(bus.read32(0x0020_0040, &mem).unwrap(), 0x1234_5678);
-        assert_eq!(bus.read32(0x0060_0040, &mem).unwrap(), 0x1234_5678);
+        let mut bus = Bus::new();
+        bus.write32(0x0000_0040, 0x1234_5678).unwrap();
+        assert_eq!(bus.read32(0x0020_0040).unwrap(), 0x1234_5678);
+        assert_eq!(bus.read32(0x0060_0040).unwrap(), 0x1234_5678);
     }
 
     #[test]
     fn sub_word_accesses_are_little_endian() {
-        let (mut bus, mut mem) = setup();
-        bus.write32(0x200, 0x4433_2211, &mut mem).unwrap();
-        assert_eq!(bus.read8(0x200, &mem).unwrap(), 0x11);
-        assert_eq!(bus.read8(0x203, &mem).unwrap(), 0x44);
-        assert_eq!(bus.read16(0x200, &mem).unwrap(), 0x2211);
-        assert_eq!(bus.read16(0x202, &mem).unwrap(), 0x4433);
+        let mut bus = Bus::new();
+        bus.write32(0x200, 0x4433_2211).unwrap();
+        assert_eq!(bus.read8(0x200).unwrap(), 0x11);
+        assert_eq!(bus.read8(0x203).unwrap(), 0x44);
+        assert_eq!(bus.read16(0x200).unwrap(), 0x2211);
+        assert_eq!(bus.read16(0x202).unwrap(), 0x4433);
 
-        bus.write8(0x201, 0xAA, &mut mem).unwrap();
-        bus.write16(0x202, 0xBBCC, &mut mem).unwrap();
-        assert_eq!(bus.read32(0x200, &mem).unwrap(), 0xBBCC_AA11);
+        bus.write8(0x201, 0xAA).unwrap();
+        bus.write16(0x202, 0xBBCC).unwrap();
+        assert_eq!(bus.read32(0x200).unwrap(), 0xBBCC_AA11);
     }
 
     #[test]
     fn bios_is_reachable_from_kseg0_and_kseg1_and_is_read_only() {
-        let (mut bus, mut mem) = setup();
-        mem.bios.as_mut_slice()[..4].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
-        assert_eq!(bus.read32(0xBFC0_0000, &mem).unwrap(), 0xCAFE_F00D);
-        assert_eq!(bus.read32(0x9FC0_0000, &mem).unwrap(), 0xCAFE_F00D);
-        assert_eq!(bus.read8(0xBFC0_0000, &mem).unwrap(), 0x0D);
-        assert_eq!(bus.read16(0xBFC0_0002, &mem).unwrap(), 0xCAFE);
+        let mut bus = Bus::new();
+        bus.memory.bios.as_mut_slice()[..4].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+        assert_eq!(bus.read32(0xBFC0_0000).unwrap(), 0xCAFE_F00D);
+        assert_eq!(bus.read32(0x9FC0_0000).unwrap(), 0xCAFE_F00D);
+        assert_eq!(bus.read8(0xBFC0_0000).unwrap(), 0x0D);
+        assert_eq!(bus.read16(0xBFC0_0002).unwrap(), 0xCAFE);
 
-        bus.write32(0xBFC0_0000, 0, &mut mem).unwrap();
-        assert_eq!(bus.read32(0xBFC0_0000, &mem).unwrap(), 0xCAFE_F00D);
+        bus.write32(0xBFC0_0000, 0).unwrap();
+        assert_eq!(bus.read32(0xBFC0_0000).unwrap(), 0xCAFE_F00D);
     }
 
     #[test]
     fn unmapped_addresses_are_reported() {
-        let (bus, mem) = setup();
+        let mut bus = Bus::new();
         assert_eq!(
-            bus.read32(0xBF80_1000, &mem),
+            bus.read32(0xBF80_1000),
             Err(Ps1Error::MemoryOutOfRange(0xBF80_1000))
         );
-        assert!(bus.read32(0xFFFE_0130, &mem).is_err());
+        assert!(bus.read32(0xFFFE_0130).is_err());
     }
 }

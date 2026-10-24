@@ -42,16 +42,16 @@ impl SaveState {
             cpu_regs: sys.cpu.regs,
             cpu_hi: sys.cpu.hi,
             cpu_lo: sys.cpu.lo,
-            gpu_regs: sys.gpu.regs,
-            spu_regs: sys.spu.register_file.to_vec(),
-            ram_snapshot: sys.memory.ram.as_slice().to_vec(),
-            vram_snapshot: sys.memory.vram.clone(),
-            dma_regs: sys.dma.registers,
-            timers: [sys.timers.timer0, sys.timers.timer1, sys.timers.timer2],
-            interrupt_stat: sys.interrupt.stat,
-            interrupt_mask: sys.interrupt.mask,
-            cdrom_sector: sys.cdrom.current_sector,
-            controllers: sys.controllers.ports.iter().map(|p| (
+            gpu_regs: sys.bus.gpu.regs,
+            spu_regs: sys.bus.spu.register_file.to_vec(),
+            ram_snapshot: sys.bus.memory.ram.as_slice().to_vec(),
+            vram_snapshot: sys.bus.memory.vram.clone(),
+            dma_regs: sys.bus.dma.registers,
+            timers: [sys.bus.timers.timer0, sys.bus.timers.timer1, sys.bus.timers.timer2],
+            interrupt_stat: sys.bus.interrupt.stat,
+            interrupt_mask: sys.bus.interrupt.mask,
+            cdrom_sector: sys.bus.cdrom.current_sector,
+            controllers: sys.bus.controllers.ports.iter().map(|p| (
                 p.buttons.bits(),
                 p.left_stick_x,
                 p.left_stick_y,
@@ -72,20 +72,20 @@ impl SaveState {
         sys.cpu.regs = self.cpu_regs;
         sys.cpu.hi = self.cpu_hi;
         sys.cpu.lo = self.cpu_lo;
-        sys.gpu.regs = self.gpu_regs;
-        sys.spu.register_file.copy_from_slice(&self.spu_regs);
-        sys.memory.ram.as_mut_slice().copy_from_slice(&self.ram_snapshot);
-        sys.memory.vram.copy_from_slice(&self.vram_snapshot);
-        sys.dma.registers = self.dma_regs;
-        sys.timers.timer0 = self.timers[0];
-        sys.timers.timer1 = self.timers[1];
-        sys.timers.timer2 = self.timers[2];
-        sys.interrupt.stat = self.interrupt_stat;
-        sys.interrupt.mask = self.interrupt_mask;
-        sys.cdrom.current_sector = self.cdrom_sector;
+        sys.bus.gpu.regs = self.gpu_regs;
+        sys.bus.spu.register_file.copy_from_slice(&self.spu_regs);
+        sys.bus.memory.ram.as_mut_slice().copy_from_slice(&self.ram_snapshot);
+        sys.bus.memory.vram.copy_from_slice(&self.vram_snapshot);
+        sys.bus.dma.registers = self.dma_regs;
+        sys.bus.timers.timer0 = self.timers[0];
+        sys.bus.timers.timer1 = self.timers[1];
+        sys.bus.timers.timer2 = self.timers[2];
+        sys.bus.interrupt.stat = self.interrupt_stat;
+        sys.bus.interrupt.mask = self.interrupt_mask;
+        sys.bus.cdrom.current_sector = self.cdrom_sector;
         for (i, (bits, lx, ly, rx, ry)) in self.controllers.iter().enumerate() {
             if i < 8 {
-                sys.controllers.set_input(i, *bits, *lx, *ly, *rx, *ry);
+                sys.bus.controllers.set_input(i, *bits, *lx, *ly, *rx, *ry);
             }
         }
     }

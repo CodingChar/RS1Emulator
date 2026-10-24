@@ -28,7 +28,7 @@ impl Spu {
     }
 
     /// Advance SPU by one cycle and produce audio samples.
-    pub fn step(&mut self, _bus: &mut crate::bus::Bus, _memory: &mut crate::memory::Memory) {
+    pub fn step(&mut self) {
         // TODO: implement voice mixing, ADPCM decoding, reverb.
     }
 

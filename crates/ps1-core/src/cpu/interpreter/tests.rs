@@ -92,25 +92,24 @@ const DATA: u32 = 0x400;
 struct Machine {
     cpu: Interpreter,
     bus: Bus,
-    mem: Memory,
 }
 
 impl Machine {
     /// Load `program` at `CODE` and point the CPU at it, in kernel mode with
     /// the RAM exception vector selected.
     fn new(program: &[u32]) -> Self {
-        let mut mem = Memory::new();
+        let mut bus = Bus::new();
         for (i, word) in program.iter().enumerate() {
-            mem.ram.write32((CODE & 0x1FFF_FFFF) as usize + i * 4, *word);
+            bus.memory.ram.write32((CODE & 0x1FFF_FFFF) as usize + i * 4, *word);
         }
         let mut cpu = Interpreter::new();
         cpu.cp0[COP0_SR] = 0;
         cpu.set_pc(CODE);
-        Self { cpu, bus: Bus::new(), mem }
+        Self { cpu, bus }
     }
 
     fn step(&mut self) {
-        self.cpu.step(&mut self.bus, &mut self.mem).unwrap();
+        self.cpu.step(&mut self.bus).unwrap();
     }
 
     fn run(&mut self, n: usize) {
@@ -124,11 +123,11 @@ impl Machine {
     }
 
     fn poke32(&mut self, addr: u32, value: u32) {
-        self.mem.ram.write32(addr as usize, value);
+        self.bus.memory.ram.write32(addr as usize, value);
     }
 
     fn peek32(&self, addr: u32) -> u32 {
-        self.mem.ram.read32(addr as usize)
+        self.bus.memory.ram.read32(addr as usize)
     }
 
     fn exc_code(&self) -> u32 {
@@ -148,13 +147,12 @@ impl Machine {
 
 #[test]
 fn reset_starts_at_bios_entry_point() {
-    let mut mem = Memory::new();
-    mem.bios.as_mut_slice()[..4].copy_from_slice(&addiu(1, 0, 0x42).to_le_bytes());
-    let mut cpu = Interpreter::new();
     let mut bus = Bus::new();
+    bus.memory.bios.as_mut_slice()[..4].copy_from_slice(&addiu(1, 0, 0x42).to_le_bytes());
+    let mut cpu = Interpreter::new();
 
     assert_eq!(cpu.pc, RESET_VECTOR);
-    cpu.step(&mut bus, &mut mem).unwrap();
+    cpu.step(&mut bus).unwrap();
     assert_eq!(cpu.regs[1], 0x42);
     assert_eq!(cpu.pc, RESET_VECTOR + 4);
 }
@@ -498,7 +496,7 @@ fn unaligned_load_pair_works_for_every_offset() {
         ]);
         let bytes = [0x10u8, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
         for (i, b) in bytes.iter().enumerate() {
-            m.mem.ram.write8(DATA as usize + i, *b);
+            m.bus.memory.ram.write8(DATA as usize + i, *b);
         }
         m.cpu.regs[1] = 0xFFFF_FFFF;
         m.run(3);
@@ -763,7 +761,7 @@ fn unusable_coprocessors_report_their_number() {
 fn gte_instructions_are_reported_as_unimplemented_when_enabled() {
     let mut m = Machine::new(&[0x12 << 26]);
     m.cpu.cp0[COP0_SR] = SR_CU2;
-    let result = m.cpu.step(&mut m.bus, &mut m.mem);
+    let result = m.cpu.step(&mut m.bus);
     assert_eq!(result, Err(Ps1Error::UnimplementedOpcode(0x12 << 26)));
 }
 
@@ -771,7 +769,7 @@ fn gte_instructions_are_reported_as_unimplemented_when_enabled() {
 fn bus_failures_are_fatal_errors_not_cpu_exceptions() {
     let mut m = Machine::new(&[lui(1, 0xBF80), lw(2, 0x1000, 1), NOP]);
     m.run(1);
-    let result = m.cpu.step(&mut m.bus, &mut m.mem);
+    let result = m.cpu.step(&mut m.bus);
     assert!(matches!(result, Err(Ps1Error::MemoryOutOfRange(_))));
 }
 

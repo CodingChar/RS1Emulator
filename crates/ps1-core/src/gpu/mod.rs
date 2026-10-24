@@ -28,7 +28,7 @@ impl Gpu {
     }
 
     /// Advance GPU by one cycle (stub — real rasterizer goes here).
-    pub fn step(&mut self, _bus: &mut crate::bus::Bus, _memory: &mut crate::memory::Memory) {
+    pub fn step(&mut self) {
         // TODO: implement GPU command parser, texture blits, drawing.
     }
 

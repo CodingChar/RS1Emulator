@@ -1,5 +1,4 @@
 use crate::bus::Bus;
-use crate::memory::Memory;
 use crate::types::{Ps1Error, Ps1Result};
 
 /// Address the CPU starts executing from after reset (start of the BIOS, KSEG1).
@@ -176,7 +175,7 @@ impl Interpreter {
     /// MIPS exceptions (overflow, syscall, address errors, interrupts...) are
     /// handled inside the emulated CPU and return `Ok`. Only emulator-level
     /// failures are returned as errors.
-    pub fn step(&mut self, bus: &mut Bus, memory: &mut Memory) -> Ps1Result<()> {
+    pub fn step(&mut self, bus: &mut Bus) -> Ps1Result<()> {
         self.current_pc = self.pc;
         self.in_delay_slot = self.branch_pending;
         self.branch_pending = false;
@@ -185,7 +184,7 @@ impl Interpreter {
         let result = if self.interrupt_pending() {
             Err(Trap::exception(Exception::Interrupt))
         } else {
-            self.fetch_and_execute(bus, memory)
+            self.fetch_and_execute(bus)
         };
 
         // The delayed load lands now, unless the instruction overwrote it.
@@ -209,15 +208,15 @@ impl Interpreter {
         sr & SR_IEC != 0 && sr & self.cp0[COP0_CAUSE] & CAUSE_IP_MASK != 0
     }
 
-    fn fetch_and_execute(&mut self, bus: &mut Bus, memory: &mut Memory) -> Exec {
+    fn fetch_and_execute(&mut self, bus: &mut Bus) -> Exec {
         let pc = self.pc;
         if pc & 3 != 0 || self.is_forbidden_address(pc) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, pc));
         }
-        let instr = bus.read32(pc, memory)?;
+        let instr = bus.read32(pc)?;
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
-        self.execute(instr, bus, memory)
+        self.execute(instr, bus)
     }
 
     /// Enter the exception handler.
@@ -292,78 +291,78 @@ impl Interpreter {
         self.cp0[COP0_SR] & SR_KUC != 0 && addr & 0x8000_0000 != 0
     }
 
-    fn read8(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u8, Trap> {
+    fn read8(&self, bus: &mut Bus, addr: u32) -> Result<u8, Trap> {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read8(addr, memory)?)
+        Ok(bus.read8(addr)?)
     }
 
-    fn read16(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u16, Trap> {
+    fn read16(&self, bus: &mut Bus, addr: u32) -> Result<u16, Trap> {
         if addr & 1 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read16(addr, memory)?)
+        Ok(bus.read16(addr)?)
     }
 
-    fn read32(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u32, Trap> {
+    fn read32(&self, bus: &mut Bus, addr: u32) -> Result<u32, Trap> {
         if addr & 3 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read32(addr, memory)?)
+        Ok(bus.read32(addr)?)
     }
 
     /// Aligned word read used by LWL/LWR/SWL/SWR (no alignment fault).
-    fn read32_unaligned_base(&self, bus: &Bus, memory: &Memory, addr: u32) -> Result<u32, Trap> {
+    fn read32_unaligned_base(&self, bus: &mut Bus, addr: u32) -> Result<u32, Trap> {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorLoad, addr));
         }
-        Ok(bus.read32(addr & !3, memory)?)
+        Ok(bus.read32(addr & !3)?)
     }
 
     fn cache_isolated(&self) -> bool {
         self.cp0[COP0_SR] & SR_ISC != 0
     }
 
-    fn write8(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u8) -> Exec {
+    fn write8(&self, bus: &mut Bus, addr: u32, value: u8) -> Exec {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
         }
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write8(addr, value, memory)?)
+        Ok(bus.write8(addr, value)?)
     }
 
-    fn write16(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u16) -> Exec {
+    fn write16(&self, bus: &mut Bus, addr: u32, value: u16) -> Exec {
         if addr & 1 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
         }
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write16(addr, value, memory)?)
+        Ok(bus.write16(addr, value)?)
     }
 
-    fn write32(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u32) -> Exec {
+    fn write32(&self, bus: &mut Bus, addr: u32, value: u32) -> Exec {
         if addr & 3 != 0 || self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
         }
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write32(addr, value, memory)?)
+        Ok(bus.write32(addr, value)?)
     }
 
     /// Aligned word write used by SWL/SWR (no alignment fault).
-    fn write32_unaligned_base(&self, bus: &mut Bus, memory: &mut Memory, addr: u32, value: u32) -> Exec {
+    fn write32_unaligned_base(&self, bus: &mut Bus, addr: u32, value: u32) -> Exec {
         if self.is_forbidden_address(addr) {
             return Err(Trap::address_error(Exception::AddressErrorStore, addr));
         }
         if self.cache_isolated() {
             return Ok(());
         }
-        Ok(bus.write32(addr & !3, value, memory)?)
+        Ok(bus.write32(addr & !3, value)?)
     }
 
     // ----- Branch helpers -----
@@ -386,7 +385,7 @@ impl Interpreter {
 
     // ----- Instruction decode / execute -----
 
-    fn execute(&mut self, instr: u32, bus: &mut Bus, memory: &mut Memory) -> Exec {
+    fn execute(&mut self, instr: u32, bus: &mut Bus) -> Exec {
         let rs = ((instr >> 21) & 0x1F) as usize;
         let rt = ((instr >> 16) & 0x1F) as usize;
         let imm = instr & 0xFFFF;
@@ -447,18 +446,18 @@ impl Interpreter {
             0x13 => return Err(Trap::coprocessor_unusable(3)),
             0x20 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                let value = self.read8(bus, memory, addr)? as i8 as i32 as u32;
+                let value = self.read8(bus, addr)? as i8 as i32 as u32;
                 self.load_reg(rt, value);
             }
             0x21 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                let value = self.read16(bus, memory, addr)? as i16 as i32 as u32;
+                let value = self.read16(bus, addr)? as i16 as i32 as u32;
                 self.load_reg(rt, value);
             }
             0x22 => {
                 // LWL
                 let addr = self.regs[rs].wrapping_add(simm);
-                let word = self.read32_unaligned_base(bus, memory, addr)?;
+                let word = self.read32_unaligned_base(bus, addr)?;
                 let cur = self.reg_for_merge(rt);
                 let value = match addr & 3 {
                     0 => (cur & 0x00FF_FFFF) | (word << 24),
@@ -470,23 +469,23 @@ impl Interpreter {
             }
             0x23 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                let value = self.read32(bus, memory, addr)?;
+                let value = self.read32(bus, addr)?;
                 self.load_reg(rt, value);
             }
             0x24 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                let value = self.read8(bus, memory, addr)? as u32;
+                let value = self.read8(bus, addr)? as u32;
                 self.load_reg(rt, value);
             }
             0x25 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                let value = self.read16(bus, memory, addr)? as u32;
+                let value = self.read16(bus, addr)? as u32;
                 self.load_reg(rt, value);
             }
             0x26 => {
                 // LWR
                 let addr = self.regs[rs].wrapping_add(simm);
-                let word = self.read32_unaligned_base(bus, memory, addr)?;
+                let word = self.read32_unaligned_base(bus, addr)?;
                 let cur = self.reg_for_merge(rt);
                 let value = match addr & 3 {
                     0 => word,
@@ -498,16 +497,16 @@ impl Interpreter {
             }
             0x28 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                self.write8(bus, memory, addr, self.regs[rt] as u8)?;
+                self.write8(bus, addr, self.regs[rt] as u8)?;
             }
             0x29 => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                self.write16(bus, memory, addr, self.regs[rt] as u16)?;
+                self.write16(bus, addr, self.regs[rt] as u16)?;
             }
             0x2A => {
                 // SWL
                 let addr = self.regs[rs].wrapping_add(simm);
-                let mem = self.read32_unaligned_base(bus, memory, addr)?;
+                let mem = self.read32_unaligned_base(bus, addr)?;
                 let reg = self.regs[rt];
                 let value = match addr & 3 {
                     0 => (mem & 0xFFFF_FF00) | (reg >> 24),
@@ -515,16 +514,16 @@ impl Interpreter {
                     2 => (mem & 0xFF00_0000) | (reg >> 8),
                     _ => reg,
                 };
-                self.write32_unaligned_base(bus, memory, addr, value)?;
+                self.write32_unaligned_base(bus, addr, value)?;
             }
             0x2B => {
                 let addr = self.regs[rs].wrapping_add(simm);
-                self.write32(bus, memory, addr, self.regs[rt])?;
+                self.write32(bus, addr, self.regs[rt])?;
             }
             0x2E => {
                 // SWR
                 let addr = self.regs[rs].wrapping_add(simm);
-                let mem = self.read32_unaligned_base(bus, memory, addr)?;
+                let mem = self.read32_unaligned_base(bus, addr)?;
                 let reg = self.regs[rt];
                 let value = match addr & 3 {
                     0 => reg,
@@ -532,7 +531,7 @@ impl Interpreter {
                     2 => (mem & 0x0000_FFFF) | (reg << 16),
                     _ => (mem & 0x00FF_FFFF) | (reg << 24),
                 };
-                self.write32_unaligned_base(bus, memory, addr, value)?;
+                self.write32_unaligned_base(bus, addr, value)?;
             }
             // LWC0/LWC1/LWC3 and SWC0/SWC1/SWC3: coprocessor not present.
             0x30 | 0x38 => return Err(Trap::coprocessor_unusable(0)),

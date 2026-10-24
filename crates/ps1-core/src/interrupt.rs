@@ -19,8 +19,9 @@ impl InterruptController {
         self.mask = 0;
     }
 
-    pub fn step(&mut self, _cpu: &mut crate::cpu::interpreter::Interpreter) {
-        // TODO: check pending IRQs against mask, set COP0 Cause/Status.
+    /// Whether any unmasked interrupt is pending (drives COP0 Cause.IP2).
+    pub fn pending(&self) -> bool {
+        self.stat & self.mask != 0
     }
 
     pub fn raise(&mut self, irq: u32) {
