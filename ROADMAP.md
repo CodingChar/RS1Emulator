@@ -6,7 +6,7 @@ contadores reales, DMA, el controlador del CD-ROM con lectura de BIN/CUE, el pue
 SIO0 con pad digital y memory cards, y una GPU con rasterizador por software (407 tests
 unitarios). Con una BIOS SCPH1001 real y un disco, la BIOS muestra su logo, identifica el
 disco, carga el ejecutable del juego y se lo cede; Resident Evil (USA) muestra el logo de
-CAPCOM y su pantalla de título (~1.200 M de instrucciones). El MDEC decodifica el FMV de introducción (Resident Evil lo muestra entero antes del título). La SPU mezcla 24 voces con ADSR, ruido, FM, reverb y el audio del CD (XA y CD-DA); la intro de Resident Evil suena con su voz y música. Falta el
+CAPCOM y su pantalla de título (~1.200 M de instrucciones). El MDEC decodifica el FMV de introducción (Resident Evil lo muestra entero antes del título). La SPU mezcla 24 voces con ADSR, ruido, FM, reverb y el audio del CD (XA y CD-DA); la intro de Resident Evil genera audio continuo (sin comprobarlo de oídas). Falta el
 intérprete va a ~15 M instr/s en nativo, la mitad del tiempo real.
 
 Las fases están ordenadas por prioridad: cada una depende de las anteriores.
