@@ -76,12 +76,13 @@ const GPU_VERSION: u32 = 2;
 enum Gp0State {
     /// Waiting for a command word.
     Command,
-    /// Collecting the parameter words of a command.
-    Parameters { words: Vec<u32>, needed: usize },
+    /// Collecting the parameter words of a command (the longest takes 12).
+    Parameters { words: [u32; 12], len: usize, needed: usize },
     /// Collecting vertices of a polyline until the terminator.
     Polyline { words: Vec<u32> },
-    /// Receiving pixel data for a CPU-to-VRAM upload.
-    Upload { x: usize, y: usize, width: usize, height: usize, index: usize },
+    /// Receiving pixel data for a CPU-to-VRAM upload; `col` and `row` are the
+    /// position of the next pixel inside the rectangle.
+    Upload { x: usize, y: usize, width: usize, height: usize, col: usize, row: usize },
 }
 
 /// A VRAM-to-CPU download in progress.
@@ -493,36 +494,41 @@ impl Gpu {
     fn write_gp0(&mut self, word: u32) {
         let _area = crate::profile::enter(crate::profile::Area::GpuCommand);
         self.gp0_word_count += 1;
-        match std::mem::replace(&mut self.gp0, Gp0State::Command) {
+        match &mut self.gp0 {
             Gp0State::Command => self.start_command(word),
-            Gp0State::Parameters { mut words, needed } => {
-                words.push(word);
-                if words.len() == needed {
-                    self.execute_command(&words);
-                } else {
-                    self.gp0 = Gp0State::Parameters { words, needed };
+            Gp0State::Parameters { words, len, needed } => {
+                words[*len] = word;
+                *len += 1;
+                if *len == *needed {
+                    let (words, needed) = (*words, *needed);
+                    self.gp0 = Gp0State::Command;
+                    self.execute_command(&words[..needed]);
                 }
             }
-            Gp0State::Polyline { mut words } => {
+            Gp0State::Polyline { words } => {
                 // The list ends with a word like 0x5xxx5xxx.
                 if word & 0xF000_F000 == 0x5000_5000 && words.len() >= 3 {
+                    let words = std::mem::take(words);
+                    self.gp0 = Gp0State::Command;
                     self.draw_polyline(&words);
                 } else {
                     words.push(word);
-                    self.gp0 = Gp0State::Polyline { words };
                 }
             }
-            Gp0State::Upload { x, y, width, height, mut index } => {
-                let total = width * height;
+            Gp0State::Upload { x, y, width, height, col, row } => {
                 for half in 0..2 {
-                    if index < total {
+                    if *row < *height {
                         let pixel = (word >> (16 * half)) as u16;
-                        sw::upload_pixel(&mut self.vram, &self.settings, x + index % width, y + index / width, pixel);
-                        index += 1;
+                        sw::upload_pixel(&mut self.vram, &self.settings, *x + *col, *y + *row, pixel);
+                        *col += 1;
+                        if *col == *width {
+                            *col = 0;
+                            *row += 1;
+                        }
                     }
                 }
-                if index < total {
-                    self.gp0 = Gp0State::Upload { x, y, width, height, index };
+                if *row >= *height {
+                    self.gp0 = Gp0State::Command;
                 }
             }
         }
@@ -531,7 +537,11 @@ impl Gpu {
     fn start_command(&mut self, word: u32) {
         match Self::command_length(word) {
             Some(1) => self.execute_command(&[word]),
-            Some(needed) => self.gp0 = Gp0State::Parameters { words: vec![word], needed },
+            Some(needed) => {
+                let mut words = [0; 12];
+                words[0] = word;
+                self.gp0 = Gp0State::Parameters { words, len: 1, needed };
+            }
             None => self.gp0 = Gp0State::Polyline { words: vec![word] },
         }
     }
@@ -564,7 +574,7 @@ impl Gpu {
                 let (x, y) = ((words[1] & 0x3FF) as usize, ((words[1] >> 16) & 0x1FF) as usize);
                 let width = sw::transfer_width(words[2] & 0xFFFF);
                 let height = sw::transfer_height(words[2] >> 16);
-                self.gp0 = Gp0State::Upload { x, y, width, height, index: 0 };
+                self.gp0 = Gp0State::Upload { x, y, width, height, col: 0, row: 0 };
             }
             0xC0..=0xDF => {
                 let (x, y) = ((words[1] & 0x3FF) as usize, ((words[1] >> 16) & 0x1FF) as usize);
