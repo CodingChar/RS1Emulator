@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/ps1-core",
     "crates/ps1-wasm",
-    "crates/ps1-web",
 ]
 
 [workspace.package]

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RS1Emu — Emulador de PS1 (Rust + WASM)</title>
+    <style>
+        :root {
+            --bg: #101114;
+            --panel: #1a1c21;
+            --line: #2c2f37;
+            --text: #e8e9ec;
+            --muted: #9a9ea8;
+            --accent: #5b9dff;
+            --danger: #ff6b6b;
+            --ok: #5fd68a;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+            padding: 16px;
+        }
+        main { max-width: 1000px; margin: 0 auto; display: grid; gap: 16px; }
+        h1 { font-size: 1.25rem; font-weight: 600; }
+        h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 8px; }
+        .screen-wrap { background: #000; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+        #screen {
+            display: block;
+            width: 100%;
+            aspect-ratio: 4 / 3;
+            image-rendering: pixelated;
+            background: #000;
+        }
+        .screen-wrap:fullscreen { display: grid; place-items: center; border: 0; border-radius: 0; }
+        .screen-wrap:fullscreen #screen { height: 100vh; width: auto; max-width: 100vw; }
+        .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        .bar .grow { flex: 1; }
+        #status { color: var(--muted); min-height: 1.5em; }
+        #status.error { color: var(--danger); }
+        #stats { color: var(--muted); font-variant-numeric: tabular-nums; }
+        .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+        section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+        .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+        .state { color: var(--muted); font-size: 0.9rem; }
+        .state.ok { color: var(--ok); }
+        button, select {
+            font: inherit;
+            color: var(--text);
+            background: #272a31;
+            border: 1px solid #3a3e48;
+            border-radius: 6px;
+            padding: 6px 12px;
+            cursor: pointer;
+        }
+        button:hover:not(:disabled) { background: #313540; }
+        button:disabled { opacity: 0.45; cursor: not-allowed; }
+        button.primary { background: var(--accent); border-color: var(--accent); color: #07152b; font-weight: 600; }
+        button.primary:hover:not(:disabled) { background: #7ab1ff; }
+        :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+        input[type="file"] { max-width: 100%; color: var(--muted); }
+        input[type="range"] { width: 120px; accent-color: var(--accent); }
+        .keys { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }
+        .keys button { display: flex; justify-content: space-between; gap: 8px; text-align: left; }
+        .keys button .key { color: var(--accent); font-weight: 600; }
+        .keys button.waiting { border-color: var(--accent); }
+        .legal { color: var(--muted); font-size: 0.82rem; }
+        progress { width: 100%; height: 8px; display: none; }
+        progress.visible { display: block; }
+        .hidden-input { display: none; }
+    </style>
+</head>
+<body>
+<main>
+    <h1>RS1Emu — PlayStation 1 en el navegador</h1>
+
+    <div class="screen-wrap" id="screen-wrap">
+        <canvas id="screen" width="320" height="240" aria-label="Pantalla de la consola"></canvas>
+    </div>
+
+    <div class="bar">
+        <button id="btn-start" class="primary" disabled>Iniciar</button>
+        <button id="btn-pause" disabled>Pausar</button>
+        <button id="btn-reset" disabled>Reiniciar</button>
+        <button id="btn-fullscreen">Pantalla completa</button>
+        <label>Velocidad
+            <select id="speed">
+                <option value="1">Normal</option>
+                <option value="2">×2</option>
+                <option value="4">×4</option>
+                <option value="max">Máxima</option>
+            </select>
+        </label>
+        <label>Volumen <input type="range" id="volume" min="0" max="100" value="80"></label>
+        <button id="btn-mute" aria-pressed="false">Silenciar</button>
+        <span class="grow"></span>
+        <span id="stats"></span>
+    </div>
+    <div id="status" role="status">Cargando el emulador…</div>
+    <progress id="progress" max="1" value="0"></progress>
+
+    <div class="grid">
+        <section>
+            <h2>1. BIOS</h2>
+            <p class="state" id="bios-state">Sin BIOS. Necesitas el volcado de 512 KB de tu consola (por ejemplo SCPH1001.BIN).</p>
+            <div class="row">
+                <input type="file" id="bios-input" accept=".bin,.rom,.bios" aria-label="Archivo de BIOS">
+                <button id="btn-bios-forget" disabled>Olvidar BIOS guardada</button>
+            </div>
+        </section>
+
+        <section>
+            <h2>2. Disco</h2>
+            <p class="state" id="disc-state">Sin disco. Elige un .cue con sus .bin, un .bin suelto o un .iso (también puedes arrastrarlos a la página).</p>
+            <div class="row">
+                <input type="file" id="disc-input" accept=".cue,.bin,.iso,.img" multiple aria-label="Archivos del disco">
+            </div>
+        </section>
+
+        <section>
+            <h2>Tarjetas de memoria</h2>
+            <p class="state" id="cards-state">Se guardan solas en este navegador.</p>
+            <div class="row" id="cards"></div>
+        </section>
+
+        <section>
+            <h2>Estados guardados (experimental)</h2>
+            <p class="state" id="states-state">Guardan toda la máquina; carga el mismo disco antes de restaurar.</p>
+            <div class="row">
+                <label>Ranura
+                    <select id="slot">
+                        <option value="1">1</option>
+                        <option value="2">2</option>
+                        <option value="3">3</option>
+                    </select>
+                </label>
+                <button id="btn-save-state" disabled>Guardar</button>
+                <button id="btn-load-state" disabled>Cargar</button>
+            </div>
+        </section>
+    </div>
+
+    <section>
+        <h2>Controles</h2>
+        <p class="state" id="pad-state">Teclado y mando (si hay uno conectado, se usa solo). Pulsa un botón y luego la tecla que quieras; Esc cancela.</p>
+        <div class="keys" id="keys" style="margin-top: 8px"></div>
+        <div class="row"><button id="btn-keys-reset">Restaurar teclas</button></div>
+    </section>
+
+    <p class="legal">La BIOS y los discos son material con derechos de autor: usa tus propias copias de respaldo. Nada se envía a ningún servidor; los archivos se quedan en tu navegador.</p>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

@@ -81,7 +81,7 @@ Archivo: `crates/ps1-core/src/bus.rs`
 Hito: la BIOS llega a la pantalla de arranque / shell.
 
 - [x] Cargar la BIOS desde el host (`examples/boot.rs --bios`); en la web, el selector de archivo sigue pendiente.
-- [ ] Validar tamaño/checksum de la BIOS.
+- [x] Validar el tamaño de la BIOS (512 KB) en el frontend. [ ] Checksum.
 - [x] Harness `examples/boot.rs`: ejecuta N instrucciones, imprime los códigos POST, los últimos `pc` y los accesos a I/O sin dispositivo.
 - [x] Desensamblador y listado de bucles calientes en el harness (`--disasm`, `--peek`).
 - [ ] Traza de ejecución (cpu trace, opcional detrás de feature flag).
@@ -190,8 +190,16 @@ Archivos: `spu/mod.rs` (registros y mezclador), `spu/voice.rs` (ADPCM, ADSR, vol
 
 ## Fase 12 — Frontend web y herramientas
 
-- [ ] UI en `ps1-web`: cargar BIOS y disco desde el navegador (hoy el `main.rs` crea `Ps1` y corre cuadros sin BIOS ni disco).
-- [ ] Controles: pausa, reset, velocidad, pantalla completa.
+- [x] Frontend en `web/` (HTML + módulos JS sobre `ps1-wasm`; el crate Rust `ps1-web` y Trunk se retiraron): BIOS (validada a 512 KB y recordada en IndexedDB) y disco (`.cue` + `.bin`, `.bin` o `.iso`, por selector o arrastrando) enviados al emulador por trozos de 8 MB sin duplicar el disco en JS.
+- [x] Controles: iniciar/reiniciar, pausa, velocidad (×1, ×2, ×4, máxima), pantalla completa, volumen y silencio; ritmo de 60/50 Hz según el modo de vídeo y contador de fps.
+- [x] Entrada: teclado reconfigurable (guardado en localStorage) y mando estándar (cruceta, botones y stick izquierdo como cruceta) en el puerto 1.
+- [x] Audio: `AudioWorklet` a 44,1 kHz con cola corta (silencio si el emulador va lento, descarta lo viejo si va rápido).
+- [x] Tarjetas de memoria 1 y 2 persistentes en IndexedDB (guardado al detectar escrituras), con exportar, importar y formatear.
+- [x] Estados guardados (3 ranuras) en IndexedDB en lugar de localStorage.
+- [x] Probado en el navegador con un módulo simulado de `ps1_wasm` (carga de archivos, bucle, cambio de resolución, entrada, tarjetas, estados, pausa y el worklet); falta probarlo con el módulo real, que necesita `wasm-bindgen-cli` para generarse (`web/build.sh`).
+- [ ] Probar el frontend con el emulador real en el navegador y medir su velocidad en WebAssembly.
+- [ ] Mando analógico (DualShock), vibración y selección del puerto 2.
+- [ ] Cambio de disco en caliente, lista de discos recientes y carga de discos grandes con `File` perezoso desde un Web Worker.
 - [ ] Guardado de estados completo y versionado (hoy `SaveState` no cubre GPU, timers/IRQ internos ni CD-ROM, y falla en silencio si cambia la versión); persistir en IndexedDB.
 - [ ] Ajustes persistentes (`settings.rs` hoy solo guarda en memoria).
 - [ ] Rendimiento: perfilar el intérprete, evaluar cachés de bloques/threaded code; Web Workers para emulación fuera del hilo principal.

@@ -26,14 +26,21 @@ rustup target add wasm32-unknown-unknown
 cargo build --release
 ```
 
-For the web build (using [Trunk](https://trunkrs.dev/)):
+For the web build you also need the `wasm-bindgen` command-line tool, at the
+same version as the `wasm-bindgen` crate in `Cargo.lock`:
 
 ```bash
-cargo install trunk
-trunk build --release --dir dist
+cargo install wasm-bindgen-cli --version <version from Cargo.lock>
+sh web/build.sh            # or: powershell web/build.ps1
+python -m http.server -d web 8080
 ```
 
-Then serve `dist/` with any static file server.
+Then open <http://localhost:8080>. The page (`web/`) asks for your BIOS (512 KB;
+it is kept in your browser's IndexedDB) and a disc: a `.cue` together with its
+`.bin` files, a single `.bin`, or an `.iso`. Memory cards are saved
+automatically in the browser (and can be exported/imported), the keyboard and
+any gamepad drive controller 1 (the keys can be remapped), and audio plays
+through an AudioWorklet.
 
 ## Testing
 
