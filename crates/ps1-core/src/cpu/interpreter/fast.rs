@@ -36,6 +36,9 @@ impl Interpreter {
     /// The caller guarantees no interrupt is pending and that this CPU's
     /// delayed-load slot is empty (`pending_load.0 == 0`), which holds between
     /// instructions.
+    // The state macros assign locals that the last instruction of a batch
+    // never reads again; that is intended.
+    #[allow(unused_assignments)]
     #[inline(never)]
     pub(super) fn run_fast(&mut self, bus: &mut Bus, limit: u32) -> u32 {
         let sr = self.cp0[COP0_SR];
