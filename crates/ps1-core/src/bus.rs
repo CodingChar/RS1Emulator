@@ -237,6 +237,7 @@ impl Bus {
 
     /// Bring every device up to date with the CPU.
     pub fn sync_devices(&mut self) {
+        let _area = crate::profile::enter(crate::profile::Area::Devices);
         let cycles = std::mem::take(&mut self.pending_cycles);
         if cycles == 0 {
             return;
@@ -288,7 +289,10 @@ impl Bus {
 
         self.gpu.step();
         self.forward_gpu_irq();
-        self.spu.step(&mut self.cdrom);
+        {
+            let _area = crate::profile::enter(crate::profile::Area::Spu);
+            self.spu.step(&mut self.cdrom);
+        }
         if self.spu.take_irq() {
             self.interrupt.raise(IRQ_SPU);
         }
@@ -453,6 +457,7 @@ impl Bus {
     }
 
     fn io_read(&mut self, phys: u32, width: u32) -> u32 {
+        let _area = crate::profile::enter(crate::profile::Area::Mmio);
         if !Self::is_timed(phys) {
             return self.io_read_synced(phys, width);
         }
@@ -491,6 +496,7 @@ impl Bus {
     }
 
     fn io_write(&mut self, phys: u32, width: u32, value: u32) {
+        let _area = crate::profile::enter(crate::profile::Area::Mmio);
         let timed = Self::is_timed(phys);
         if timed {
             self.sync_devices();
@@ -544,6 +550,7 @@ impl Bus {
 
     /// Start a DMA transfer if the channel is ready, and signal completion.
     fn run_dma(&mut self, channel: usize) {
+        let _area = crate::profile::enter(crate::profile::Area::Dma);
         if !self.dma.should_run(channel) {
             return;
         }

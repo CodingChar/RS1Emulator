@@ -645,6 +645,7 @@ impl Interpreter {
 
         // Bit 25 set: a GTE command rather than a register move.
         if instr & (1 << 25) != 0 {
+            let _area = crate::profile::enter(crate::profile::Area::Gte);
             self.gte.execute(instr & 0x01FF_FFFF);
             return Ok(());
         }

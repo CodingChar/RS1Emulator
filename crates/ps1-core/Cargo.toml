@@ -8,3 +8,7 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "1"
 bitflags = "2"
 bincode = "1"
+
+[features]
+# Sampling instrumentation for `examples/bench.rs` (see `profile.rs`).
+profile = []

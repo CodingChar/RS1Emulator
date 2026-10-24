@@ -16,6 +16,7 @@ pub mod gpu;
 pub mod interrupt;
 pub mod io;
 pub mod mdec;
+pub mod profile;
 pub mod memory;
 pub mod save_state;
 pub mod settings;

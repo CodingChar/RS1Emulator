@@ -423,6 +423,7 @@ impl CdRom {
 
     /// Read the sector under the head and raise INT1 (or INT4 at the end).
     fn deliver_sector(&mut self) {
+        let _area = crate::profile::enter(crate::profile::Area::CdSector);
         let lba = self.current_sector;
         let mut raw = [0u8; RAW_SECTOR_SIZE];
         let readable = self

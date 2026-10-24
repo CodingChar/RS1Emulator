@@ -491,6 +491,7 @@ impl Gpu {
     }
 
     fn write_gp0(&mut self, word: u32) {
+        let _area = crate::profile::enter(crate::profile::Area::GpuCommand);
         self.gp0_word_count += 1;
         match std::mem::replace(&mut self.gp0, Gp0State::Command) {
             Gp0State::Command => self.start_command(word),
@@ -639,6 +640,7 @@ impl Gpu {
     }
 
     fn draw_polygon(&mut self, words: &[u32]) {
+        let _area = crate::profile::enter(crate::profile::Area::GpuTriangle);
         let command = words[0];
         let gouraud = command & (1 << 28) != 0;
         let quad = command & (1 << 27) != 0;
@@ -694,6 +696,7 @@ impl Gpu {
     }
 
     fn draw_rectangle(&mut self, words: &[u32]) {
+        let _area = crate::profile::enter(crate::profile::Area::GpuRectangle);
         let command = words[0];
         let textured = command & (1 << 26) != 0;
         let raw = command & (1 << 24) != 0;
@@ -747,6 +750,7 @@ impl Gpu {
     /// Lines and polylines: `words` holds the command, then vertices (with a
     /// colour before each vertex but the first when Gouraud shaded).
     fn draw_polyline(&mut self, words: &[u32]) {
+        let _area = crate::profile::enter(crate::profile::Area::GpuLine);
         let command = words[0];
         let gouraud = command & (1 << 28) != 0;
         let semi = command & (1 << 25) != 0;
@@ -788,6 +792,7 @@ impl Gpu {
     /// Render the displayed part of VRAM as RGBA8888, `display_width() *
     /// display_height() * 4` bytes.
     pub fn framebuffer(&self) -> Vec<u8> {
+        let _area = crate::profile::enter(crate::profile::Area::Display);
         let (width, height) = (self.display_width(), self.display_height());
         let mut out = vec![0u8; width * height * 4];
         for pixel in out.chunks_exact_mut(4) {

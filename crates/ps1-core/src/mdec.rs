@@ -242,6 +242,7 @@ impl Mdec {
 
     /// Decode a whole bitstream of macroblocks into `output`.
     fn decode(&mut self, words: &[u32], depth: Depth, signed: bool, bit15: bool) {
+        let _area = crate::profile::enter(crate::profile::Area::Mdec);
         let halfwords: Vec<u16> = words
             .iter()
             .flat_map(|w| [*w as u16, (*w >> 16) as u16])
