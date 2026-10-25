@@ -12,3 +12,5 @@ bincode = "1"
 [features]
 # Sampling instrumentation for `examples/bench.rs` (see `profile.rs`).
 profile = []
+# Keeps a trace of the last executed instructions (slow: see `cpu/trace.rs`).
+trace = []

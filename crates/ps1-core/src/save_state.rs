@@ -22,7 +22,7 @@ use crate::cpu::interpreter::Interpreter;
 use crate::dma::Dma;
 use crate::gpu::Gpu;
 use crate::interrupt::InterruptController;
-use crate::io::StubRegs;
+use crate::sio1::Sio1;
 use crate::mdec::Mdec;
 use crate::spu::Spu;
 use crate::system::System;
@@ -32,7 +32,7 @@ use crate::types::{Ps1Error, Ps1Result};
 /// Starts every save state.
 const MAGIC: [u8; 4] = *b"RS1S";
 /// Bumped whenever the layout of the state changes.
-pub const SAVE_STATE_VERSION: u32 = 7;
+pub const SAVE_STATE_VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
 struct Header {
@@ -55,7 +55,7 @@ struct StateRef<'a> {
     interrupt: &'a InterruptController,
     mdec: &'a Mdec,
     sio0: &'a Sio0,
-    sio1: &'a StubRegs,
+    sio1: &'a Sio1,
     controllers: &'a ControllerManager,
     ram: &'a [u8],
     scratchpad: &'a [u8],
@@ -84,7 +84,7 @@ struct State {
     interrupt: InterruptController,
     mdec: Mdec,
     sio0: Sio0,
-    sio1: StubRegs,
+    sio1: Sio1,
     controllers: ControllerManager,
     ram: Vec<u8>,
     scratchpad: Vec<u8>,

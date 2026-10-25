@@ -54,6 +54,14 @@ const CNT_CD_REVERB: u16 = 1 << 2;
 const SPUSTAT_MIRROR_MASK: u16 = 0x3F;
 const SPUSTAT_IRQ: u16 = 1 << 6;
 
+/// The first 4 KB of sound RAM hold four capture buffers of 512 samples each,
+/// refilled continuously: CD audio left and right, then voices 1 and 3.
+const CAPTURE_BUFFER_SAMPLES: usize = 0x200;
+const CAPTURE_CD_LEFT: usize = 0x000;
+const CAPTURE_CD_RIGHT: usize = 0x400;
+const CAPTURE_VOICE_1: usize = 0x800;
+const CAPTURE_VOICE_3: usize = 0xC00;
+
 /// CPU cycles per output sample (33.8688 MHz / 44.1 kHz).
 const CYCLES_PER_SAMPLE: u32 = 768;
 /// The host is expected to drain the output; if it does not, keep only the
@@ -86,6 +94,8 @@ pub struct Spu {
     end_flags: u32,
     noise_level: u16,
     noise_counter: u32,
+    /// Where the capture buffers are being written, in samples.
+    capture_index: u16,
     cycles: u32,
     /// The SPU interrupt fired and has not been acknowledged.
     irq_flag: bool,
@@ -111,6 +121,7 @@ impl Spu {
             end_flags: 0,
             noise_level: 1,
             noise_counter: 0,
+            capture_index: 0,
             cycles: 0,
             irq_flag: false,
             irq: false,
@@ -210,6 +221,22 @@ impl Spu {
         }
     }
 
+    /// Write this sample to the capture buffers: the CD input (after the CD
+    /// volume) and the output of voices 1 and 3 (after their envelopes).
+    fn capture(&mut self, cd_left: i32, cd_right: i32) {
+        let at = self.capture_index as usize * 2;
+        for (base, value) in [
+            (CAPTURE_CD_LEFT, cd_left),
+            (CAPTURE_CD_RIGHT, cd_right),
+            (CAPTURE_VOICE_1, self.voices[1].last_output as i32),
+            (CAPTURE_VOICE_3, self.voices[3].last_output as i32),
+        ] {
+            let half = (value.clamp(-0x8000, 0x7FFF) as i16).to_le_bytes();
+            self.sound_ram[base + at..base + at + 2].copy_from_slice(&half);
+        }
+        self.capture_index = (self.capture_index + 1) % CAPTURE_BUFFER_SAMPLES as u16;
+    }
+
     fn voice_regs(&self, v: usize) -> VoiceRegs {
         let base = (v * 8) as usize;
         VoiceRegs {
@@ -278,9 +305,10 @@ impl Spu {
         }
 
         // CD audio input.
+        let cd_left = (cd.0 as i32 * self.reg(CD_VOLUME_LEFT) as i16 as i32) >> 15;
+        let cd_right = (cd.1 as i32 * self.reg(CD_VOLUME_RIGHT) as i16 as i32) >> 15;
+        self.capture(cd_left, cd_right);
         if cnt & CNT_CD_ENABLE != 0 {
-            let cd_left = (cd.0 as i32 * self.reg(CD_VOLUME_LEFT) as i16 as i32) >> 15;
-            let cd_right = (cd.1 as i32 * self.reg(CD_VOLUME_RIGHT) as i16 as i32) >> 15;
             left += cd_left;
             right += cd_right;
             if cnt & CNT_CD_REVERB != 0 {

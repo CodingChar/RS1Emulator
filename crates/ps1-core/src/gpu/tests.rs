@@ -687,3 +687,100 @@ fn register_access_is_32_bit_with_partial_reads() {
     assert_eq!(gpu.read(6, 2), stat >> 16);
     assert_eq!(gpu.read(0xC, 4), 0, "no register there");
 }
+
+// ----- Blanking intervals -----
+
+#[test]
+fn hblank_is_the_part_of_the_line_outside_the_display_range() {
+    let mut gpu = Gpu::new();
+    // Default range: 0x200 .. 0x200 + 2560 clocks out of 3413.
+    gpu.line_clock = 100;
+    assert!(gpu.in_hblank());
+    gpu.line_clock = 0x200;
+    assert!(!gpu.in_hblank());
+    gpu.line_clock = 0x200 + 2559;
+    assert!(!gpu.in_hblank());
+    gpu.line_clock = 0x200 + 2560;
+    assert!(gpu.in_hblank());
+}
+
+#[test]
+fn the_next_blank_edge_is_never_later_than_the_real_one() {
+    // Advancing to just before the reported edge never changes the blanking state.
+    let mut gpu = Gpu::new();
+    for step in 0..4000u32 {
+        let before = (gpu.in_hblank(), gpu.in_vblank());
+        let edge = gpu.video_timing().next_blank_edge;
+        assert!(edge >= 1);
+        if edge > 1 {
+            gpu.advance(edge - 1);
+            assert_eq!((gpu.in_hblank(), gpu.in_vblank()), before, "step {step}");
+        }
+        gpu.advance(1 + step % 3);
+    }
+}
+
+#[test]
+fn advancing_reports_when_hblank_and_vblank_begin() {
+    let mut gpu = Gpu::new();
+    gpu.line_clock = 0x200 + 2559;
+    let tick = gpu.advance(4);
+    assert!(tick.in_hblank && tick.hblank_started);
+    let tick = gpu.advance(1);
+    assert!(tick.in_hblank && !tick.hblank_started, "still the same interval");
+    gpu.scanline = VBLANK_START_LINE - 1;
+    gpu.line_clock = 3400;
+    let tick = gpu.advance(10);
+    assert!(tick.in_vblank && tick.vblank_started);
+}
+
+// ----- Drawing time -----
+
+const READY_BITS: u32 = (1 << 26) | (1 << 28);
+
+#[test]
+fn a_fresh_gpu_is_ready() {
+    assert_eq!(gpu().status() & READY_BITS, READY_BITS);
+}
+
+#[test]
+fn drawing_keeps_the_gpu_busy_until_enough_time_passes() {
+    let mut gpu = gpu();
+    // A 256x256 flat rectangle.
+    gp0(&mut gpu, &[0x6000_00FF, xy(0, 0), xy(256, 256)]);
+    assert_eq!(gpu.status() & READY_BITS, 0, "busy right after the command");
+    gpu.advance(10);
+    assert_eq!(gpu.status() & READY_BITS, 0, "still busy a few cycles later");
+    gpu.advance(200_000);
+    assert_eq!(gpu.status() & READY_BITS, READY_BITS, "done");
+}
+
+#[test]
+fn bigger_work_takes_longer_and_clears_do_not_leave_the_gpu_busy_for_ever() {
+    let busy_for = |words: &[u32]| {
+        let mut gpu = gpu();
+        gp0(&mut gpu, words);
+        let mut cycles = 0;
+        while gpu.is_busy() {
+            gpu.advance(100);
+            cycles += 100;
+            assert!(cycles < 5_000_000, "never finishes");
+        }
+        cycles
+    };
+    let small = busy_for(&[0x6000_00FF, xy(0, 0), xy(8, 8)]);
+    let large = busy_for(&[0x6000_00FF, xy(0, 0), xy(256, 256)]);
+    assert!(large > small * 10, "{large} vs {small}");
+    let textured = busy_for(&[0x6500_0000, xy(0, 0), 0, xy(64, 64)]);
+    let flat = busy_for(&[0x6000_00FF, xy(0, 0), xy(64, 64)]);
+    assert!(textured > flat);
+    assert!(busy_for(&[0x0200_00FF, xy(0, 0), xy(1024, 512)]) < 1_000_000);
+}
+
+#[test]
+fn a_gpu_reset_drops_the_queued_work() {
+    let mut gpu = gpu();
+    gp0(&mut gpu, &[0x6000_00FF, xy(0, 0), xy(256, 256)]);
+    gp1(&mut gpu, 0);
+    assert_eq!(gpu.status() & READY_BITS, READY_BITS);
+}

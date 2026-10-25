@@ -13,8 +13,9 @@
 //! checksum tests in `examples/bench.rs` check that over billions of
 //! instructions.
 
-use super::{Interpreter, COP0_SR, SR_CU2, SR_ISC, SR_KUC};
+use super::{multiply_latency, Interpreter, COP0_SR, DIVIDE_LATENCY, SR_CU2, SR_ISC, SR_KUC};
 use crate::bus::Bus;
+use crate::gte::Gte;
 use crate::io::{read_le, write_le};
 
 const SCRATCHPAD_START: u32 = 0x1F80_0000;
@@ -55,6 +56,11 @@ impl Interpreter {
         // Load issued by the instruction being executed.
         let (mut next_load_reg, mut next_load_value) = self.next_load;
         let mut count = 0u32;
+        // Stall cycles added on top of one per instruction, and the cycle (from the
+        // start of the batch) at which the multiply/divide unit has its result.
+        let mut extra = 0u32;
+        let mut busy_until = self.hilo_busy;
+        let mut gte_until = self.gte_busy;
         // The 4 KB page of code being fetched from: translated once, not for
         // every instruction. `u32::MAX` never matches a page address.
         let mut code_page = u32::MAX;
@@ -114,6 +120,27 @@ impl Interpreter {
                 branch_pending = true;
             }};
         }
+        // Reading HI/LO before the multiply/divide unit is done costs the wait. It is
+        // cut short at the end of the batch (`limit`) so no device event is skipped.
+        macro_rules! stall_for_hilo {
+            () => {{
+                let now = count + extra;
+                if busy_until > now {
+                    extra += (busy_until - now).min(limit - now - 1);
+                }
+                busy_until = 0;
+            }};
+        }
+        // The same for the GTE: touching it before its command is done costs the wait.
+        macro_rules! stall_for_gte {
+            () => {{
+                let now = count + extra;
+                if gte_until > now {
+                    extra += (gte_until - now).min(limit - now - 1);
+                }
+                gte_until = 0;
+            }};
+        }
         // Where a data address lives, or stop and let the slow path handle it.
         macro_rules! data_address {
             ($addr:expr, $align:expr) => {{
@@ -125,7 +152,7 @@ impl Interpreter {
             }};
         }
 
-        while count < limit {
+        while count + extra < limit {
             if BREAKPOINT && pc == break_pc {
                 break;
             }
@@ -203,6 +230,7 @@ impl Interpreter {
                         }
                         0x10 => {
                             commit!();
+                            stall_for_hilo!();
                             set!(rd, self.hi);
                         }
                         0x11 => {
@@ -211,6 +239,7 @@ impl Interpreter {
                         }
                         0x12 => {
                             commit!();
+                            stall_for_hilo!();
                             set!(rd, self.lo);
                         }
                         0x13 => {
@@ -222,20 +251,24 @@ impl Interpreter {
                             let prod = (a as i32 as i64) * (b as i32 as i64);
                             self.lo = prod as u32;
                             self.hi = (prod >> 32) as u32;
+                            busy_until = count + extra + multiply_latency(a, true);
                         }
                         0x19 => {
                             commit!();
                             let prod = (a as u64) * (b as u64);
                             self.lo = prod as u32;
                             self.hi = (prod >> 32) as u32;
+                            busy_until = count + extra + multiply_latency(a, false);
                         }
                         0x1A => {
                             commit!();
                             self.divide_signed(a as i32, b as i32);
+                            busy_until = count + extra + DIVIDE_LATENCY;
                         }
                         0x1B => {
                             commit!();
                             self.divide_unsigned(a, b);
+                            busy_until = count + extra + DIVIDE_LATENCY;
                         }
                         0x20 => {
                             let Some(value) = (a as i32).checked_add(b as i32) else { break };
@@ -459,26 +492,32 @@ impl Interpreter {
                     if instr & (1 << 25) != 0 {
                         // A GTE command rather than a register move.
                         commit!();
+                        stall_for_gte!();
                         self.gte.execute(instr & 0x01FF_FFFF);
+                        gte_until = count + extra + Gte::latency(instr);
                     } else {
                         match rs {
                             // MFC2 / CFC2 are loads and have a load delay.
                             0x00 => {
                                 commit!();
+                                stall_for_gte!();
                                 let value = self.gte.read_data(rd);
                                 load!(rt, value);
                             }
                             0x02 => {
                                 commit!();
+                                stall_for_gte!();
                                 let value = self.gte.read_control(rd);
                                 load!(rt, value);
                             }
                             0x04 => {
                                 commit!();
+                                stall_for_gte!();
                                 self.gte.write_data(rd, self.regs[rt]);
                             }
                             0x06 => {
                                 commit!();
+                                stall_for_gte!();
                                 self.gte.write_control(rd, self.regs[rt]);
                             }
                             _ => break,
@@ -499,6 +538,7 @@ impl Interpreter {
                         break;
                     };
                     commit!();
+                    stall_for_gte!();
                     self.gte.write_data(rt, value);
                 }
                 // SWC2: store a GTE data register.
@@ -507,13 +547,14 @@ impl Interpreter {
                         break;
                     }
                     let phys = data_address!(self.regs[rs].wrapping_add(simm), 3);
-                    let value = self.gte.read_data(rt);
                     if phys < RAM_MIRROR_END {
                         commit!();
-                        bus.memory.ram.write32(phys as usize, value);
+                        stall_for_gte!();
+                        bus.memory.ram.write32(phys as usize, self.gte.read_data(rt));
                     } else if phys.wrapping_sub(SCRATCHPAD_START) < SCRATCHPAD_SIZE {
                         commit!();
-                        write_le(&mut bus.scratchpad, (phys & 0x3FF) as usize, 4, value);
+                        stall_for_gte!();
+                        write_le(&mut bus.scratchpad, (phys & 0x3FF) as usize, 4, self.gte.read_data(rt));
                     } else {
                         break;
                     }
@@ -535,6 +576,9 @@ impl Interpreter {
         self.branch_pending = branch_pending;
         self.pending_load = (0, 0);
         self.next_load = (next_load_reg, next_load_value);
+        self.hilo_busy = busy_until.saturating_sub(count + extra);
+        self.gte_busy = gte_until.saturating_sub(count + extra);
+        self.extra_cycles = extra;
         count
     }
 }

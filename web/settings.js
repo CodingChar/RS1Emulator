@@ -2,7 +2,7 @@
 
 const STORAGE_KEY = 'rs1emu.settings';
 
-const DEFAULTS = { volume: 80, muted: false, speed: '1' };
+const DEFAULTS = { volume: 80, muted: false, speed: '1', slot: 1, aspect: '4:3', filter: 'nearest' };
 
 export function loadSettings() {
     try {

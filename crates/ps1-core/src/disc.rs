@@ -109,21 +109,54 @@ pub struct Track {
     pub kind: TrackKind,
     /// LBA of the track's INDEX 01.
     pub start_lba: u32,
+    /// LBA where the track's pregap (INDEX 00) starts; `start_lba` when it has none.
+    pub pregap_lba: u32,
 }
 
-/// One file of the image and where it sits on the disc.
-struct Extent {
-    source: Box<dyn SectorSource>,
+/// A contiguous run of sectors on the disc: part of a file, or silence for a
+/// gap (a CUE `PREGAP` or `POSTGAP`) that the image does not contain.
+struct Segment {
+    /// Index into `Disc::sources`; `None` for silence.
+    source: Option<usize>,
     format: SectorFormat,
-    /// LBA of the file's first sector.
+    /// What the sectors are, for the header a silent data sector needs.
+    kind: TrackKind,
+    /// LBA of the segment's first sector.
     first_lba: u32,
     sectors: u32,
+    /// Sector of the file where the segment starts.
+    file_sector: u32,
+}
+
+/// Replacement subchannel Q data for one sector, from a `.sbi` file (the
+/// copy protection of some discs lives in damaged Q data).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SbiEntry {
+    lba: u32,
+    /// Control/ADR, track, index, relative MSF, a zero byte, absolute MSF (BCD).
+    q: [u8; 10],
 }
 
 pub struct Disc {
-    extents: Vec<Extent>,
+    sources: Vec<Box<dyn SectorSource>>,
+    segments: Vec<Segment>,
     tracks: Vec<Track>,
     total_sectors: u32,
+    sbi: Vec<SbiEntry>,
+}
+
+/// The subchannel Q data of a sector: where the head is on the disc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubQ {
+    /// Control nibble in the high half (4 = data track), ADR in the low half.
+    pub control: u8,
+    pub track: u8,
+    /// 0 in a pregap, 1 in the track proper.
+    pub index: u8,
+    /// Position within the track, in sectors: it counts down through a pregap.
+    pub relative: u32,
+    /// Position on the disc's clock (the lead-in's two seconds included).
+    pub absolute: u32,
 }
 
 /// Region of a licensed disc, as reported by GetID.
@@ -177,14 +210,27 @@ impl Disc {
             return Err(Ps1Error::InvalidDiscFormat("empty image".into()));
         }
         Ok(Disc {
-            extents: vec![Extent { source, format, first_lba: 0, sectors }],
-            tracks: vec![Track { number: 1, kind: TrackKind::Data, start_lba: 0 }],
+            sources: vec![source],
+            segments: vec![Segment {
+                source: Some(0),
+                format,
+                kind: TrackKind::Data,
+                first_lba: 0,
+                sectors,
+                file_sector: 0,
+            }],
+            tracks: vec![Track { number: 1, kind: TrackKind::Data, start_lba: 0, pregap_lba: 0 }],
             total_sectors: sectors,
+            sbi: Vec::new(),
         })
     }
 
     /// Build a disc from a CUE sheet. `open` loads the file named in each
     /// `FILE` entry (relative to wherever the sheet lives).
+    ///
+    /// `INDEX 00` marks a pregap that is part of the file; `PREGAP` and
+    /// `POSTGAP` add silent sectors the file does not hold, which shift
+    /// everything after them (the track's INDEX 01 lands after its pregap).
     pub fn from_cue(
         cue: &str,
         mut open: impl FnMut(&str) -> Result<Box<dyn SectorSource>, String>,
@@ -195,7 +241,11 @@ impl Disc {
             number: u8,
             kind: TrackKind,
             format: SectorFormat,
+            /// Sectors into the file.
+            index00: Option<u32>,
             index01: Option<u32>,
+            pregap: u32,
+            postgap: u32,
         }
         // (file name, tracks declared in it)
         let mut files: Vec<(String, Vec<PendingTrack>)> = Vec::new();
@@ -220,24 +270,41 @@ impl Disc {
                     other => return Err(invalid(format!("unsupported track mode {other:?}"))),
                 };
                 let file = files.last_mut().ok_or_else(|| invalid("TRACK before FILE".into()))?;
-                file.1.push(PendingTrack { number, kind, format, index01: None });
+                file.1.push(PendingTrack { number, kind, format, index00: None, index01: None, pregap: 0, postgap: 0 });
             } else if upper.starts_with("INDEX") {
                 let mut parts = line.split_whitespace().skip(1);
                 let index: u32 = parts.next().and_then(|n| n.parse().ok()).ok_or_else(|| invalid("bad INDEX".into()))?;
                 let msf = parts.next().ok_or_else(|| invalid("INDEX without time".into()))?;
-                if index == 1 {
+                if index <= 1 {
                     let frames = parse_cue_time(msf).ok_or_else(|| invalid(format!("bad INDEX time {msf}")))?;
                     let track = files
                         .last_mut()
                         .and_then(|f| f.1.last_mut())
                         .ok_or_else(|| invalid("INDEX before TRACK".into()))?;
-                    track.index01 = Some(frames);
+                    if index == 0 {
+                        track.index00 = Some(frames);
+                    } else {
+                        track.index01 = Some(frames);
+                    }
+                }
+            } else if upper.starts_with("PREGAP") || upper.starts_with("POSTGAP") {
+                let msf = line.split_whitespace().nth(1).ok_or_else(|| invalid("gap without a length".into()))?;
+                let frames = parse_cue_time(msf).ok_or_else(|| invalid(format!("bad gap length {msf}")))?;
+                let track = files
+                    .last_mut()
+                    .and_then(|f| f.1.last_mut())
+                    .ok_or_else(|| invalid("gap before TRACK".into()))?;
+                if upper.starts_with("PREGAP") {
+                    track.pregap = frames;
+                } else {
+                    track.postgap = frames;
                 }
             }
-            // PREGAP, POSTGAP, REM, CATALOG, FLAGS... carry nothing we need.
+            // REM, CATALOG, FLAGS... carry nothing we need.
         }
 
-        let mut extents = Vec::new();
+        let mut sources: Vec<Box<dyn SectorSource>> = Vec::new();
+        let mut segments = Vec::new();
         let mut tracks = Vec::new();
         let mut next_lba = 0u32;
         for (name, pending) in files {
@@ -249,18 +316,151 @@ impl Disc {
                 return Err(invalid(format!("FILE {name} mixes sector sizes")));
             }
             let source = open(&name).map_err(|e| invalid(format!("{name}: {e}")))?;
-            let sectors = (source.len() / format.size()) as u32;
-            for track in &pending {
+            let file_sectors = (source.len() / format.size()) as u32;
+            let source_index = sources.len();
+            sources.push(source);
+
+            let mut cursor = 0u32; // next unplaced sector of the file
+            for (i, track) in pending.iter().enumerate() {
                 let index01 = track.index01.ok_or_else(|| invalid(format!("track {} has no INDEX 01", track.number)))?;
-                tracks.push(Track { number: track.number, kind: track.kind, start_lba: next_lba + index01 });
+                // The track's part of the file runs to where the next track's pregap
+                // (or, without one, the next track) starts.
+                let end = pending
+                    .get(i + 1)
+                    .map(|next| next.index00.or(next.index01).unwrap_or(file_sectors))
+                    .unwrap_or(file_sectors)
+                    .min(file_sectors);
+                let pregap_start = next_lba;
+                if track.pregap > 0 {
+                    segments.push(silence(track.kind, next_lba, track.pregap));
+                    next_lba += track.pregap;
+                }
+                let begin = cursor.min(end);
+                let in_file_pregap = track.index00.map_or(0, |index00| index01.saturating_sub(index00.max(begin)));
+                let start_lba = next_lba + index01.saturating_sub(begin);
+                let pregap_lba = if track.pregap > 0 {
+                    pregap_start
+                } else {
+                    start_lba - in_file_pregap
+                };
+                tracks.push(Track { number: track.number, kind: track.kind, start_lba, pregap_lba });
+                let length = end - begin;
+                if length > 0 {
+                    segments.push(Segment {
+                        source: Some(source_index),
+                        format,
+                        kind: track.kind,
+                        first_lba: next_lba,
+                        sectors: length,
+                        file_sector: begin,
+                    });
+                    next_lba += length;
+                }
+                cursor = end;
+                if track.postgap > 0 {
+                    segments.push(silence(track.kind, next_lba, track.postgap));
+                    next_lba += track.postgap;
+                }
             }
-            extents.push(Extent { source, format, first_lba: next_lba, sectors });
-            next_lba += sectors;
         }
         if tracks.is_empty() {
             return Err(invalid("the CUE sheet has no tracks".into()));
         }
-        Ok(Disc { extents, tracks, total_sectors: next_lba })
+        Ok(Disc { sources, segments, tracks, total_sectors: next_lba, sbi: Vec::new() })
+    }
+
+    /// Build a disc from a CloneCD control file (`.ccd`) and its image (`.img`,
+    /// raw 2352-byte sectors from the start of the disc). The sub-channel file
+    /// (`.sub`) is not used; `[TRACK n]` entries give each track's mode and indexes.
+    pub fn from_ccd(ccd: &str, image: Box<dyn SectorSource>) -> Ps1Result<Disc> {
+        let invalid = |msg: String| Ps1Error::InvalidDiscFormat(msg);
+        let sectors = (image.len() / RAW_SECTOR_SIZE as u64) as u32;
+        if sectors == 0 || image.len() % RAW_SECTOR_SIZE as u64 != 0 {
+            return Err(invalid("a CloneCD image holds whole 2352-byte sectors".into()));
+        }
+        struct Entry {
+            number: u8,
+            mode: u32,
+            index0: Option<u32>,
+            index1: Option<u32>,
+        }
+        let mut entries: Vec<Entry> = Vec::new();
+        for line in ccd.lines().map(str::trim) {
+            let upper = line.to_ascii_uppercase();
+            if let Some(rest) = upper.strip_prefix("[TRACK ") {
+                let number = rest
+                    .trim_end_matches(']')
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid(format!("bad track header {line}")))?;
+                entries.push(Entry { number, mode: 1, index0: None, index1: None });
+            } else if let Some((key, value)) = upper.split_once('=') {
+                let Some(entry) = entries.last_mut() else { continue };
+                let value: Option<u32> = value.trim().parse().ok();
+                match key.trim() {
+                    "MODE" => entry.mode = value.unwrap_or(1),
+                    "INDEX 0" => entry.index0 = value,
+                    "INDEX 1" => entry.index1 = value,
+                    _ => {}
+                }
+            }
+        }
+        let mut tracks = Vec::new();
+        for entry in &entries {
+            let index1 = entry
+                .index1
+                .ok_or_else(|| invalid(format!("track {} has no INDEX 1", entry.number)))?;
+            let kind = if entry.mode == 0 { TrackKind::Audio } else { TrackKind::Data };
+            let pregap_lba = entry.index0.filter(|&i0| i0 < index1).unwrap_or(index1);
+            tracks.push(Track { number: entry.number, kind, start_lba: index1, pregap_lba });
+        }
+        if tracks.is_empty() {
+            return Err(invalid("the CCD file lists no tracks".into()));
+        }
+        Ok(Disc {
+            sources: vec![image],
+            segments: vec![Segment {
+                source: Some(0),
+                format: SectorFormat::Raw2352,
+                kind: tracks[0].kind,
+                first_lba: 0,
+                sectors,
+                file_sector: 0,
+            }],
+            tracks,
+            total_sectors: sectors,
+            sbi: Vec::new(),
+        })
+    }
+
+    /// Apply the replacement subchannel data of a `.sbi` file: the drive then
+    /// reports those sectors' Q data as the file says (the protection of some
+    /// European discs reads them back).
+    pub fn load_sbi(&mut self, data: &[u8]) -> Ps1Result<()> {
+        let invalid = |msg: &str| Ps1Error::InvalidDiscFormat(msg.into());
+        if data.len() < 4 || &data[..4] != b"SBI\0" {
+            return Err(invalid("not an SBI file"));
+        }
+        let mut entries = Vec::new();
+        for entry in data[4..].chunks(14) {
+            if entry.len() < 14 {
+                return Err(invalid("truncated SBI entry"));
+            }
+            let bcd = |b: u8| from_bcd(b).ok_or_else(|| invalid("bad time in an SBI entry"));
+            let frames = (bcd(entry[0])? as u32) * SECTORS_PER_MINUTE
+                + (bcd(entry[1])? as u32) * SECTORS_PER_SECOND
+                + bcd(entry[2])? as u32;
+            // Entry type 1: the 10 bytes of Q data follow.
+            if entry[3] != 1 {
+                return Err(invalid("unsupported SBI entry type"));
+            }
+            let mut q = [0u8; 10];
+            q.copy_from_slice(&entry[4..14]);
+            entries.push(SbiEntry { lba: frames.saturating_sub(LEAD_IN_SECTORS), q });
+        }
+        entries.sort_by_key(|e| e.lba);
+        self.sbi = entries;
+        Ok(())
     }
 
     pub fn total_sectors(&self) -> u32 {
@@ -271,32 +471,70 @@ impl Disc {
         &self.tracks
     }
 
-    /// The track a sector belongs to.
+    /// The track a sector belongs to; a pregap belongs to the track it leads into.
     pub fn track_at(&self, lba: u32) -> &Track {
         self.tracks
             .iter()
             .rev()
-            .find(|t| t.start_lba <= lba)
+            .find(|t| t.pregap_lba <= lba)
             .unwrap_or(&self.tracks[0])
     }
 
+    /// What the drive reads from the subchannel Q of the sector at `lba`.
+    pub fn subchannel_q(&self, lba: u32) -> SubQ {
+        if let Ok(position) = self.sbi.binary_search_by_key(&lba, |e| e.lba) {
+            let q = self.sbi[position].q;
+            let bcd = |b: u8| from_bcd(b).unwrap_or(0) as u32;
+            let time = |m: u8, s: u8, f: u8| bcd(m) * SECTORS_PER_MINUTE + bcd(s) * SECTORS_PER_SECOND + bcd(f);
+            return SubQ {
+                control: q[0],
+                track: from_bcd(q[1]).unwrap_or(0),
+                index: from_bcd(q[2]).unwrap_or(0),
+                relative: time(q[3], q[4], q[5]),
+                absolute: time(q[7], q[8], q[9]),
+            };
+        }
+        let track = self.track_at(lba);
+        let control = match track.kind {
+            TrackKind::Data => 0x41,
+            TrackKind::Audio => 0x01,
+        };
+        let (index, relative) = if lba >= track.start_lba {
+            (1, lba - track.start_lba)
+        } else {
+            // In the pregap the time counts down to the start of the track.
+            (0, track.start_lba - lba - 1)
+        };
+        SubQ { control, track: track.number, index, relative, absolute: lba + LEAD_IN_SECTORS }
+    }
+
     /// Read the raw 2352-byte sector at `lba`. Cooked sectors get a
-    /// synthesized sync/header so the controller sees a uniform layout.
-    /// Returns false when `lba` is outside the disc or the source fails.
+    /// synthesized sync/header so the controller sees a uniform layout, and gaps
+    /// read as silence. Returns false when `lba` is outside the disc or the
+    /// source fails.
     pub fn read_raw_sector(&mut self, lba: u32, out: &mut [u8; RAW_SECTOR_SIZE]) -> bool {
-        let Some(extent) = self
-            .extents
-            .iter_mut()
-            .find(|e| lba >= e.first_lba && lba < e.first_lba + e.sectors)
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|s| lba >= s.first_lba && lba < s.first_lba + s.sectors)
         else {
             return false;
         };
-        let offset = (lba - extent.first_lba) as u64 * extent.format.size();
-        match extent.format {
-            SectorFormat::Raw2352 => extent.source.read_at(offset, out),
+        let Some(source_index) = segment.source else {
+            out.fill(0);
+            if segment.kind == TrackKind::Data {
+                write_header(lba, out);
+            }
+            return true;
+        };
+        let format = segment.format;
+        let offset = (segment.file_sector + lba - segment.first_lba) as u64 * format.size();
+        let source = &mut self.sources[source_index];
+        match format {
+            SectorFormat::Raw2352 => source.read_at(offset, out),
             SectorFormat::Cooked2048 => {
                 let mut data = [0u8; DATA_SECTOR_SIZE];
-                if !extent.source.read_at(offset, &mut data) {
+                if !source.read_at(offset, &mut data) {
                     return false;
                 }
                 out.fill(0);
@@ -307,7 +545,7 @@ impl Disc {
             }
             SectorFormat::Mode2_2336 => {
                 let mut payload = [0u8; 2336];
-                if !extent.source.read_at(offset, &mut payload) {
+                if !source.read_at(offset, &mut payload) {
                     return false;
                 }
                 out.fill(0);
@@ -338,6 +576,10 @@ impl Disc {
             None
         }
     }
+}
+
+fn silence(kind: TrackKind, first_lba: u32, sectors: u32) -> Segment {
+    Segment { source: None, format: SectorFormat::Raw2352, kind, first_lba, sectors, file_sector: 0 }
 }
 
 /// Sync pattern plus the BCD minute/second/frame header and mode byte.
@@ -466,9 +708,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(disc.total_sectors(), 30);
-        assert_eq!(disc.tracks()[1], Track { number: 2, kind: TrackKind::Audio, start_lba: 12 });
+        assert_eq!(disc.tracks()[1], Track { number: 2, kind: TrackKind::Audio, start_lba: 12, pregap_lba: 10 });
         assert_eq!(disc.track_at(5).number, 1);
-        assert_eq!(disc.track_at(11).number, 1, "still in track 2's pregap");
+        assert_eq!(disc.track_at(9).number, 1);
+        assert_eq!(disc.track_at(11).number, 2, "track 2's pregap belongs to track 2");
         assert_eq!(disc.track_at(12).number, 2);
 
         // LBA 13 is sector 3 of the second file.
@@ -508,5 +751,135 @@ mod tests {
     fn region_is_none_on_a_tiny_disc() {
         let mut disc = Disc::from_image(iso(2)).unwrap();
         assert_eq!(disc.region(), None);
+    }
+
+    // ----- Gaps, subchannel, CloneCD and SBI -----
+
+    fn open_raw(sectors: &'static [u32]) -> impl FnMut(&str) -> Result<Box<dyn SectorSource>, String> {
+        let mut next = 0;
+        move |_| {
+            let count = sectors[next];
+            next += 1;
+            Ok(Box::new(MemorySource(raw(count))) as Box<dyn SectorSource>)
+        }
+    }
+
+    #[test]
+    fn a_pregap_command_adds_silent_sectors_before_the_track() {
+        let cue = "FILE \"d.bin\" BINARY
+ TRACK 01 MODE2/2352
+  INDEX 01 00:00:00
+                   FILE \"a.bin\" BINARY
+ TRACK 02 AUDIO
+  PREGAP 00:00:02
+  INDEX 01 00:00:00
+";
+        let mut disc = Disc::from_cue(cue, open_raw(&[10, 5])).unwrap();
+        assert_eq!(disc.total_sectors(), 17, "the file has 5 sectors, the gap adds 2");
+        assert_eq!(disc.tracks()[1], Track { number: 2, kind: TrackKind::Audio, start_lba: 12, pregap_lba: 10 });
+        let mut sector = [0xAAu8; RAW_SECTOR_SIZE];
+        assert!(disc.read_raw_sector(10, &mut sector));
+        assert!(sector.iter().all(|b| *b == 0), "audio silence");
+        assert!(disc.read_raw_sector(12, &mut sector));
+        assert_eq!(sector[24], 0, "the file's first sector comes after the gap");
+        assert!(disc.read_raw_sector(14, &mut sector));
+        assert_eq!(sector[24], 2);
+    }
+
+    #[test]
+    fn a_postgap_command_adds_silent_sectors_after_the_track() {
+        let cue = "FILE \"d.bin\" BINARY
+ TRACK 01 MODE2/2352
+  INDEX 01 00:00:00
+  POSTGAP 00:00:03
+";
+        let mut disc = Disc::from_cue(cue, open_raw(&[4])).unwrap();
+        assert_eq!(disc.total_sectors(), 7);
+        let mut sector = [0xAAu8; RAW_SECTOR_SIZE];
+        assert!(disc.read_raw_sector(5, &mut sector));
+        assert_eq!(&sector[..12], &SYNC, "a data gap keeps its header");
+        assert!(sector[24..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn one_file_with_several_tracks_keeps_the_pregap_inside_it() {
+        let cue = "FILE \"all.bin\" BINARY
+ TRACK 01 MODE2/2352
+  INDEX 01 00:00:00
+                   TRACK 02 AUDIO
+  INDEX 00 00:00:20
+  INDEX 01 00:00:22
+";
+        let mut disc = Disc::from_cue(cue, open_raw(&[30])).unwrap();
+        assert_eq!(disc.total_sectors(), 30);
+        assert_eq!(disc.tracks()[1].start_lba, 22);
+        assert_eq!(disc.tracks()[1].pregap_lba, 20);
+        let mut sector = [0u8; RAW_SECTOR_SIZE];
+        assert!(disc.read_raw_sector(25, &mut sector));
+        assert_eq!(sector[24], 25, "sectors keep their place in the file");
+    }
+
+    #[test]
+    fn the_subchannel_counts_down_through_a_pregap() {
+        let cue = "FILE \"all.bin\" BINARY
+ TRACK 01 MODE2/2352
+  INDEX 01 00:00:00
+                   TRACK 02 AUDIO
+  INDEX 00 00:00:20
+  INDEX 01 00:00:22
+";
+        let disc = Disc::from_cue(cue, open_raw(&[30])).unwrap();
+        let q = disc.subchannel_q(5);
+        assert_eq!((q.track, q.index, q.relative, q.control), (1, 1, 5, 0x41));
+        assert_eq!(q.absolute, 5 + LEAD_IN_SECTORS);
+        let q = disc.subchannel_q(20);
+        assert_eq!((q.track, q.index, q.relative, q.control), (2, 0, 1, 0x01));
+        let q = disc.subchannel_q(21);
+        assert_eq!((q.track, q.index, q.relative), (2, 0, 0), "the last pregap sector reads 00:00:00");
+        let q = disc.subchannel_q(22);
+        assert_eq!((q.track, q.index, q.relative), (2, 1, 0));
+    }
+
+    #[test]
+    fn a_ccd_file_gives_the_tracks_of_a_raw_image() {
+        let ccd = "[CloneCD]
+Version=3
+[Disc]
+TocEntries=4
+                   [TRACK 1]
+MODE=2
+INDEX 1=0
+[TRACK 2]
+MODE=0
+INDEX 0=20
+INDEX 1=22
+";
+        let mut disc = Disc::from_ccd(ccd, Box::new(MemorySource(raw(30)))).unwrap();
+        assert_eq!(disc.total_sectors(), 30);
+        assert_eq!(disc.tracks()[0].kind, TrackKind::Data);
+        assert_eq!(disc.tracks()[1], Track { number: 2, kind: TrackKind::Audio, start_lba: 22, pregap_lba: 20 });
+        let mut sector = [0u8; RAW_SECTOR_SIZE];
+        assert!(disc.read_raw_sector(7, &mut sector));
+        assert_eq!(sector[24], 7);
+        assert!(Disc::from_ccd("[CloneCD]
+", Box::new(MemorySource(raw(3)))).is_err(), "no tracks");
+        assert!(Disc::from_ccd(ccd, Box::new(MemorySource(vec![0; 100]))).is_err(), "not whole sectors");
+    }
+
+    #[test]
+    fn an_sbi_file_replaces_the_q_data_of_the_sectors_it_lists() {
+        let mut disc = Disc::from_image(raw(20)).unwrap();
+        let mut sbi = b"SBI ".to_vec();
+        // 00:02:10 is LBA 10; type 1; Q: control 41, track 01, index 01, rel 00:00:10,
+        // zero, abs 00:02:10.
+        sbi.extend([0x00, 0x02, 0x10, 0x01, 0x41, 0x01, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x02, 0x99]);
+        disc.load_sbi(&sbi).unwrap();
+        let q = disc.subchannel_q(10);
+        assert_eq!((q.control, q.track, q.index), (0x41, 1, 1));
+        assert_eq!(q.relative, 10);
+        assert_eq!(q.absolute, 2 * 75 + 99, "the file's value wins even when it is not what a clean disc says");
+        assert_eq!(disc.subchannel_q(11).absolute, 11 + LEAD_IN_SECTORS, "other sectors are untouched");
+        assert!(disc.load_sbi(b"nope").is_err());
+        assert!(disc.load_sbi(b"SBI  ").is_err(), "truncated entry");
     }
 }

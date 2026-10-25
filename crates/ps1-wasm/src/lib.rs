@@ -75,6 +75,10 @@ pub struct Ps1 {
     disc_files: Vec<(String, DiscFile)>,
     /// The file currently being received.
     incoming: Option<(String, Vec<u8>)>,
+    /// A CloneCD control file (`.ccd`) that describes the image received, if any.
+    ccd: Option<String>,
+    /// Replacement subchannel data (`.sbi`) for the next disc inserted, if any.
+    sbi: Option<Vec<u8>>,
     /// The last rendered frame (RGBA8888), see `render_frame`.
     frame: Vec<u8>,
 }
@@ -83,7 +87,7 @@ pub struct Ps1 {
 impl Ps1 {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { inner: System::new(), disc_files: Vec::new(), incoming: None, frame: Vec::new() }
+        Self { inner: System::new(), disc_files: Vec::new(), incoming: None, ccd: None, sbi: None, frame: Vec::new() }
     }
 
     /// Load the PS1 BIOS ROM (required to boot). Called from JS with a Uint8Array.
@@ -131,10 +135,22 @@ impl Ps1 {
         self.disc_files.push((name.to_string(), DiscFile::Lazy(JsSource { read, len: len as u64 })));
     }
 
+    /// The text of a CloneCD `.ccd` file: the disc is then the one image received.
+    pub fn set_disc_ccd(&mut self, text: String) {
+        self.ccd = Some(text);
+    }
+
+    /// The contents of an `.sbi` file, applied to the disc inserted next.
+    pub fn set_disc_sbi(&mut self, data: &[u8]) {
+        self.sbi = Some(data.to_vec());
+    }
+
     /// Forget every disc file received so far (after a failed load).
     pub fn discard_disc_files(&mut self) {
         self.incoming = None;
         self.disc_files.clear();
+        self.ccd = None;
+        self.sbi = None;
     }
 
     /// Insert the disc made of the files received so far. With a CUE sheet the
@@ -157,7 +173,17 @@ impl Ps1 {
         self.end_disc_file();
         let mut files = std::mem::take(&mut self.disc_files);
         let to_js = |e: ps1_core::Ps1Error| JsValue::from_str(&e.to_string());
-        let disc = match cue {
+        let ccd = self.ccd.take();
+        let sbi = self.sbi.take();
+        let mut disc = match (ccd, cue) {
+            (Some(ccd), _) => {
+                if files.len() != 1 {
+                    return Err(JsValue::from_str("a .ccd goes with exactly one .img file"));
+                }
+                let (_, file) = files.remove(0);
+                Disc::from_ccd(&ccd, file.into_source()).map_err(to_js)?
+            }
+            (None, cue) => match cue {
             Some(cue) => Disc::from_cue(&cue, |name| {
                 let wanted = base_name(name);
                 let position = files
@@ -175,8 +201,27 @@ impl Ps1 {
                 let (_, file) = files.remove(0);
                 Disc::from_image_source(file.into_source()).map_err(to_js)?
             }
+            },
         };
+        if let Some(sbi) = sbi {
+            disc.load_sbi(&sbi).map_err(to_js)?;
+        }
         Ok(disc)
+    }
+
+    /// The bytes the console sent through its serial port (SIO1) since the last call.
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        self.inner.take_serial_output()
+    }
+
+    /// A byte arriving at the serial port from the other end of the cable.
+    pub fn serial_input(&mut self, byte: u8) {
+        self.inner.serial_input(byte);
+    }
+
+    /// A line describing the loaded BIOS (model or version, region, checksum).
+    pub fn bios_description(&self) -> String {
+        self.inner.bios_info().describe()
     }
 
     /// Queue a PS-X EXE program to run instead of the BIOS shell (the BIOS

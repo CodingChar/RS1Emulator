@@ -4,9 +4,10 @@ use crate::controllers::ControllerManager;
 use crate::dma::{Dma, CHANNEL_MDEC_IN, CHANNEL_MDEC_OUT};
 use crate::gpu::Gpu;
 use crate::interrupt::{
-    InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_GPU, IRQ_SPU, IRQ_VBLANK,
+    InterruptController, IRQ_CDROM, IRQ_CONTROLLER, IRQ_DMA, IRQ_GPU, IRQ_SIO, IRQ_SPU, IRQ_VBLANK,
 };
-use crate::io::{extract, merge, read_le, write_le, StubRegs};
+use crate::io::{extract, merge, read_le, write_le};
+use crate::sio1::Sio1;
 use crate::mdec::Mdec;
 use crate::memory::Memory;
 use crate::spu::Spu;
@@ -128,7 +129,7 @@ pub struct Bus {
     /// Serial port 0: controllers and memory cards.
     pub sio0: Sio0,
     /// Serial port 1 (link cable) registers, not emulated.
-    pub(crate) sio1: StubRegs,
+    pub(crate) sio1: Sio1,
     /// Motion decoder (FMV video decompression).
     pub mdec: Mdec,
     /// DMA channel 1 was started before the MDEC had produced enough data and
@@ -163,7 +164,7 @@ impl Bus {
             cache_control: 0,
             post_code: 0,
             sio0: Sio0::new(),
-            sio1: Self::idle_sio1(),
+            sio1: Sio1::new(),
             mdec: Mdec::new(),
             mdec_out_waiting: false,
             unhandled_io: Vec::new(),
@@ -177,10 +178,6 @@ impl Bus {
     fn with_deadline(mut self) -> Self {
         self.deadline = self.compute_deadline();
         self
-    }
-
-    fn idle_sio1() -> StubRegs {
-        StubRegs::new(0x10)
     }
 
     /// Reset every device and clear RAM/VRAM (the BIOS ROM is kept).
@@ -199,7 +196,7 @@ impl Bus {
         self.post_code = 0;
         self.sio0.reset();
         self.controllers.deselect();
-        self.sio1 = Self::idle_sio1();
+        self.sio1.reset();
         self.mdec.reset();
         self.mdec_out_waiting = false;
         self.unhandled_io.clear();
@@ -223,6 +220,7 @@ impl Bus {
             .min(self.cdrom.cycles_until_event())
             .min(self.sio0.cycles_until_event())
             .min(self.spu.cycles_until_event())
+            .min(self.dma.cycles_until_event())
             .max(1)
     }
 
@@ -258,18 +256,20 @@ impl Bus {
     /// Bring every device up to date with the CPU.
     pub fn sync_devices(&mut self) {
         let _area = crate::profile::enter(crate::profile::Area::Devices);
-        let cycles = std::mem::take(&mut self.pending_cycles);
-        if cycles == 0 {
-            return;
-        }
-        if cycles < self.deadline {
-            // Nothing can happen yet: skip ahead and keep the (shorter) deadline.
-            self.skip_devices(cycles);
-            self.deadline -= cycles;
-        } else {
-            // The last cycle is where the event may happen: run it exactly.
-            self.skip_devices(cycles - 1);
+        let mut cycles = std::mem::take(&mut self.pending_cycles);
+        while cycles > 0 {
+            if cycles < self.deadline {
+                // Nothing can happen yet: skip ahead and keep the (shorter) deadline.
+                self.skip_devices(cycles);
+                self.deadline -= cycles;
+                return;
+            }
+            // The last cycle up to the deadline is where the event may happen:
+            // run it exactly. (More than one deadline can be pending when an
+            // instruction stalled for several cycles.)
+            self.skip_devices(self.deadline - 1);
             self.step_devices();
+            cycles -= self.deadline;
             self.deadline = self.compute_deadline();
         }
     }
@@ -287,11 +287,16 @@ impl Bus {
             sysclk: cycles,
             dotclock: video.dot_ticks,
             hblank: video.hblanks,
+            in_hblank: video.in_hblank,
+            in_vblank: video.in_vblank,
+            hblank_started: video.hblank_started,
+            vblank_started: video.vblank_started,
         };
         self.timers.tick(clocks, &mut self.interrupt);
         self.cdrom.skip_cycles(cycles);
         self.sio0.skip_cycles(cycles);
         self.spu.skip_cycles(cycles);
+        self.dma.advance(cycles);
     }
 
     /// Advance all devices by exactly one CPU cycle.
@@ -304,6 +309,10 @@ impl Bus {
             sysclk: 1,
             dotclock: video.dot_ticks,
             hblank: video.hblanks,
+            in_hblank: video.in_hblank,
+            in_vblank: video.in_vblank,
+            hblank_started: video.hblank_started,
+            vblank_started: video.vblank_started,
         };
         self.timers.tick(clocks, &mut self.interrupt);
 
@@ -320,6 +329,14 @@ impl Bus {
         self.forward_cdrom_irq();
         self.sio0.step(&mut self.controllers);
         self.forward_sio_irq();
+        self.dma.advance(1);
+        self.forward_dma_irq();
+    }
+
+    /// The cycles the CPU was held by DMA transfers since the last call; the
+    /// caller adds them to the instruction's cycles.
+    pub fn take_dma_stall(&mut self) -> u32 {
+        self.dma.take_stall()
     }
 
     fn decode(addr: u32) -> Target {
@@ -469,7 +486,7 @@ impl Bus {
     /// state that only changes at the events the deadline already covers.
     fn is_timed(phys: u32) -> bool {
         match phys {
-            TIMERS..=TIMERS_END | CDROM..=CDROM_END | SIO..=SIO_END => true,
+            TIMERS..=TIMERS_END | CDROM..=CDROM_END | SIO..=SIO_END | DMA..=DMA_END => true,
             // GPUSTAT (scanline, field) and GP1 (video mode); not GP0/GPUREAD.
             GPU..=GPU_END => phys >= GPU + 4,
             _ => false,
@@ -541,7 +558,10 @@ impl Bus {
                     self.sio0.write(off, width, value, &mut self.controllers);
                     self.forward_sio_irq();
                 }
-                off => self.sio1.write(off - 0x10, width, value),
+                off => {
+                    self.sio1.write(off - 0x10, width, value);
+                    self.forward_sio1_irq();
+                }
             },
             RAM_SIZE..=RAM_SIZE_END => self.ram_size = merge(self.ram_size, phys, width, value),
             INTERRUPT..=INTERRUPT_END => self.interrupt.write(phys - INTERRUPT, width, value),
@@ -599,6 +619,12 @@ impl Bus {
     fn forward_gpu_irq(&mut self) {
         if self.gpu.take_irq() {
             self.interrupt.raise(IRQ_GPU);
+        }
+    }
+
+    fn forward_sio1_irq(&mut self) {
+        if self.sio1.take_irq() {
+            self.interrupt.raise(IRQ_SIO);
         }
     }
 
@@ -933,11 +959,26 @@ mod tests {
     }
 
     #[test]
-    fn serial_port_1_registers_just_store_values() {
+    fn serial_port_1_registers_are_separate_from_port_0() {
         let mut bus = Bus::new();
-        bus.write16(0x1F80_105A, 0x1234).unwrap();
-        assert_eq!(bus.read16(0x1F80_105A).unwrap(), 0x1234);
+        bus.write16(0x1F80_105A, 0x0C05).unwrap();
+        assert_eq!(bus.read16(0x1F80_105A).unwrap(), 0x0C05);
         assert_eq!(bus.read16(0x1F80_104A).unwrap(), 0, "SIO0 control is separate");
+    }
+
+    #[test]
+    fn serial_port_1_sends_text_to_the_host_and_raises_irq8_for_input() {
+        let mut bus = Bus::new();
+        // Transmitter on, receiver on, receive interrupt on (after one byte).
+        bus.write16(0x1F80_105A, 0x0805).unwrap();
+        for byte in "ok".bytes() {
+            bus.write8(0x1F80_1050, byte).unwrap();
+        }
+        assert_eq!(bus.sio1.take_output(), b"ok".to_vec());
+        bus.sio1.push_input(0x55);
+        bus.forward_sio1_irq();
+        assert_ne!(bus.interrupt.stat & (1 << IRQ_SIO), 0, "IRQ8 pending");
+        assert_eq!(bus.read8(0x1F80_1050).unwrap(), 0x55);
     }
 
     #[test]
@@ -1025,6 +1066,11 @@ mod tests {
         DMA_BASE + channel * 0x10 + reg * 4
     }
 
+    /// Let the time pass that started DMA transfers take.
+    fn settle(bus: &mut Bus) {
+        bus.tick(2_000_000);
+    }
+
     fn enable_dma_channel(bus: &mut Bus, channel: u32) {
         let dpcr = bus.read32(0x1F80_10F0).unwrap();
         bus.write32(0x1F80_10F0, dpcr | (1 << (channel * 4 + 3))).unwrap();
@@ -1037,6 +1083,7 @@ mod tests {
         bus.write32(dma_reg(6, 0), 0x1000).unwrap(); // MADR: last entry
         bus.write32(dma_reg(6, 1), 4).unwrap(); // 4 entries
         bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap(); // start + trigger, backward
+        settle(&mut bus);
 
         assert_eq!(bus.read32(0x1000).unwrap(), 0x0FFC);
         assert_eq!(bus.read32(0x0FFC).unwrap(), 0x0FF8);
@@ -1053,12 +1100,14 @@ mod tests {
         bus.write32(dma_reg(6, 0), 0x1000).unwrap();
         bus.write32(dma_reg(6, 1), 4).unwrap();
         bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        settle(&mut bus);
         assert_eq!(bus.read32(0x1000).unwrap(), 0);
         assert_ne!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "still busy");
 
         // Enabling afterwards does not retroactively start it, but a new write does.
         enable_dma_channel(&mut bus, 6);
         bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        settle(&mut bus);
         assert_eq!(bus.read32(0x1000).unwrap(), 0x0FFC);
     }
 
@@ -1069,8 +1118,10 @@ mod tests {
         bus.write32(dma_reg(6, 0), 0x1000).unwrap();
         bus.write32(dma_reg(6, 1), 2).unwrap();
         bus.write32(dma_reg(6, 2), 0x0100_0002).unwrap(); // busy, no trigger
+        settle(&mut bus);
         assert_eq!(bus.read32(0x1000).unwrap(), 0);
         bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        settle(&mut bus);
         assert_eq!(bus.read32(0x1000).unwrap(), 0x0FFC);
     }
 
@@ -1086,6 +1137,7 @@ mod tests {
         bus.write32(dma_reg(2, 0), 0x2000).unwrap();
         bus.write32(dma_reg(2, 1), (2 << 16) | 4).unwrap(); // 2 blocks of 4 words
         bus.write32(dma_reg(2, 2), 0x0100_0201).unwrap(); // request sync, from RAM
+        settle(&mut bus);
         assert_eq!(bus.gpu.gp0_word_count, 8);
         for i in 0..4 {
             assert_eq!(bus.gpu.vram.get(16 + i, 0), 1 + i as u16, "row 0, pixel {i}");
@@ -1112,6 +1164,7 @@ mod tests {
 
         bus.write32(dma_reg(2, 0), 0x2000).unwrap();
         bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap(); // linked-list sync, from RAM
+        settle(&mut bus);
         assert_eq!(bus.gpu.gp0_word_count, 3);
         assert_eq!(bus.gpu.vram.get(16, 0), 0x001F, "red in 15-bit");
         assert_eq!(bus.gpu.vram.get(31, 0), 0x001F);
@@ -1127,6 +1180,7 @@ mod tests {
         bus.write32(0x2000, 0x2000).unwrap(); // empty node pointing at itself
         bus.write32(dma_reg(2, 0), 0x2000).unwrap();
         bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap(); // must terminate
+        settle(&mut bus);
         assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
     }
 
@@ -1146,6 +1200,7 @@ mod tests {
         bus.write32(dma_reg(2, 0), 0x3000).unwrap();
         bus.write32(dma_reg(2, 1), (1 << 16) | 1).unwrap();
         bus.write32(dma_reg(2, 2), 0x0100_0200).unwrap(); // request sync, to RAM
+        settle(&mut bus);
         assert_eq!(bus.read32(0x3000).unwrap(), 0x5678_1234);
     }
 
@@ -1160,12 +1215,14 @@ mod tests {
         bus.write32(dma_reg(0, 0), 0x2000).unwrap();
         bus.write32(dma_reg(0, 1), (1 << 16) | 2).unwrap();
         bus.write32(dma_reg(0, 2), 0x0100_0201).unwrap();
+        settle(bus);
     }
 
     fn start_mdec_output(bus: &mut Bus) {
         bus.write32(dma_reg(1, 0), 0x3000).unwrap();
         bus.write32(dma_reg(1, 1), (1 << 16) | 16).unwrap();
         bus.write32(dma_reg(1, 2), 0x0100_0200).unwrap();
+        settle(bus);
     }
 
     #[test]
@@ -1175,8 +1232,10 @@ mod tests {
         enable_dma_channel(&mut bus, 1);
         stage_mdec_stream(&mut bus);
         start_mdec_input(&mut bus);
+        settle(&mut bus);
         assert_eq!(bus.mdec.output_words(), 16);
         start_mdec_output(&mut bus);
+        settle(&mut bus);
         for i in 0..16 {
             assert_eq!(bus.read32(0x3000 + i * 4).unwrap(), 0x8080_8080, "word {i}");
         }
@@ -1191,8 +1250,10 @@ mod tests {
         enable_dma_channel(&mut bus, 1);
         stage_mdec_stream(&mut bus);
         start_mdec_output(&mut bus);
+        settle(&mut bus);
         assert_ne!(bus.read32(dma_reg(1, 2)).unwrap() & (1 << 24), 0, "still busy");
         start_mdec_input(&mut bus);
+        settle(&mut bus);
         assert_eq!(bus.read32(dma_reg(1, 2)).unwrap() & (1 << 24), 0, "finished");
         assert_eq!(bus.read32(0x3000).unwrap(), 0x8080_8080);
     }
@@ -1204,22 +1265,24 @@ mod tests {
         for i in 0..4u32 {
             bus.write32(0x4000 + i * 4, 0x0403_0201 + i * 0x0404_0404).unwrap();
         }
-        bus.write16(0x1F80_1DA6, 0x100).unwrap(); // transfer address = 0x100 * 8
+        bus.write16(0x1F80_1DA6, 0x400).unwrap(); // transfer address = 0x400 * 8, past the capture buffers
         bus.write32(dma_reg(4, 0), 0x4000).unwrap();
         bus.write32(dma_reg(4, 1), (1 << 16) | 4).unwrap();
         bus.write32(dma_reg(4, 2), 0x0100_0201).unwrap();
-        assert_eq!(&bus.spu.sound_ram[0x800..0x808], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        settle(&mut bus);
+        assert_eq!(&bus.spu.sound_ram[0x2000..0x2008], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
     fn spu_dma_from_sound_ram_reads_back() {
         let mut bus = Bus::new();
         enable_dma_channel(&mut bus, 4);
-        bus.spu.sound_ram[0x800..0x804].copy_from_slice(&[0xDD, 0xCC, 0xBB, 0xAA]);
-        bus.write16(0x1F80_1DA6, 0x100).unwrap();
+        bus.spu.sound_ram[0x2000..0x2004].copy_from_slice(&[0xDD, 0xCC, 0xBB, 0xAA]);
+        bus.write16(0x1F80_1DA6, 0x400).unwrap();
         bus.write32(dma_reg(4, 0), 0x4000).unwrap();
         bus.write32(dma_reg(4, 1), (1 << 16) | 1).unwrap();
         bus.write32(dma_reg(4, 2), 0x0100_0200).unwrap();
+        settle(&mut bus);
         assert_eq!(bus.read32(0x4000).unwrap(), 0xAABB_CCDD);
     }
 
@@ -1241,6 +1304,7 @@ mod tests {
         bus.write32(dma_reg(6, 0), 0x1000).unwrap();
         bus.write32(dma_reg(6, 1), 4).unwrap();
         bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        settle(&mut bus);
 
         let dicr = bus.read32(0x1F80_10F4).unwrap();
         assert_ne!(dicr & (1 << 30), 0, "channel 6 flag");
@@ -1256,8 +1320,9 @@ mod tests {
         bus.write32(dma_reg(6, 0), 0x1000).unwrap();
         bus.write32(dma_reg(6, 1), 4).unwrap();
         bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        settle(&mut bus);
         assert_eq!(bus.read32(0x1F80_10F4).unwrap() & 0xFF00_0000, 0);
-        assert_eq!(bus.interrupt.stat, 0);
+        assert_eq!(bus.interrupt.stat & (1 << IRQ_DMA), 0, "settling also let a vblank pass, but no DMA interrupt came");
     }
 
     #[test]
@@ -1265,5 +1330,77 @@ mod tests {
         let mut bus = Bus::new();
         bus.write32(0x1F80_10F4, 1 << 15).unwrap();
         assert_eq!(bus.interrupt.stat & (1 << IRQ_DMA), 1 << IRQ_DMA);
+    }
+
+    #[test]
+    fn a_transfer_holds_the_cpu_and_the_channel_busy_for_its_duration() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 6);
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap();
+        bus.write32(dma_reg(6, 1), 400).unwrap();
+        bus.write32(dma_reg(6, 2), 0x1100_0002).unwrap();
+        assert_eq!(bus.take_dma_stall(), 400, "one cycle per word");
+        assert_eq!(bus.take_dma_stall(), 0, "taken once");
+        assert_ne!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "busy while it lasts");
+        bus.tick(399);
+        assert_ne!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "one cycle short");
+        bus.tick(1);
+        assert_eq!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "done on time");
+    }
+
+    #[test]
+    fn slow_devices_take_longer_per_word() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 4);
+        bus.write32(dma_reg(4, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(4, 1), (1 << 16) | 64).unwrap();
+        bus.write32(dma_reg(4, 2), 0x0100_0201).unwrap();
+        assert_eq!(bus.take_dma_stall(), 64 * 4, "the SPU takes 4 cycles a word");
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 3);
+        bus.write32(dma_reg(3, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(3, 1), (1 << 16) | 32).unwrap();
+        bus.write32(dma_reg(3, 2), 0x0100_0200).unwrap();
+        assert_eq!(bus.take_dma_stall(), 32 * 24, "the CD-ROM takes 24 cycles a word");
+    }
+
+    #[test]
+    fn a_linked_list_takes_a_cycle_per_word_including_the_headers() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 2);
+        bus.write32(0x2000, (2 << 24) | 0x2010).unwrap();
+        bus.write32(0x2010, (1 << 24) | 0x00FF_FFFF).unwrap();
+        bus.write32(0x2014, 0xE100_0000).unwrap();
+        bus.write32(0x2004, 0xE100_0000).unwrap();
+        bus.write32(0x2008, 0xE100_0000).unwrap();
+        bus.write32(dma_reg(2, 0), 0x2000).unwrap();
+        bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap();
+        assert_eq!(bus.take_dma_stall(), 3 + 2, "two headers and three command words");
+    }
+
+    #[test]
+    fn chopping_lets_the_cpu_run_between_slices_so_the_transfer_ends_later() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 6);
+        bus.write32(dma_reg(6, 0), 0x1000).unwrap();
+        bus.write32(dma_reg(6, 1), 64).unwrap();
+        // Chopping, DMA window 2^4 = 16 cycles, CPU window 2^3 = 8 cycles.
+        bus.write32(dma_reg(6, 2), 0x1100_0002 | (1 << 8) | (4 << 16) | (3 << 20)).unwrap();
+        assert_eq!(bus.take_dma_stall(), 64, "the CPU is held only while the DMA runs");
+        bus.tick(64);
+        assert_ne!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0, "three CPU windows still to come");
+        bus.tick(3 * 8);
+        assert_eq!(bus.read32(dma_reg(6, 2)).unwrap() & (1 << 24), 0);
+    }
+
+    #[test]
+    fn the_expansion_port_channel_reads_floating_data_lines() {
+        let mut bus = Bus::new();
+        enable_dma_channel(&mut bus, 5);
+        bus.write32(dma_reg(5, 0), 0x3000).unwrap();
+        bus.write32(dma_reg(5, 1), 2).unwrap();
+        bus.write32(dma_reg(5, 2), 0x1100_0000).unwrap();
+        assert_eq!(bus.read32(0x3000).unwrap(), 0xFFFF_FFFF);
+        assert_eq!(bus.take_dma_stall(), 2 * 20);
     }
 }

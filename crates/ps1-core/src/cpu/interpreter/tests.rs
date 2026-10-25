@@ -1073,3 +1073,167 @@ fn interrupt_lets_a_pending_load_complete() {
     m.step(); // interrupt; the load still lands
     assert_eq!(m.reg(1), 0xABCD);
 }
+
+// ----- Multiply/divide timing -----
+
+/// Cycles a stepped program takes: one per instruction plus the stalls.
+fn cycles_to_run(m: &mut Machine, instructions: usize) -> u32 {
+    let mut cycles = 0;
+    for _ in 0..instructions {
+        m.step();
+        cycles += 1 + m.cpu.take_extra_cycles();
+    }
+    cycles
+}
+
+#[test]
+fn reading_the_result_straight_after_a_divide_stalls() {
+    let mut m = Machine::new(&[div(1, 2), mflo(3)]);
+    m.cpu.regs[1] = 100;
+    m.cpu.regs[2] = 7;
+    assert_eq!(cycles_to_run(&mut m, 2), 2 + (DIVIDE_LATENCY as usize - 1) as u32);
+    assert_eq!(m.reg(3), 14);
+}
+
+#[test]
+fn work_between_the_divide_and_the_read_hides_the_latency() {
+    let mut program = vec![div(1, 2)];
+    program.extend([NOP; 40]);
+    program.push(mflo(3));
+    let mut m = Machine::new(&program);
+    m.cpu.regs[1] = 100;
+    m.cpu.regs[2] = 7;
+    assert_eq!(cycles_to_run(&mut m, program.len()), program.len() as u32, "no stall");
+
+    let mut program = vec![div(1, 2)];
+    program.extend([NOP; 10]);
+    program.push(mflo(3));
+    let mut m = Machine::new(&program);
+    m.cpu.regs[1] = 100;
+    m.cpu.regs[2] = 7;
+    assert_eq!(cycles_to_run(&mut m, program.len()), DIVIDE_LATENCY + 1, "the divide ends 36 cycles after it started");
+}
+
+#[test]
+fn multiply_latency_depends_on_the_size_of_the_first_operand() {
+    for (rs, cycles) in [(0x7FFu32, 6), (0x800, 9), (0xF_FFFF, 9), (0x10_0000, 13), (0xFFFF_F800, 6), (0xFFF0_0000, 9), (0x8000_0000, 13)] {
+        let mut m = Machine::new(&[mult(1, 2), mflo(3)]);
+        m.cpu.regs[1] = rs;
+        m.cpu.regs[2] = 3;
+        assert_eq!(cycles_to_run(&mut m, 2), 1 + cycles, "mult by {rs:#x}");
+    }
+}
+
+#[test]
+fn the_fast_path_and_the_exact_one_agree_on_timing() {
+    let program = [
+        div(1, 2), mflo(3), mult(1, 2), mfhi(4), addiu(5, 5, 1), multu(1, 2), NOP, NOP, mflo(6), j(CODE), NOP,
+    ];
+    let setup = |m: &mut Machine| {
+        m.cpu.regs[1] = 0x12345;
+        m.cpu.regs[2] = 7;
+    };
+    // A batch cuts a stall short at its end, so compare only the lengths at which
+    // the exact path also lands on a batch boundary.
+    let mut compared = 0;
+    for target in 100..400u64 {
+        let mut fast = Machine::new(&program);
+        setup(&mut fast);
+        let (ran, result) = fast.cpu.run(&mut fast.bus, target);
+        result.unwrap();
+
+        let mut exact = Machine::new(&program);
+        setup(&mut exact);
+        let mut cycles = 0u64;
+        while cycles < target {
+            exact.cpu.set_irq(exact.bus.interrupt.pending());
+            exact.step();
+            let spent = 1 + exact.cpu.take_extra_cycles();
+            exact.bus.tick(spent);
+            cycles += spent as u64;
+        }
+        if cycles != target {
+            continue;
+        }
+        compared += 1;
+        assert_eq!(ran, cycles);
+        assert_eq!(fast.cpu.pc, exact.cpu.pc, "target {target}");
+        assert_eq!(fast.cpu.regs, exact.cpu.regs, "target {target}");
+        assert_eq!(fast.cpu.hilo_busy, exact.cpu.hilo_busy, "target {target}");
+    }
+    assert!(compared > 20, "only {compared} lengths compared");
+}
+
+// ----- GTE timing -----
+
+#[test]
+fn touching_the_gte_before_its_command_is_done_stalls() {
+    // RTPS takes 15 cycles; the next instruction is 1 cycle later, so it waits 14.
+    let mut m = gte_machine(&[gte_command(0x01), mfc2(1, 9)]);
+    assert_eq!(cycles_to_run(&mut m, 2), 2 + 14);
+}
+
+#[test]
+fn work_between_a_gte_command_and_its_result_hides_the_latency() {
+    let mut program = vec![gte_command(0x01)];
+    program.extend([NOP; 20]);
+    program.push(mfc2(1, 9));
+    let mut m = gte_machine(&program);
+    assert_eq!(cycles_to_run(&mut m, program.len()), program.len() as u32);
+
+    let mut program = vec![gte_command(0x01)];
+    program.extend([NOP; 5]);
+    program.push(mfc2(1, 9));
+    let mut m = gte_machine(&program);
+    assert_eq!(cycles_to_run(&mut m, program.len()), 15 + 1, "waits until 15 cycles after the command");
+}
+
+#[test]
+fn a_gte_command_waits_for_the_previous_one() {
+    // RTPT (23 cycles) then NCLIP (8): the second starts after 23 and ends 8 later.
+    let mut m = gte_machine(&[gte_command(0x30), gte_command(0x06), mfc2(1, 9)]);
+    assert_eq!(cycles_to_run(&mut m, 3), 3 + 22 + 7);
+}
+
+#[test]
+fn every_gte_command_has_a_latency() {
+    for (command, cycles) in [(0x01u32, 15u32), (0x06, 8), (0x0C, 6), (0x12, 8), (0x16, 44), (0x20, 30), (0x2D, 5), (0x30, 23), (0x3F, 39)] {
+        assert_eq!(Gte::latency(command), cycles, "command {command:#x}");
+        // The opcode bits above the command number do not matter.
+        assert_eq!(Gte::latency(command | 0x0780_0000), cycles);
+    }
+}
+
+#[test]
+fn the_fast_path_and_the_exact_one_agree_on_gte_timing() {
+    let program = [
+        gte_command(0x30), mfc2(3, 9), swc2(9, 0x10, 0), gte_command(0x06), lwc2(9, 0x10, 0), gte_command(0x2E),
+        addiu(5, 5, 1), mfc2(4, 7), mult(3, 4), mflo(6), j(CODE), NOP,
+    ];
+    let mut compared = 0;
+    for target in 100..500u64 {
+        let mut fast = gte_machine(&program);
+        let (ran, result) = fast.cpu.run(&mut fast.bus, target);
+        result.unwrap();
+
+        let mut exact = gte_machine(&program);
+        let mut cycles = 0u64;
+        while cycles < target {
+            exact.cpu.set_irq(exact.bus.interrupt.pending());
+            exact.step();
+            let spent = 1 + exact.cpu.take_extra_cycles();
+            exact.bus.tick(spent);
+            cycles += spent as u64;
+        }
+        if cycles != target {
+            continue;
+        }
+        compared += 1;
+        assert_eq!(ran, cycles);
+        assert_eq!(fast.cpu.pc, exact.cpu.pc, "target {target}");
+        assert_eq!(fast.cpu.regs, exact.cpu.regs, "target {target}");
+        assert_eq!(fast.cpu.gte_busy, exact.cpu.gte_busy, "target {target}");
+        assert_eq!(fast.cpu.hilo_busy, exact.cpu.hilo_busy, "target {target}");
+    }
+    assert!(compared > 20, "only {compared} lengths compared");
+}

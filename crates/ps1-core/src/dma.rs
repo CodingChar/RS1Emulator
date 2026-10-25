@@ -31,7 +31,11 @@ const DICR_IRQ: u32 = 1 << 31;
 // Channel control register bits.
 const CHCR_FROM_RAM: u32 = 1 << 0;
 const CHCR_STEP_BACKWARD: u32 = 1 << 1;
+const CHCR_CHOPPING: u32 = 1 << 8;
 const CHCR_SYNC_SHIFT: u32 = 9;
+/// Chopping: log2 of the cycles the DMA runs / the CPU runs per slice.
+const CHCR_DMA_WINDOW_SHIFT: u32 = 16;
+const CHCR_CPU_WINDOW_SHIFT: u32 = 20;
 const CHCR_BUSY: u32 = 1 << 24;
 const CHCR_TRIGGER: u32 = 1 << 28;
 
@@ -54,8 +58,13 @@ const MAX_LIST_NODES: u32 = 0x8_0000;
 /// Register file at `0x1F801080`: seven channels of `MADR`, `BCR`, `CHCR`
 /// (16 bytes each), then `DPCR` and `DICR`.
 ///
-/// Transfers complete instantly when they start, instead of stalling the CPU
-/// for as long as the real hardware would.
+/// The data moves the moment a transfer starts, but the transfer takes the time it
+/// would on the console: the CPU is held (see [`Dma::take_stall`]) while the DMA
+/// owns the bus, and the channel stays busy and signals its interrupt only when
+/// that time is up. With chopping on, the CPU also runs in the gaps between the
+/// DMA's slices, so the transfer ends later than the CPU was held for. A started
+/// channel runs to its end before another can start, so priorities never decide
+/// anything.
 #[derive(Serialize, Deserialize)]
 pub struct Dma {
     /// One 32-bit word per register, indexed by `(address - 0x1F801080) / 4`.
@@ -63,11 +72,32 @@ pub struct Dma {
     /// The DMA interrupt line rose; the bus forwards it to the interrupt
     /// controller (see [`Dma::take_irq`]).
     irq: bool,
+    /// Cycles until each channel's running transfer ends (0: none running).
+    remaining: [u32; 7],
+    /// Cycles the CPU is held by transfers started since the last
+    /// [`Dma::take_stall`].
+    #[serde(skip)]
+    stall: u32,
+}
+
+/// Longest a single transfer is allowed to take, in cycles (a whole RAM through
+/// the slowest channel takes less).
+const MAX_TRANSFER_CYCLES: u64 = 1 << 24;
+
+/// Cycles a channel takes per word (psx-spx timing notes): the CD-ROM and SPU
+/// are slow devices; the expansion port (PIO) is slower still.
+fn cycles_per_word(channel: usize) -> u64 {
+    match channel {
+        CHANNEL_CDROM => 24,
+        CHANNEL_SPU => 4,
+        CHANNEL_PIO => 20,
+        _ => 1,
+    }
 }
 
 impl Dma {
     pub fn new() -> Self {
-        let mut dma = Self { registers: [0u32; 32], irq: false };
+        let mut dma = Self { registers: [0u32; 32], irq: false, remaining: [0; 7], stall: 0 };
         dma.reset();
         dma
     }
@@ -76,6 +106,34 @@ impl Dma {
         self.registers = [0u32; 32];
         self.registers[DPCR] = DPCR_RESET;
         self.irq = false;
+        self.remaining = [0; 7];
+        self.stall = 0;
+    }
+
+    /// The cycles the CPU was held by the transfers started since the last call.
+    pub fn take_stall(&mut self) -> u32 {
+        std::mem::take(&mut self.stall)
+    }
+
+    /// A lower bound on the cycles until a running transfer ends (`u32::MAX`
+    /// when none is running).
+    pub fn cycles_until_event(&self) -> u32 {
+        self.remaining.iter().copied().filter(|&n| n > 0).min().unwrap_or(u32::MAX)
+    }
+
+    /// Let `cycles` pass: transfers that run out of time finish (flag in DICR,
+    /// maybe an interrupt).
+    pub fn advance(&mut self, cycles: u32) {
+        for channel in 0..7 {
+            if self.remaining[channel] == 0 {
+                continue;
+            }
+            self.remaining[channel] = self.remaining[channel].saturating_sub(cycles);
+            if self.remaining[channel] == 0 {
+                self.registers[channel * 4 + 2] &= !CHCR_BUSY;
+                self.signal_completion(channel);
+            }
+        }
     }
 
     /// Whether the DMA interrupt fired since the last call.
@@ -145,7 +203,7 @@ impl Dma {
     /// in DPCR, and (for manual sync) triggered.
     pub fn should_run(&self, channel: usize) -> bool {
         let chcr = self.chcr(channel);
-        if chcr & CHCR_BUSY == 0 {
+        if chcr & CHCR_BUSY == 0 || self.remaining[channel] > 0 {
             return false;
         }
         if self.registers[DPCR] & (1 << (channel * 4 + 3)) == 0 {
@@ -172,16 +230,21 @@ impl Dma {
         let sync = (chcr >> CHCR_SYNC_SHIFT) & 3;
         let bcr = self.bcr(channel);
 
+        let words_moved: u64;
         let end_address = if channel == CHANNEL_OTC {
+            words_moved = Self::block_length(bcr & 0xFFFF) as u64;
             Self::clear_ordering_table(self.madr(channel), bcr & 0xFFFF, ram)
         } else if channel == CHANNEL_GPU && sync == SYNC_LINKED_LIST {
-            Self::walk_linked_list(self.madr(channel), ram, gpu)
+            let (end, words) = Self::walk_linked_list(self.madr(channel), ram, gpu);
+            words_moved = words;
+            end
         } else {
             let words = if sync == SYNC_MANUAL {
                 Self::block_length(bcr & 0xFFFF)
             } else {
                 Self::block_length(bcr & 0xFFFF) * (bcr >> 16)
             };
+            words_moved = words as u64;
             let step: u32 = if chcr & CHCR_STEP_BACKWARD != 0 { 4u32.wrapping_neg() } else { 4 };
             let from_ram = chcr & CHCR_FROM_RAM != 0;
 
@@ -204,8 +267,20 @@ impl Dma {
         };
 
         self.registers[channel * 4] = end_address & 0x00FF_FFFF;
-        self.registers[channel * 4 + 2] = chcr & !(CHCR_BUSY | CHCR_TRIGGER);
-        self.signal_completion(channel);
+        // The channel stays busy until the transfer's time is up (see `advance`).
+        self.registers[channel * 4 + 2] = chcr & !CHCR_TRIGGER;
+
+        let transfer = (words_moved * cycles_per_word(channel)).clamp(1, MAX_TRANSFER_CYCLES);
+        let mut total = transfer;
+        if chcr & CHCR_CHOPPING != 0 && !(channel == CHANNEL_GPU && sync == SYNC_LINKED_LIST) {
+            // The DMA runs `dma_window` cycles, then the CPU gets `cpu_window`.
+            let dma_window = 1u64 << ((chcr >> CHCR_DMA_WINDOW_SHIFT) & 7);
+            let cpu_window = 1u64 << ((chcr >> CHCR_CPU_WINDOW_SHIFT) & 7);
+            let slices = transfer.div_ceil(dma_window);
+            total = (transfer + (slices - 1) * cpu_window).min(MAX_TRANSFER_CYCLES);
+        }
+        self.stall = self.stall.saturating_add(transfer as u32);
+        self.remaining[channel] = total as u32;
     }
 
     /// A zero block length means 0x10000 words.
@@ -233,10 +308,12 @@ impl Dma {
     /// Feed a GPU command list to GP0. Each node is a header word (word count
     /// in the top byte, next node in the low 24 bits) followed by that many
     /// command words. Returns the address of the last header's successor.
-    fn walk_linked_list(madr: u32, ram: &mut Ram, gpu: &mut Gpu) -> u32 {
+    fn walk_linked_list(madr: u32, ram: &mut Ram, gpu: &mut Gpu) -> (u32, u64) {
         let mut node = madr & RAM_ADDRESS_MASK;
+        let mut words = 0u64;
         for _ in 0..MAX_LIST_NODES {
             let header = ram.read32(node as usize);
+            words += 1 + (header >> 24) as u64;
             for i in 1..=(header >> 24) {
                 let word = ram.read32((node.wrapping_add(i * 4) & RAM_ADDRESS_MASK) as usize);
                 gpu.write(0, 4, word);
@@ -244,11 +321,11 @@ impl Dma {
             let next = header & 0x00FF_FFFF;
             // Bit 23 set means end of list (normally 0xFFFFFF).
             if next & 0x0080_0000 != 0 {
-                return LIST_END;
+                return (LIST_END, words);
             }
             node = next & RAM_ADDRESS_MASK;
         }
-        node
+        (node, words)
     }
 
     fn write_device(channel: usize, word: u32, gpu: &mut Gpu, spu: &mut Spu, mdec: &mut Mdec) {
@@ -272,6 +349,8 @@ impl Dma {
             CHANNEL_CDROM => cdrom.dma_read_word(),
             CHANNEL_SPU => spu.dma_read_word(),
             CHANNEL_MDEC_OUT => mdec.read_data(),
+            // Nothing is plugged into the expansion port: the data lines float high.
+            CHANNEL_PIO => 0xFFFF_FFFF,
             _ => 0,
         }
     }

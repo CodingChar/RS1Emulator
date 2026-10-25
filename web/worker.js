@@ -67,7 +67,7 @@ function useBios(bytes, name) {
         return false;
     }
     biosLoaded = true;
-    post({ type: 'bios', name, size: bytes.length });
+    post({ type: 'bios', name, size: bytes.length, info: ps1.bios_description ? ps1.bios_description() : '' });
     publishState();
     return true;
 }
@@ -121,7 +121,10 @@ function loadDisc(files, swap = false) {
         return;
     }
     const cue = files.find((f) => /\.cue$/i.test(f.name));
-    const data = files.filter((f) => !/\.cue$/i.test(f.name));
+    const ccd = files.find((f) => /\.ccd$/i.test(f.name));
+    const sbi = files.find((f) => /\.sbi$/i.test(f.name));
+    // The CloneCD sub-channel dump (.sub) is not used.
+    const data = files.filter((f) => !/\.(cue|ccd|sbi|sub)$/i.test(f.name));
     if (data.length === 0) {
         say('Falta el archivo .bin (o .iso) del disco.', true);
         return;
@@ -131,6 +134,8 @@ function loadDisc(files, swap = false) {
             ps1.add_lazy_disc_file(file.name, file.size, makeReader(file));
         }
         const cueText = cue ? new FileReaderSync().readAsText(cue) : undefined;
+        if (ccd && !cue) ps1.set_disc_ccd(new FileReaderSync().readAsText(ccd));
+        if (sbi) ps1.set_disc_sbi(new Uint8Array(new FileReaderSync().readAsArrayBuffer(sbi)));
         if (swap) ps1.swap_disc_files(cueText);
         else ps1.insert_disc_files(cueText);
     } catch (error) {
@@ -140,7 +145,7 @@ function loadDisc(files, swap = false) {
     }
     discLoaded = true;
     const total = data.reduce((sum, f) => sum + f.size, 0);
-    post({ type: 'disc', names: (cue ? [cue] : data).map((f) => f.name), size: total });
+    post({ type: 'disc', names: (cue || ccd ? [cue || ccd] : data).map((f) => f.name), size: total });
     publishState();
 }
 

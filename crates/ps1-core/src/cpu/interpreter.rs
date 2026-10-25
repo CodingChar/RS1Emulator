@@ -136,6 +136,18 @@ pub struct Interpreter {
     pending_load: (usize, u32),
     /// Load issued by the current instruction; becomes `pending_load`.
     next_load: (usize, u32),
+    /// Cycles until the multiply/divide unit has its result, counted from the
+    /// start of the next instruction. Reading HI/LO before then stalls.
+    hilo_busy: u32,
+    /// The same for the GTE: cycles until the command it is running is done.
+    gte_busy: u32,
+    /// Stall cycles the last instruction added on top of its one cycle; the
+    /// caller takes them with `take_extra_cycles` and passes them to the bus.
+    #[serde(skip)]
+    extra_cycles: u32,
+    #[cfg(feature = "trace")]
+    #[serde(skip)]
+    trace: crate::cpu::trace::Trace,
 }
 
 impl Interpreter {
@@ -154,6 +166,11 @@ impl Interpreter {
             branch_pending: false,
             pending_load: (0, 0),
             next_load: (0, 0),
+            hilo_busy: 0,
+            gte_busy: 0,
+            extra_cycles: 0,
+            #[cfg(feature = "trace")]
+            trace: Default::default(),
         };
         cpu.cp0[COP0_SR] = SR_RESET;
         cpu.cp0[COP0_PRID] = PRID_R3000A;
@@ -192,6 +209,18 @@ impl Interpreter {
         }
     }
 
+    /// The last executed instructions as `(address, word)`, oldest first.
+    #[cfg(feature = "trace")]
+    pub fn trace(&self) -> Vec<(u32, u32)> {
+        self.trace.entries()
+    }
+
+    /// The stall cycles the last `step` added to its one cycle (a multiply or
+    /// divide result read too early); the bus must be ticked for them as well.
+    pub fn take_extra_cycles(&mut self) -> u32 {
+        std::mem::take(&mut self.extra_cycles)
+    }
+
     /// Execute one instruction.
     ///
     /// MIPS exceptions (overflow, syscall, address errors, interrupts...) are
@@ -204,9 +233,11 @@ impl Interpreter {
         }
     }
 
-    /// Run `count` instructions, each followed by one cycle of the devices
-    /// (see `Bus::tick`), with the interrupt line sampled before each one.
-    /// Returns how many were executed and why it stopped early, if it did.
+    /// Run `count` cycles, each instruction taking one (plus the stalls of a
+    /// multiply or divide result read too early), followed by the same cycles of
+    /// the devices (see `Bus::tick`), with the interrupt line sampled before each
+    /// instruction. Returns how many cycles ran, which can exceed `count` by the
+    /// stall of the last instruction, and why it stopped early, if it did.
     ///
     /// This is the same as calling [`Interpreter::step`] in a loop but keeps
     /// the whole interpreter in a single hot loop, which is what makes it fast.
@@ -235,15 +266,17 @@ impl Interpreter {
                 return (executed, Ok(()), true);
             }
             self.set_irq(bus.interrupt.pending());
-            if !self.interrupt_pending() {
+            // (With the `trace` feature every instruction takes the exact path.)
+            if !self.interrupt_pending() && !cfg!(feature = "trace") {
                 // Nothing can change the interrupt line before the next device
                 // event, so a whole batch runs without looking at it again.
                 let limit = (count - executed).min(bus.cycles_to_deadline() as u64) as u32;
                 let done = self.run_fast::<BREAKPOINT>(bus, limit, break_pc);
-                if done > 0 {
-                    bus.tick(done);
-                    executed += done as u64;
-                    if done == limit {
+                let spent = done + self.take_extra_cycles();
+                if spent > 0 {
+                    bus.tick(spent);
+                    executed += spent as u64;
+                    if spent >= limit {
                         continue;
                     }
                 }
@@ -257,10 +290,11 @@ impl Interpreter {
                     return (executed, Err(e), false);
                 }
             }
-            bus.tick(1);
-            executed += 1;
+            let spent = 1 + self.take_extra_cycles() + bus.take_dma_stall();
+            bus.tick(spent);
+            executed += spent as u64;
         }
-        (count, Ok(()), false)
+        (executed, Ok(()), false)
     }
 
     #[inline(always)]
@@ -282,6 +316,8 @@ impl Interpreter {
             self.regs[reg] = value;
             self.pending_load.0 = 0;
         }
+        self.hilo_busy = self.hilo_busy.saturating_sub(1);
+        self.gte_busy = self.gte_busy.saturating_sub(1);
         result
     }
 
@@ -312,6 +348,8 @@ impl Interpreter {
             return Err(Trap::address_error(Exception::AddressErrorLoad, pc));
         }
         let instr = bus.load(pc, 4).ok_or(Trap::exception(Exception::BusErrorFetch))?;
+        #[cfg(feature = "trace")]
+        self.trace.record(pc, instr);
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
         self.execute(instr, bus)
@@ -652,6 +690,7 @@ impl Interpreter {
             0x32 => {
                 // LWC2: load a word straight into a GTE data register.
                 self.require_cop2()?;
+                self.wait_for_gte();
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read32(bus, addr)?;
                 self.gte.write_data(rt, value);
@@ -659,6 +698,7 @@ impl Interpreter {
             0x3A => {
                 // SWC2: store a GTE data register.
                 self.require_cop2()?;
+                self.wait_for_gte();
                 let addr = self.regs[rs].wrapping_add(simm);
                 self.write32(bus, addr, self.gte.read_data(rt))?;
             }
@@ -690,22 +730,37 @@ impl Interpreter {
             }
             0x0C => return Err(Trap::exception(Exception::Syscall)),
             0x0D => return Err(Trap::exception(Exception::Breakpoint)),
-            0x10 => self.set_reg(rd, self.hi),
+            0x10 => {
+                self.wait_for_hilo();
+                self.set_reg(rd, self.hi);
+            }
             0x11 => self.hi = a,
-            0x12 => self.set_reg(rd, self.lo),
+            0x12 => {
+                self.wait_for_hilo();
+                self.set_reg(rd, self.lo);
+            }
             0x13 => self.lo = a,
             0x18 => {
                 let prod = (a as i32 as i64) * (b as i32 as i64);
                 self.lo = prod as u32;
                 self.hi = (prod >> 32) as u32;
+                // One more than the stall for the next instruction: this one's own cycle.
+                self.hilo_busy = multiply_latency(a, true);
             }
             0x19 => {
                 let prod = (a as u64) * (b as u64);
                 self.lo = prod as u32;
                 self.hi = (prod >> 32) as u32;
+                self.hilo_busy = multiply_latency(a, false);
             }
-            0x1A => self.divide_signed(a as i32, b as i32),
-            0x1B => self.divide_unsigned(a, b),
+            0x1A => {
+                self.divide_signed(a as i32, b as i32);
+                self.hilo_busy = DIVIDE_LATENCY;
+            }
+            0x1B => {
+                self.divide_unsigned(a, b);
+                self.hilo_busy = DIVIDE_LATENCY;
+            }
             0x20 => {
                 let value = (a as i32)
                     .checked_add(b as i32)
@@ -742,11 +797,14 @@ impl Interpreter {
     #[inline(never)]
     fn execute_cop2(&mut self, instr: u32) -> Exec {
         self.require_cop2()?;
+        self.wait_for_gte();
 
         // Bit 25 set: a GTE command rather than a register move.
         if instr & (1 << 25) != 0 {
             let _area = crate::profile::enter(crate::profile::Area::Gte);
             self.gte.execute(instr & 0x01FF_FFFF);
+            // The end of this instruction takes one cycle off before the next one starts.
+            self.gte_busy = Gte::latency(instr);
             return Ok(());
         }
 
@@ -823,6 +881,20 @@ impl Interpreter {
 
     // ----- Multiply/divide helpers -----
 
+    /// Stall until the GTE has finished its command (the CPU touches the GTE).
+    #[inline(never)]
+    fn wait_for_gte(&mut self) {
+        self.extra_cycles += self.gte_busy;
+        self.gte_busy = 0;
+    }
+
+    /// Stall until the multiply/divide unit has finished (HI/LO were read).
+    #[inline(never)]
+    fn wait_for_hilo(&mut self) {
+        self.extra_cycles += self.hilo_busy;
+        self.hilo_busy = 0;
+    }
+
     // Results for the cases real hardware doesn't trap on, as documented in
     // the "CPU division by zero / overflow" notes.
     #[inline(never)]
@@ -859,6 +931,23 @@ impl Default for Interpreter {
 
 fn sign_extend16(imm: u32) -> u32 {
     imm as u16 as i16 as i32 as u32
+}
+
+/// Cycles a divide takes (R3000A, from the psx-spx timing notes).
+pub(crate) const DIVIDE_LATENCY: u32 = 36;
+
+/// Cycles a multiply takes: 6, 9 or 13 depending on how many significant bits
+/// `rs` has (for MULT the magnitude of the signed value counts).
+#[inline(always)]
+pub(crate) fn multiply_latency(rs: u32, signed: bool) -> u32 {
+    let magnitude = if signed && (rs as i32) < 0 { !rs } else { rs };
+    if magnitude < 0x800 {
+        6
+    } else if magnitude < 0x10_0000 {
+        9
+    } else {
+        13
+    }
 }
 
 mod fast;

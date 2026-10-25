@@ -21,6 +21,7 @@ pub mod profile;
 mod serde_arrays;
 pub mod memory;
 pub mod save_state;
+pub mod sio1;
 pub mod spu;
 pub mod timers;
 pub mod system;

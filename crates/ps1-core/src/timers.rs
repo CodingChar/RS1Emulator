@@ -34,6 +34,14 @@ pub struct TimerClocks {
     pub dotclock: u32,
     /// Horizontal blanks (one per scanline).
     pub hblank: u32,
+    /// Whether the beam is in the horizontal / vertical blanking interval at
+    /// the end of the span (the span never crosses a blanking edge when a timer
+    /// is synchronised with it: see `cycles_until_event`).
+    pub in_hblank: bool,
+    pub in_vblank: bool,
+    /// A horizontal / vertical blanking interval started in the span.
+    pub hblank_started: bool,
+    pub vblank_started: bool,
 }
 
 /// System timers (Timer 0, 1, 2) and timing events.
@@ -42,9 +50,10 @@ pub struct TimerClocks {
 /// `0x1F801120` (timer 2): counter, mode and target, 16 bytes per timer.
 ///
 /// Clock sources: timer 0 sysclk or dot clock, timer 1 sysclk or hblank,
-/// timer 2 sysclk or sysclk/8. Synchronisation with the blanking intervals
-/// is only emulated for timer 2 (modes 0 and 3 stop the counter); timers 0
-/// and 1 free-run regardless of their sync setting.
+/// timer 2 sysclk or sysclk/8. Timers 0 and 1 can be synchronised with the
+/// horizontal and vertical blanking intervals (pause while blanking, reset when
+/// it starts, both, or pause until it first starts); timer 2's modes 0 and 3
+/// stop the counter, 1 and 2 free-run.
 ///
 /// Mirrors DuckStation's `timers.cpp` / `timing_event.cpp`.
 #[derive(Serialize, Deserialize)]
@@ -74,11 +83,17 @@ impl Timers {
         *self = Self::new();
     }
 
-    /// Whether the timer is held still by its sync mode.
+    /// Whether the timer is held still by its sync mode, regardless of the
+    /// beam (timer 2's stop modes).
     fn is_halted(&self, timer: usize) -> bool {
         let mode = self.mode[timer];
         let sync_mode = (mode >> MODE_SYNC_MODE_SHIFT) & 3;
         timer == 2 && mode & MODE_SYNC_ENABLE != 0 && (sync_mode == 0 || sync_mode == 3)
+    }
+
+    /// Whether timer 0 or 1 is synchronised with a blanking interval.
+    fn is_synchronised(&self, timer: usize) -> bool {
+        timer < 2 && self.mode[timer] & MODE_SYNC_ENABLE != 0
     }
 
     /// Pulses until the counter next reaches its target or overflows (at least 1).
@@ -108,6 +123,10 @@ impl Timers {
                 _ => (1, 1),
             };
             next = next.min(first + (self.ticks_until_event(timer) - 1) * period);
+            // A synchronised timer reacts to the blanking edges: run them exactly.
+            if self.is_synchronised(timer) {
+                next = next.min(video.next_blank_edge);
+            }
         }
         next
     }
@@ -135,6 +154,7 @@ impl Timers {
             if self.is_halted(timer) {
                 continue;
             }
+            let ticks = if self.is_synchronised(timer) { self.apply_blank_sync(timer, ticks, &clocks) } else { ticks };
 
             // Far from the target and the overflow nothing happens: add up.
             if ticks < self.ticks_until_event(timer) {
@@ -144,6 +164,43 @@ impl Timers {
 
             for _ in 0..ticks {
                 self.count(timer, interrupt);
+            }
+        }
+    }
+
+    /// Timer 0 follows the horizontal blanking interval, timer 1 the vertical
+    /// one. Returns how many of the pulses still count.
+    fn apply_blank_sync(&mut self, timer: usize, ticks: u32, clocks: &TimerClocks) -> u32 {
+        let (in_blank, started) = if timer == 0 {
+            (clocks.in_hblank, clocks.hblank_started)
+        } else {
+            (clocks.in_vblank, clocks.vblank_started)
+        };
+        match (self.mode[timer] >> MODE_SYNC_MODE_SHIFT) & 3 {
+            // Pause while the beam is blanking.
+            0 => if in_blank { 0 } else { ticks },
+            // Free-run, back to zero when the blanking starts.
+            1 => {
+                if started {
+                    self.counter[timer] = 0;
+                    0
+                } else {
+                    ticks
+                }
+            }
+            // Back to zero when it starts, and only count while it lasts.
+            2 => {
+                if started {
+                    self.counter[timer] = 0;
+                }
+                if in_blank { ticks } else { 0 }
+            }
+            // Paused until the first blanking, then free-running for good.
+            _ => {
+                if started {
+                    self.mode[timer] &= !MODE_SYNC_ENABLE;
+                }
+                0
             }
         }
     }
@@ -359,7 +416,7 @@ mod tests {
         let mut timers = Timers::new();
         let mut irq = InterruptController::new();
         setup(&mut timers, 0, 1 << MODE_CLOCK_SOURCE_SHIFT, 0);
-        let clocks = TimerClocks { sysclk: 1000, dotclock: 7, hblank: 3 };
+        let clocks = TimerClocks { sysclk: 1000, dotclock: 7, hblank: 3, ..Default::default() };
         timers.tick(clocks, &mut irq);
         assert_eq!(timers.read(0, 4), 7);
     }
@@ -369,7 +426,7 @@ mod tests {
         let mut timers = Timers::new();
         let mut irq = InterruptController::new();
         setup(&mut timers, 1, 1 << MODE_CLOCK_SOURCE_SHIFT, 0);
-        let clocks = TimerClocks { sysclk: 1000, dotclock: 7, hblank: 3 };
+        let clocks = TimerClocks { sysclk: 1000, dotclock: 7, hblank: 3, ..Default::default() };
         timers.tick(clocks, &mut irq);
         assert_eq!(timers.read(16, 4), 3);
     }
@@ -414,5 +471,83 @@ mod tests {
         assert_eq!(timers.read(0x10, 4), 0, "mode write restarts the counter");
         assert_eq!(timers.read(0x14, 4) & 0x7FF, 0x158 | MODE_IRQ_OFF);
         assert_eq!(timers.read(0x30, 4), 0, "no fourth timer");
+    }
+
+    fn span(n: u32, in_hblank: bool, hblank_started: bool) -> TimerClocks {
+        TimerClocks { sysclk: n, in_hblank, hblank_started, ..Default::default() }
+    }
+
+    #[test]
+    fn timer0_sync_mode_0_pauses_during_hblank() {
+        let mut timers = Timers::new();
+        let mut irq = InterruptController::new();
+        setup(&mut timers, 0, MODE_SYNC_ENABLE, 0);
+        timers.tick(span(10, false, false), &mut irq);
+        timers.tick(span(10, true, true), &mut irq);
+        timers.tick(span(10, true, false), &mut irq);
+        timers.tick(span(5, false, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 15);
+    }
+
+    #[test]
+    fn timer0_sync_mode_1_resets_when_hblank_starts() {
+        let mut timers = Timers::new();
+        let mut irq = InterruptController::new();
+        setup(&mut timers, 0, MODE_SYNC_ENABLE | (1 << MODE_SYNC_MODE_SHIFT), 0);
+        timers.tick(span(10, false, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 10);
+        timers.tick(span(1, true, true), &mut irq);
+        assert_eq!(timers.read(0, 4), 0);
+        timers.tick(span(7, true, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 7, "free-runs after the reset");
+    }
+
+    #[test]
+    fn timer0_sync_mode_2_counts_only_during_hblank() {
+        let mut timers = Timers::new();
+        let mut irq = InterruptController::new();
+        setup(&mut timers, 0, MODE_SYNC_ENABLE | (2 << MODE_SYNC_MODE_SHIFT), 0);
+        timers.tick(span(10, false, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 0);
+        timers.tick(span(1, true, true), &mut irq);
+        timers.tick(span(6, true, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 7, "the edge's own pulse counts after the reset");
+        timers.tick(span(1, true, true), &mut irq);
+        assert_eq!(timers.read(0, 4), 1, "back to zero at the next hblank");
+    }
+
+    #[test]
+    fn timer0_sync_mode_3_waits_for_the_first_hblank_then_free_runs() {
+        let mut timers = Timers::new();
+        let mut irq = InterruptController::new();
+        setup(&mut timers, 0, MODE_SYNC_ENABLE | (3 << MODE_SYNC_MODE_SHIFT), 0);
+        timers.tick(span(10, false, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 0);
+        timers.tick(span(1, true, true), &mut irq);
+        assert_eq!(timers.read(4, 4) & MODE_SYNC_ENABLE, 0, "sync switched off");
+        timers.tick(span(10, false, false), &mut irq);
+        assert_eq!(timers.read(0, 4), 10);
+    }
+
+    #[test]
+    fn timer1_follows_the_vertical_blank_not_the_horizontal_one() {
+        let mut timers = Timers::new();
+        let mut irq = InterruptController::new();
+        setup(&mut timers, 1, MODE_SYNC_ENABLE, 0);
+        // In hblank but not in vblank: counts.
+        timers.tick(span(10, true, true), &mut irq);
+        assert_eq!(timers.read(16, 4), 10);
+        timers.tick(TimerClocks { sysclk: 10, in_vblank: true, vblank_started: true, ..Default::default() }, &mut irq);
+        assert_eq!(timers.read(16, 4), 10, "paused in vblank");
+    }
+
+    #[test]
+    fn a_synchronised_timer_limits_how_far_the_devices_may_skip() {
+        let video = crate::gpu::VideoTiming { next_dot: 5, dot_period: 5, next_hblank: 1000, hblank_period: 1000, next_blank_edge: 40 };
+        let mut timers = Timers::new();
+        setup(&mut timers, 0, 0, 0);
+        assert!(timers.cycles_until_event(&video) > 40);
+        setup(&mut timers, 0, MODE_SYNC_ENABLE, 0);
+        assert_eq!(timers.cycles_until_event(&video), 40);
     }
 }

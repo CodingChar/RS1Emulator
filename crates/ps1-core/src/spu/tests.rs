@@ -270,3 +270,44 @@ fn reverb_echoes_the_input_when_enabled() {
     let echoes = spu.output_buffer.chunks(2).skip(2).filter(|f| f[0].abs() > 0.1).count();
     assert!(echoes >= 1, "the reverb should return the impulse later");
 }
+
+fn half_at(spu: &Spu, address: usize) -> i16 {
+    i16::from_le_bytes([spu.sound_ram[address], spu.sound_ram[address + 1]])
+}
+
+#[test]
+fn the_capture_buffers_record_the_cd_input_and_voices_1_and_3() {
+    let mut spu = spu_with_tone();
+    // The same tone on voice 1 (its registers start at 0x10).
+    for (offset, value) in [(0x10, 0x3FFF), (0x12, 0x3FFF), (0x14, 0x1000), (0x16, (BLOCK_ADDRESS / 8) as u32), (0x18, 0x000F), (0x1A, 0)] {
+        spu.write(offset, 2, value);
+    }
+    spu.write(CD_VOLUME_LEFT, 2, 0x4000); // half volume
+    spu.write(CD_VOLUME_RIGHT, 2, 0x4000);
+    spu.write(KEY_ON_LOW, 2, 0b10);
+    for i in 0..40i16 {
+        spu.tick_sample((1000 + 2 * i, -1000 - 2 * i));
+    }
+    // Sample n of the CD input is at byte 2n of the first two buffers, at half volume.
+    assert_eq!(half_at(&spu, 0), 500);
+    assert_eq!(half_at(&spu, 2), 501);
+    assert_eq!(half_at(&spu, 0x400), -500);
+    assert_eq!(half_at(&spu, 0x400 + 2 * 39), -539);
+    // Voice 1 is sounding (a steady level by now); voice 3 is silent.
+    let level = half_at(&spu, 0x800 + 2 * 39);
+    assert!(level > 20_000, "{level}");
+    assert_eq!(half_at(&spu, 0xC00 + 2 * 39), 0);
+}
+
+#[test]
+fn the_capture_buffers_wrap_after_512_samples() {
+    let mut spu = Spu::new();
+    spu.write(CD_VOLUME_LEFT, 2, 0x7FFF);
+    for i in 0..600i16 {
+        spu.tick_sample((i, 0));
+    }
+    assert_eq!(spu.capture_index, 600 % 512);
+    // The first 88 entries were overwritten by samples 512..600.
+    assert_eq!(half_at(&spu, 0), 511);
+    assert_eq!(half_at(&spu, 2 * 100), 99, "later entries still hold the first pass");
+}

@@ -51,6 +51,8 @@ pub struct VideoTiming {
     pub next_hblank: u32,
     /// Between two horizontal blanks.
     pub hblank_period: u32,
+    /// Until the horizontal or vertical blanking interval next starts or ends.
+    pub next_blank_edge: u32,
 }
 
 /// What happened on screen while the GPU advanced.
@@ -62,12 +64,53 @@ pub struct VideoTick {
     pub hblanks: u32,
     /// The vertical blanking interval started (IRQ0).
     pub vblank_started: bool,
+    /// Whether the beam is now in the horizontal / vertical blanking interval
+    /// (the gate of the timers' sync modes).
+    pub in_hblank: bool,
+    pub in_vblank: bool,
+    /// A blanking interval started during this advance.
+    pub hblank_started: bool,
 }
 
 // ----- GPUSTAT bits that are always the same -----
 const STAT_READY_FOR_COMMAND: u32 = 1 << 26;
 const STAT_READY_FOR_VRAM_READ: u32 = 1 << 27;
 const STAT_READY_FOR_DMA: u32 = 1 << 28;
+
+/// The most GPU clocks of drawing work that can be queued (about a frame).
+const MAX_BUSY_CLOCKS: u32 = 1 << 20;
+
+/// GPU clocks a drawing command keeps the GPU busy, an estimate: the real
+/// pipeline draws about a pixel per clock, textured and blended pixels cost more,
+/// and every command has a setup cost.
+mod cost {
+    const SETUP: u32 = 16;
+
+    pub fn fill(width: u32, height: u32) -> u32 {
+        // Fills work in 8-pixel units per line.
+        height.min(512) * (width.min(1024) / 8 + 9)
+    }
+
+    pub fn triangle(area2: u64, textured: bool, semi: bool) -> u32 {
+        let pixels = (area2 / 2).min(1024 * 512) as u32;
+        let per_pixel = 1 + textured as u32;
+        SETUP + 8 + pixels * per_pixel + if semi { pixels / 2 } else { 0 }
+    }
+
+    pub fn rectangle(width: u32, height: u32, textured: bool, semi: bool) -> u32 {
+        let pixels = width.min(1024) * height.min(512);
+        SETUP + pixels * (1 + textured as u32) + if semi { pixels / 2 } else { 0 }
+    }
+
+    pub fn line(dx: u32, dy: u32, semi: bool) -> u32 {
+        let length = dx.max(dy).min(2048);
+        SETUP + length * 2 + if semi { length / 2 } else { 0 }
+    }
+
+    pub fn copy(width: u32, height: u32) -> u32 {
+        SETUP + width.min(1024) * height.min(512) * 2
+    }
+}
 
 /// What the GPU version query (GP1 10h, index 7) returns.
 const GPU_VERSION: u32 = 2;
@@ -141,6 +184,8 @@ pub struct Gpu {
     pub scanline: u32,
     line_clock: u32,
     clock_remainder: u32,
+    /// GPU clocks of queued drawing work still to go (see `cost`).
+    busy_clocks: u32,
     dot_remainder: u32,
 }
 
@@ -177,6 +222,7 @@ impl Gpu {
             scanline: 0,
             line_clock: 0,
             clock_remainder: 0,
+            busy_clocks: 0,
             dot_remainder: 0,
         };
         gpu.reset_state();
@@ -210,6 +256,7 @@ impl Gpu {
         self.vertical_range = (0x10, 0x10 + 240);
         self.display_mode = 0;
         self.irq1 = false;
+        self.busy_clocks = 0;
         self.gp0 = Gp0State::Command;
         self.download = None;
     }
@@ -269,15 +316,43 @@ impl Gpu {
         self.scanline >= VBLANK_START_LINE
     }
 
+    /// The part of each scanline that is displayed, in GPU clocks since the
+    /// start of the line (from the horizontal display range).
+    fn visible_clocks(&self) -> (u32, u32) {
+        let per_line = self.clocks_per_line();
+        let start = self.horizontal_range.0.min(per_line - 1);
+        let end = self.horizontal_range.1.clamp(start + 1, per_line);
+        (start, end)
+    }
+
+    /// Whether the beam is in the horizontal blanking interval: the part of the
+    /// line outside the displayed range.
+    pub fn in_hblank(&self) -> bool {
+        let (start, end) = self.visible_clocks();
+        self.line_clock < start || self.line_clock >= end
+    }
+
+    /// Whether the GPU is still drawing what it was last given (GPUSTAT bits 26
+    /// and 28 read as not ready until it finishes).
+    pub fn is_busy(&self) -> bool {
+        self.busy_clocks > 0
+    }
+
+    fn add_busy(&mut self, clocks: u32) {
+        self.busy_clocks = (self.busy_clocks + clocks).min(MAX_BUSY_CLOCKS);
+    }
+
     // ----- Timing -----
 
     /// Advance the video timing by `cpu_cycles` CPU cycles.
     pub fn advance(&mut self, cpu_cycles: u32) -> VideoTick {
         let mut tick = VideoTick::default();
+        let was_in_hblank = self.in_hblank();
 
         self.clock_remainder += cpu_cycles * GPU_CLOCKS_PER_7_CPU_CYCLES;
         let gpu_clocks = self.clock_remainder / CPU_CYCLES_PER_11_GPU_CLOCKS;
         self.clock_remainder %= CPU_CYCLES_PER_11_GPU_CLOCKS;
+        self.busy_clocks = self.busy_clocks.saturating_sub(gpu_clocks);
 
         let divider = self.dot_clock_divider();
         self.dot_remainder += gpu_clocks;
@@ -298,6 +373,9 @@ impl Gpu {
                 self.scanline = 0;
             }
         }
+        tick.in_hblank = self.in_hblank();
+        tick.in_vblank = self.in_vblank();
+        tick.hblank_started = tick.in_hblank && !was_in_hblank;
         tick
     }
 
@@ -315,7 +393,33 @@ impl Gpu {
             dot_period: divider * CPU_CYCLES_PER_11_GPU_CLOCKS / GPU_CLOCKS_PER_7_CPU_CYCLES,
             next_hblank: cycles_for(per_line - self.line_clock.min(per_line - 1)),
             hblank_period: per_line * CPU_CYCLES_PER_11_GPU_CLOCKS / GPU_CLOCKS_PER_7_CPU_CYCLES,
+            next_blank_edge: cycles_for(self.clocks_to_blank_edge()).min(self.cycles_until_frame_edge()).max(1),
         }
+    }
+
+    /// GPU clocks until the horizontal blanking interval starts or ends.
+    fn clocks_to_blank_edge(&self) -> u32 {
+        let (start, end) = self.visible_clocks();
+        let line = self.line_clock;
+        if line < start {
+            start - line
+        } else if line < end {
+            end - line
+        } else {
+            self.clocks_per_line() - line + start
+        }
+    }
+
+    /// A lower bound on the CPU cycles until the vertical blanking interval
+    /// starts or ends.
+    fn cycles_until_frame_edge(&self) -> u32 {
+        let lines = if self.scanline < VBLANK_START_LINE {
+            VBLANK_START_LINE - self.scanline
+        } else {
+            self.lines_per_frame() - self.scanline
+        };
+        let clocks = (lines * self.clocks_per_line()).saturating_sub(self.line_clock);
+        (clocks * CPU_CYCLES_PER_11_GPU_CLOCKS).saturating_sub(self.clock_remainder) / GPU_CLOCKS_PER_7_CPU_CYCLES
     }
 
     /// A lower bound on the CPU cycles until the next vertical blank starts.
@@ -369,7 +473,10 @@ impl Gpu {
         stat |= (self.irq1 as u32) << 24;
         // Data request: follows the DMA direction.
         stat |= ((self.dma_direction != 0) as u32) << 25;
-        stat |= STAT_READY_FOR_COMMAND | STAT_READY_FOR_VRAM_READ | STAT_READY_FOR_DMA;
+        stat |= STAT_READY_FOR_VRAM_READ;
+        if !self.is_busy() {
+            stat |= STAT_READY_FOR_COMMAND | STAT_READY_FOR_DMA;
+        }
         stat |= (self.dma_direction as u32) << 29;
 
         // Interlace field / odd-even line.
@@ -562,6 +669,7 @@ impl Gpu {
                 let (x, y) = (words[1] & 0xFFFF, words[1] >> 16);
                 let (w, h) = (words[2] & 0xFFFF, words[2] >> 16);
                 sw::fill_rectangle(&mut self.vram, x, y, w, h, rgb(command));
+                self.add_busy(cost::fill(w, h));
             }
             0x20..=0x3F => self.draw_polygon(words),
             0x40..=0x5F => self.draw_polyline(words),
@@ -571,6 +679,7 @@ impl Gpu {
                 let dst = (words[2] & 0x3FF, (words[2] >> 16) & 0x1FF);
                 let size = (words[3] & 0xFFFF, words[3] >> 16);
                 sw::copy_rectangle(&mut self.vram, &self.settings, src, dst, size);
+                self.add_busy(cost::copy(size.0, size.1));
             }
             0xA0..=0xBF => {
                 let (x, y) = ((words[1] & 0x3FF) as usize, ((words[1] >> 16) & 0x1FF) as usize);
@@ -702,8 +811,10 @@ impl Gpu {
             texture: self.current_texture(clut),
         };
         sw::draw_triangle(&mut self.vram, &self.settings, &attrs, [vertices[0], vertices[1], vertices[2]]);
+        self.add_busy(cost::triangle(doubled_area(&vertices[0..3]), textured, semi));
         if quad {
             sw::draw_triangle(&mut self.vram, &self.settings, &attrs, [vertices[1], vertices[2], vertices[3]]);
+            self.add_busy(cost::triangle(doubled_area(&vertices[1..4]), textured, semi));
         }
     }
 
@@ -757,6 +868,7 @@ impl Gpu {
             self.rect_flip_x,
             self.rect_flip_y,
         );
+        self.add_busy(cost::rectangle(width as u32, height as u32, textured, semi));
     }
 
     /// Lines and polylines: `words` holds the command, then vertices (with a
@@ -796,6 +908,7 @@ impl Gpu {
         }
         for pair in points.windows(2) {
             sw::draw_line(&mut self.vram, &self.settings, &attrs, pair[0], pair[1]);
+            self.add_busy(cost::line(pair[0].x.abs_diff(pair[1].x), pair[0].y.abs_diff(pair[1].y), semi));
         }
     }
 
@@ -936,6 +1049,14 @@ impl Default for Gpu {
 }
 
 /// The 24-bit colour in the low bits of a command word.
+/// Twice the area of the triangle the first three vertices make.
+fn doubled_area(vertices: &[Vertex]) -> u64 {
+    let (a, b, c) = (vertices[0], vertices[1], vertices[2]);
+    let cross = (b.x as i64 - a.x as i64) * (c.y as i64 - a.y as i64)
+        - (c.x as i64 - a.x as i64) * (b.y as i64 - a.y as i64);
+    cross.unsigned_abs()
+}
+
 fn rgb(word: u32) -> [u8; 3] {
     [word as u8, (word >> 8) as u8, (word >> 16) as u8]
 }

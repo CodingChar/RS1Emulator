@@ -49,10 +49,12 @@ struct Args {
     screenshot: Option<PathBuf>,
     /// Save the whole 1024x512 VRAM as a PNG after the run (`--vram`).
     vram: Option<PathBuf>,
+    /// Print the last N executed instructions (`--trace N`; needs `--features trace`).
+    trace: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None, trace: 0 };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -83,6 +85,9 @@ fn parse_args() -> Result<Args, String> {
                 let addr = u32::from_str_radix(text.trim_start_matches("0x"), 16)
                     .map_err(|e| format!("--watch-pc: {e}"))?;
                 args.watch.push(addr);
+            }
+            "--trace" => {
+                args.trace = value("--trace")?.parse().map_err(|e| format!("--trace: {e}"))?;
             }
             "--screenshot" => args.screenshot = Some(PathBuf::from(value("--screenshot")?)),
             "--vram" => args.vram = Some(PathBuf::from(value("--vram")?)),
@@ -216,6 +221,7 @@ fn run_bios(
 
     let mut sys = System::new();
     sys.load_bios(&bios).expect("BIOS image too large");
+    println!("        {}", sys.bios_info().describe());
     if let Some(cue) = cue {
         match open_disc(cue) {
             Ok(mut disc) => {
@@ -295,6 +301,22 @@ fn run_bios(
             Some(step) => println!("watch {addr:#010X}: executed {count} times, first at step {step}"),
             None => println!("watch {addr:#010X}: never executed"),
         }
+    }
+    let serial = sys.take_serial_output();
+    if !serial.is_empty() {
+        println!("serial port output: {}", String::from_utf8_lossy(&serial));
+    }
+    if args.trace > 0 {
+        #[cfg(feature = "trace")]
+        {
+            let entries = sys.cpu.trace();
+            println!("last {} executed instructions:", args.trace.min(entries.len()));
+            for (pc, word) in entries.iter().rev().take(args.trace).rev() {
+                println!("  {pc:#010X}  {word:08X}  {}", disasm(*pc, *word));
+            }
+        }
+        #[cfg(not(feature = "trace"))]
+        eprintln!("--trace needs the `trace` feature: cargo run --features trace ...");
     }
     println!("\nExecuted {executed} instructions.");
     println!("pc = {:#010X}", sys.cpu.pc);

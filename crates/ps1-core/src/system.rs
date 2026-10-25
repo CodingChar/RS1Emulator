@@ -25,6 +25,9 @@ pub struct System {
     pub frame_cycles_remaining: u64,
     /// Target cycles per video frame.
     pub cycles_per_frame: u64,
+    /// Cycles the last frame ran beyond its target (an instruction stalled past
+    /// the end); the next frame is that much shorter.
+    cycle_overrun: u64,
     pub running: bool,
     pub bios_loaded: bool,
     pub disc_inserted: bool,
@@ -40,6 +43,7 @@ impl System {
             cycles: 0,
             frame_cycles_remaining: 0,
             cycles_per_frame: CPU_CYCLES_PER_FRAME, // NTSC default
+            cycle_overrun: 0,
             running: false,
             bios_loaded: false,
             disc_inserted: false,
@@ -57,6 +61,25 @@ impl System {
         bios.as_mut_slice()[..data.len()].copy_from_slice(data);
         self.bios_loaded = true;
         Ok(())
+    }
+
+    /// The bytes the console sent through its serial port (SIO1) since the last call.
+    pub fn take_serial_output(&mut self) -> Vec<u8> {
+        self.bus.sio1.take_output()
+    }
+
+    /// A byte arriving at the serial port from the other end of the cable.
+    pub fn serial_input(&mut self, byte: u8) {
+        self.sync();
+        self.bus.sio1.push_input(byte);
+        if self.bus.sio1.take_irq() {
+            self.bus.interrupt.raise(crate::interrupt::IRQ_SIO);
+        }
+    }
+
+    /// Which BIOS is loaded (checksum, version line, model when verified).
+    pub fn bios_info(&self) -> crate::memory::bios::BiosInfo {
+        self.bus.memory.bios.info()
     }
 
     /// Queue a PS-X EXE to run instead of the BIOS shell: the BIOS boots as
@@ -98,7 +121,7 @@ impl System {
             return (executed, result);
         }
         self.start_pending_exe();
-        let (more, result) = self.cpu.run(&mut self.bus, count - executed);
+        let (more, result) = self.cpu.run(&mut self.bus, count.saturating_sub(executed));
         (executed + more, result)
     }
 
@@ -160,6 +183,7 @@ impl System {
         self.cpu.reset();
         self.bus.reset();
         self.cycles = 0;
+        self.cycle_overrun = 0;
         self.frame_cycles_remaining = self.cycles_per_frame;
         self.running = true;
         Ok(())
@@ -178,12 +202,11 @@ impl System {
 
         // Timers, GPU, SPU, CD-ROM and the rest follow in lockstep, caught up
         // lazily (see `Bus::tick`).
-        self.bus.tick(1);
+        let spent = 1 + self.cpu.take_extra_cycles() + self.bus.take_dma_stall();
+        self.bus.tick(spent);
 
-        self.cycles += 1;
-        if self.frame_cycles_remaining > 0 {
-            self.frame_cycles_remaining -= 1;
-        }
+        self.cycles += spent as u64;
+        self.frame_cycles_remaining = self.frame_cycles_remaining.saturating_sub(spent as u64);
 
         Ok(())
     }
@@ -204,9 +227,11 @@ impl System {
         if !self.running {
             return Ok(());
         }
-        let (executed, result) = self.run_cpu(self.cycles_per_frame);
+        let target = self.cycles_per_frame.saturating_sub(self.cycle_overrun);
+        let (executed, result) = self.run_cpu(target);
         self.cycles += executed;
-        self.frame_cycles_remaining = self.cycles_per_frame - executed;
+        self.cycle_overrun = executed.saturating_sub(target);
+        self.frame_cycles_remaining = target.saturating_sub(executed);
         self.sync();
         result
     }

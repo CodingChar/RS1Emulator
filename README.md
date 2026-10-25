@@ -36,10 +36,14 @@ disc: a `.cue` with its `.bin` files, a single `.bin`, an `.iso`, or a PS-EXE pr
 | | |
 |---|---|
 | Disc | read from disk on demand (a 650 MB disc costs no memory); "Cambiar disco" swaps it while the game runs |
-| Controls | keyboard (rebindable) and gamepads; the second gamepad drives port 2 |
-| Analog | F9 or the gamepad Home button toggles the DualShock analog mode; vibration uses the Gamepad API |
+| Controls | keyboard (rebindable) and USB or Bluetooth gamepads (per-pad port, button map, dead zone and rumble test in Settings → Mandos); by default the second gamepad drives port 2 |
+| Analog | F9 or the quick menu toggles the DualShock analog mode; vibration uses the Gamepad API |
+| Interface | menu bar, toolbar and a settings dialog; a full-screen style quick menu (Esc, F1 or the gamepad Home button; Alt+Enter for full screen) with save/load slots, disc swap, speed, volume, analog mode and display options, navigable by keyboard, gamepad or mouse; on-screen messages |
 | Saves | memory cards 1 and 2 persist in IndexedDB (export/import/format); three save-state slots |
 | Speed | ×1, ×2, ×4 or maximum; volume, mute and speed are remembered |
+| Discs | `.cue`/`.bin` (with `PREGAP`, `POSTGAP` and `INDEX 00`), `.iso`, CloneCD `.ccd`/`.img`, optional `.sbi` |
+| Timing | multiply/divide and GTE latencies, GPU busy time, DMA durations and chopping, CD seek time by distance, timers 0/1 synchronised with the blanking |
+| Guide | [docs/guia-de-usuario.md](docs/guia-de-usuario.md) (Spanish) |
 
 The emulator runs in a Web Worker (`web/worker.js`): it draws into a transferred
 `OffscreenCanvas` straight from the module's memory and sends audio to an

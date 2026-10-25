@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 use crate::disc::{
-    from_bcd, lba_to_msf, to_bcd, Disc, TrackKind, DATA_SECTOR_SIZE, LEAD_IN_SECTORS,
+    from_bcd, lba_to_msf, to_bcd, Disc, SubQ, TrackKind, DATA_SECTOR_SIZE, LEAD_IN_SECTORS,
     RAW_SECTOR_SIZE, SECTORS_PER_MINUTE, SECTORS_PER_SECOND,
 };
 use crate::types::Ps1Result;
@@ -58,6 +58,12 @@ const PAUSE_DELAY_WHILE_READING: u32 = 0x21181;
 const PAUSE_DELAY_IDLE: u32 = 0x1DF2;
 const MOTOR_DELAY: u32 = 0x5_0000;
 const SEEK_DELAY: u32 = 0x1_0000;
+/// Extra time a seek takes per sector of distance, up to a full stroke (about
+/// 0.6 s of the 33.8688 MHz clock): the head travels, it does not teleport.
+const SEEK_CYCLES_PER_SECTOR: u32 = 60;
+const SEEK_MAX_TRAVEL: u32 = 20_000_000;
+/// Sectors Forward and Backward jump over per sector they let through.
+const SCAN_STEP: u32 = 8;
 const TOC_DELAY: u32 = 0x10_0000;
 /// Extra wait before the first sector of a read, for the head to settle.
 const READ_START_DELAY: u32 = 0x1_0000;
@@ -153,6 +159,8 @@ pub struct CdRom {
     playing: bool,
     play_sector: u32,
     play_countdown: u32,
+    /// Forward (+1) or Backward (-1) scanning while playing; 0 plays normally.
+    scan: i8,
     /// CD to SPU volume matrix, 0x80 = 1.0: left-left, left-right, right-left, right-right.
     volume: [u8; 4],
 }
@@ -183,6 +191,7 @@ impl CdRom {
             filter_file: 0,
             filter_channel: 0,
             seek_target: None,
+            scan: 0,
             read_countdown: 0,
             sector_buffer: Vec::new(),
             last_header: None,
@@ -520,27 +529,32 @@ impl CdRom {
         // With "report" on, every sector brings its position (INT1), the
         // relative time on one and the absolute time on the next.
         if self.mode & MODE_REPORT != 0 && self.interrupt_flag == 0 {
-            let (track, relative, absolute) = match &self.disc {
-                Some(disc) => {
-                    let track = disc.track_at(lba);
-                    (track.number, lba - track.start_lba, lba + LEAD_IN_SECTORS)
-                }
-                None => (1, 0, lba + LEAD_IN_SECTORS),
-            };
+            let q = self.position_at(lba);
             let (mm, ss, ff, ss_flag) = if lba & 0x10 != 0 {
-                let (m, s, f) = lba_to_msf(relative);
+                let (m, s, f) = lba_to_msf(q.relative);
                 (m, s, f, 0x80)
             } else {
-                let (m, s, f) = lba_to_msf(absolute);
+                let (m, s, f) = lba_to_msf(q.absolute);
                 (m, s, f, 0)
             };
             let stat = self.stat();
             self.set_response(
                 INT1_DATA_READY,
-                &[stat, to_bcd(track), 0x01, to_bcd(mm), to_bcd(ss) | ss_flag, to_bcd(ff), 0, 0],
+                &[stat, to_bcd(q.track), q.index, to_bcd(mm), to_bcd(ss) | ss_flag, to_bcd(ff), 0, 0],
             );
         }
-        self.play_sector += 1;
+        self.play_sector = match self.scan {
+            0 => self.play_sector + 1,
+            // Scanning lets a sector through and jumps over the next few; at the
+            // start of the disc it goes back to playing normally.
+            direction => match self.play_sector.checked_add_signed(direction as i32 * SCAN_STEP as i32) {
+                Some(next) => next,
+                None => {
+                    self.scan = 0;
+                    self.play_sector + 1
+                }
+            },
+        };
         self.current_sector = self.play_sector;
         self.play_countdown = self.cycles_per_sector();
     }
@@ -648,28 +662,36 @@ impl CdRom {
                     let number = from_bcd(*t)?;
                     self.disc.as_ref()?.tracks().iter().find(|t| t.number == number).map(|t| t.start_lba)
                 });
+                let from = self.current_sector;
                 self.play_sector = track_start
                     .or_else(|| self.seek_target.take())
                     .unwrap_or(self.current_sector);
                 self.seek_target = None;
                 self.playing = true;
                 self.reading = false;
-                self.play_countdown = ACK_DELAY + READ_START_DELAY;
+                self.scan = 0;
+                self.play_countdown = ACK_DELAY + READ_START_DELAY + Self::travel_cycles(from, self.play_sector);
                 self.acknowledge(vec![self.stat()]);
             }
-            // Forward, Backward: fast-forward is not emulated.
-            0x04 | 0x05 => self.acknowledge(vec![stat]),
+            // Forward, Backward: scan the audio being played
+            0x04 | 0x05 => {
+                if self.playing {
+                    self.scan = if command == 0x04 { 1 } else { -1 };
+                }
+                self.acknowledge(vec![stat]);
+            }
             // ReadN, ReadS
             0x06 | 0x1B => {
                 if self.disc.is_none() {
                     return self.fail(ERROR_NOT_READY);
                 }
+                let from = self.current_sector;
                 if let Some(target) = self.seek_target.take() {
                     self.current_sector = target;
                 }
                 self.playing = false;
                 self.reading = true;
-                self.read_countdown = ACK_DELAY + READ_START_DELAY;
+                self.read_countdown = ACK_DELAY + READ_START_DELAY + Self::travel_cycles(from, self.current_sector);
                 self.acknowledge(vec![self.stat()]);
             }
             // MotorOn
@@ -682,6 +704,7 @@ impl CdRom {
             0x08 => {
                 self.reading = false;
                 self.playing = false;
+                self.scan = 0;
                 self.acknowledge(vec![stat]);
                 self.motor_on = false;
                 self.complete(MOTOR_DELAY, vec![self.stat()]);
@@ -691,6 +714,7 @@ impl CdRom {
                 let delay = if self.reading { PAUSE_DELAY_WHILE_READING } else { PAUSE_DELAY_IDLE };
                 self.reading = false;
                 self.playing = false;
+                self.scan = 0;
                 self.acknowledge(vec![stat]);
                 self.complete(delay, vec![self.stat()]);
             }
@@ -725,12 +749,12 @@ impl CdRom {
             },
             // GetlocP
             0x11 => {
-                let (track, relative, absolute) = self.position_info();
-                let (rm, rs, rf) = lba_to_msf(relative);
-                let (am, as_, af) = lba_to_msf(absolute);
+                let q = self.position_info();
+                let (rm, rs, rf) = lba_to_msf(q.relative);
+                let (am, as_, af) = lba_to_msf(q.absolute);
                 self.acknowledge(vec![
-                    to_bcd(track),
-                    1,
+                    to_bcd(q.track),
+                    q.index,
                     to_bcd(rm),
                     to_bcd(rs),
                     to_bcd(rf),
@@ -778,11 +802,13 @@ impl CdRom {
                 }
                 self.reading = false;
                 self.playing = false;
+                self.scan = 0;
+                let from = self.current_sector;
                 if let Some(target) = self.seek_target.take() {
                     self.current_sector = target;
                 }
                 self.acknowledge(vec![self.stat() | STAT_SEEKING]);
-                self.complete(SEEK_DELAY, vec![self.stat()]);
+                self.complete(SEEK_DELAY + Self::travel_cycles(from, self.current_sector), vec![self.stat()]);
             }
             // Test
             0x19 => match params[0] {
@@ -825,17 +851,21 @@ impl CdRom {
         }
     }
 
-    /// Track number, position within the track and absolute position of the
-    /// sector last read, as `(track, relative, absolute)` clock values.
-    fn position_info(&self) -> (u8, u32, u32) {
-        let lba = self.current_sector.saturating_sub(1);
+    /// Where the head is: the subchannel Q data of the sector last read.
+    fn position_info(&self) -> SubQ {
+        self.position_at(self.current_sector.saturating_sub(1))
+    }
+
+    fn position_at(&self, lba: u32) -> SubQ {
         match &self.disc {
-            Some(disc) => {
-                let track = disc.track_at(lba);
-                (track.number, lba.saturating_sub(track.start_lba), lba + LEAD_IN_SECTORS)
-            }
-            None => (1, 0, lba + LEAD_IN_SECTORS),
+            Some(disc) => disc.subchannel_q(lba),
+            None => SubQ { control: 0x41, track: 1, index: 1, relative: 0, absolute: lba + LEAD_IN_SECTORS },
         }
+    }
+
+    /// Cycles the head needs to travel from one sector to another.
+    fn travel_cycles(from: u32, to: u32) -> u32 {
+        from.abs_diff(to).saturating_mul(SEEK_CYCLES_PER_SECTOR).min(SEEK_MAX_TRAVEL)
     }
 }
 
@@ -1478,5 +1508,85 @@ mod tests {
         assert_eq!(int, INT3_ACKNOWLEDGE);
         assert_eq!(drive.wait_interrupt(), INT2_COMPLETE);
         assert_eq!(drive.cd.total_sectors, 10);
+    }
+
+    // ----- Seek time, subchannel position, scanning -----
+
+    fn long_audio_disc() -> Disc {
+        use crate::disc::{MemorySource, SectorSource};
+        let cue = "FILE \"all.bin\" BINARY
+ TRACK 01 MODE2/2352
+  INDEX 01 00:00:00
+                   TRACK 02 AUDIO
+  INDEX 00 00:00:20
+  INDEX 01 00:00:22
+";
+        Disc::from_cue(cue, |_| {
+            Ok(Box::new(MemorySource(vec![0u8; 400 * RAW_SECTOR_SIZE])) as Box<dyn SectorSource>)
+        })
+        .unwrap()
+    }
+
+    /// Cycles from issuing SeekL to its INT2.
+    fn seek_time(target: [u8; 3]) -> u64 {
+        let mut drive = Drive::with_disc(2000);
+        drive.run(0x02, &target);
+        drive.command(0x15, &[]);
+        let start = drive.cycles;
+        drive.wait_interrupt();
+        drive.ack();
+        assert_eq!(drive.wait_interrupt_within(30_000_000), INT2_COMPLETE);
+        drive.cycles - start
+    }
+
+    #[test]
+    fn a_seek_takes_longer_the_farther_the_head_has_to_go() {
+        let near = seek_time([0x00, 0x02, 0x05]);
+        let far = seek_time([0x00, 0x20, 0x00]);
+        assert!(far > near + 50_000, "near {near}, far {far}");
+    }
+
+    #[test]
+    fn the_pregap_reports_index_0_and_counts_down() {
+        let mut drive = Drive::new();
+        drive.cd.insert_disc(long_audio_disc());
+        let q = drive.cd.position_at(20);
+        assert_eq!((q.track, q.index, q.relative), (2, 0, 1));
+        let q = drive.cd.position_at(22);
+        assert_eq!((q.track, q.index, q.relative), (2, 1, 0));
+
+        // Right after the drive let sector 21 through, the last of the pregap.
+        drive.run(0x02, &[0x00, 0x02, 0x21]);
+        drive.run(0x03, &[]);
+        let mut guard = 0u64;
+        while drive.cd.current_sector <= 21 {
+            drive.cd.step();
+            guard += 1;
+            assert!(guard < 5_000_000, "the first sector never arrived");
+        }
+        let q = drive.cd.position_info();
+        assert_eq!((q.track, q.index, q.relative, q.absolute), (2, 0, 0, 21 + LEAD_IN_SECTORS));
+    }
+
+    #[test]
+    fn forward_scans_ahead_and_backward_goes_back() {
+        fn play_position_after(command: Option<u8>) -> u32 {
+            let mut drive = Drive::new();
+            drive.cd.insert_disc(long_audio_disc());
+            drive.run(0x02, &[0x00, 0x02, 0x22 + 0x30]);
+            drive.run(0x03, &[]);
+            if let Some(command) = command {
+                drive.run(command, &[]);
+            }
+            for _ in 0..(ACK_DELAY + READ_START_DELAY + 400 * SEEK_CYCLES_PER_SECTOR) as u64 + 10 * (CPU_CLOCK / SECTORS_PER_SECOND) as u64 {
+                drive.cd.step();
+            }
+            drive.cd.play_sector
+        }
+        let normal = play_position_after(None);
+        let forward = play_position_after(Some(0x04));
+        let backward = play_position_after(Some(0x05));
+        assert!(forward > normal + 20, "normal {normal}, forward {forward}");
+        assert!(backward < normal.saturating_sub(20), "normal {normal}, backward {backward}");
     }
 }
