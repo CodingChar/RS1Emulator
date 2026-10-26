@@ -8,10 +8,10 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["RS1Emu Contributors"]
+authors = ["CodingChar"]
 description = "PlayStation 1 emulator written in Rust, targeting WebAssembly for the web"
 license = "MIT"
-repository = "https://github.com/RS1Emu/rs1-emu"
+repository = "https://github.com/CodingChar/RS1Emulator"
 
 [profile.release]
 opt-level = 3

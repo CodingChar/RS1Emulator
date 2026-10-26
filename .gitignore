@@ -1,12 +1,14 @@
 # Rust
 /target/
 /**/*.rs.bak
-Cargo.lock
 
 # WASM / Trunk
 dist/
 pkg/
 .trunk/
+
+# Local tool configuration
+.claude/
 
 # IDE
 .idea/

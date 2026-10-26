@@ -3,6 +3,12 @@
 An open-source Sony PlayStation (PS1) emulator written in Rust, compiled to WebAssembly
 so it runs directly in a web browser (and natively, through the same core).
 
+**Try it:** <https://codingchar.github.io/RS1Emulator/> — bring your own BIOS and games;
+nothing leaves your browser.
+
+[![CI](https://github.com/CodingChar/RS1Emulator/actions/workflows/ci.yml/badge.svg)](https://github.com/CodingChar/RS1Emulator/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-e8955c.svg)](LICENSE)
+
 **Architecture reference:** [DuckStation](https://github.com/stenzek/duckstation)
 (used only for design reference — no code is copied; DuckStation is licensed under
 CC BY-NC-ND 4.0, which is not a free/libre license). Hardware details come from the
@@ -39,10 +45,10 @@ disc: a `.cue` with its `.bin` files, a single `.bin`, an `.iso`, or a PS-EXE pr
 | Controls | keyboard (rebindable) and USB or Bluetooth gamepads (per-pad port, button map, dead zone and rumble test in Settings → Mandos); by default the second gamepad drives port 2 |
 | Analog | F9 or the quick menu toggles the DualShock analog mode; vibration uses the Gamepad API |
 | Interface | menu bar, toolbar and a settings dialog; a full-screen style quick menu (Esc, F1 or the gamepad Home button; Alt+Enter for full screen) with save/load slots, disc swap, speed, volume, analog mode and display options, navigable by keyboard, gamepad or mouse; on-screen messages |
-| Saves | memory cards 1 and 2 persist in IndexedDB (export/import/format); three save-state slots |
+| Saves | memory cards 1 and 2 persist in IndexedDB (export, import of raw dumps, DexDrive `.gme` and PSP/PS3 `.vmp`, format); three save-state slots |
 | Speed | ×1, ×2, ×4 or maximum; volume, mute and speed are remembered |
 | Discs | `.cue`/`.bin` (with `PREGAP`, `POSTGAP` and `INDEX 00`), `.iso`, CloneCD `.ccd`/`.img`, optional `.sbi` |
-| Timing | multiply/divide and GTE latencies, GPU busy time, DMA durations and chopping, CD seek time by distance, timers 0/1 synchronised with the blanking |
+| Timing | multiply/divide and GTE latencies, RAM read latency, GPU busy time, DMA durations and chopping, CD seek time by distance, timers 0/1 synchronised with the blanking |
 | Guide | [docs/guia-de-usuario.md](docs/guia-de-usuario.md) (Spanish) |
 
 The emulator runs in a Web Worker (`web/worker.js`): it draws into a transferred
@@ -74,6 +80,21 @@ audio recording, disassembly):
 ```bash
 cargo run --release -p ps1-core --example boot --target x86_64-pc-windows-msvc -- \
     --disc "rom_test/<game>/<game>.cue" --bios path/to/bios.bin --steps 20000000
+```
+
+To get a game to a given screen it can also press buttons at chosen CPU cycles
+(`--press 0x4000@1900000000-1970000000`), plug memory cards (`--card 1=card.mcr`), run a
+PS-X EXE (`--exe`), and log the kernel calls (`--bios-call B0:4F`), the arguments at an
+address (`--log-pc`) or the interrupt status (`--irq-log`); the header of
+`crates/ps1-core/examples/boot.rs` lists them all.
+
+Three tests need the BIOS (and, for two of them, a disc) under `rom_test/` and are ignored by
+default because they boot it: the games reach their title or memory card screens, and the BIOS
+memory card manager copies a save between cards. Run them in release mode:
+
+```bash
+cargo test --release -p ps1-core --target x86_64-pc-windows-msvc \
+    --test boot_games --test memory_card_bios -- --ignored
 ```
 
 ### Benchmarks and equivalence checks
