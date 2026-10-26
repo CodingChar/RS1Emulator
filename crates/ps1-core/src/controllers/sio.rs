@@ -660,4 +660,42 @@ mod tests {
         assert_eq!(rig.transfer(0x81), Some(0xFF));
         assert_eq!(rig.transfer(b'S'), Some(0xFF), "floating line: no card");
     }
+
+    #[test]
+    fn writing_a_memory_card_through_the_port() {
+        let mut rig = Rig::new();
+        rig.devices.insert_memory_card(0, MemoryCard::formatted());
+        rig.select(BIOS_CTRL);
+
+        let data: Vec<u8> = (0..128u32).map(|i| (i * 5 + 1) as u8).collect();
+        let sector = 0x0123 & 0x3FF;
+        let checksum = data.iter().fold((sector >> 8) as u8 ^ sector as u8, |a, b| a ^ b);
+
+        let mut sent = vec![0x81, b'W', 0, 0, (sector >> 8) as u8, sector as u8];
+        sent.extend_from_slice(&data);
+        sent.push(checksum);
+        sent.extend_from_slice(&[0, 0, 0]);
+        let reply: Vec<u8> = sent.iter().map(|byte| rig.transfer(*byte).expect("the card answers")).collect();
+
+        assert_eq!(&reply[reply.len() - 3..], &[0x5C, 0x5D, b'G'], "the card acknowledges a good write");
+        let card = rig.devices.memory_card(0).unwrap();
+        assert_eq!(&card.data()[sector as usize * 128..(sector as usize + 1) * 128], &data[..]);
+        assert!(card.is_dirty());
+    }
+
+    #[test]
+    fn a_card_exchange_ends_when_the_port_is_deselected() {
+        let mut rig = Rig::new();
+        rig.devices.insert_memory_card(0, MemoryCard::formatted());
+        rig.select(BIOS_CTRL);
+        for byte in [0x81, b'R', 0, 0, 0, 1] {
+            rig.transfer(byte);
+        }
+        // Released half way through a sector: the next exchange starts from scratch.
+        rig.select(0x1001);
+        rig.select(BIOS_CTRL);
+        assert_eq!(rig.transfer(0x81), Some(0xFF));
+        assert_eq!(rig.transfer(b'S'), Some(0x08));
+        assert_eq!(rig.transfer(0), Some(0x5A));
+    }
 }

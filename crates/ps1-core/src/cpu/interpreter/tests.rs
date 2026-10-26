@@ -1164,6 +1164,89 @@ fn the_fast_path_and_the_exact_one_agree_on_timing() {
     assert!(compared > 20, "only {compared} lengths compared");
 }
 
+// ----- Memory timing -----
+
+#[test]
+fn a_data_read_from_ram_waits_for_the_dram() {
+    for load in [lb(2, DATA as i32, 0), lbu(2, DATA as i32, 0), lh(2, DATA as i32, 0), lhu(2, DATA as i32, 0), lw(2, DATA as i32, 0), lwl(2, DATA as i32, 0), lwr(2, DATA as i32, 0)] {
+        let mut m = Machine::new(&[load]);
+        assert_eq!(cycles_to_run(&mut m, 1), 1 + RAM_READ_CYCLES, "instruction {load:#010x}");
+    }
+}
+
+#[test]
+fn only_reads_of_main_ram_wait() {
+    // Stores go through the write buffer; the scratchpad is on the chip.
+    let mut m = Machine::new(&[lui(1, 0x1F80), lw(2, 0, 1), sw(2, 0, 1), sw(2, DATA as i32, 0), sb(2, DATA as i32, 0), addiu(3, 3, 1)]);
+    assert_eq!(cycles_to_run(&mut m, 6), 6);
+}
+
+#[test]
+fn the_mirrors_of_ram_wait_too() {
+    // KSEG1 and the 2 MB mirrors reach the same DRAM.
+    let mut m = Machine::new(&[lui(1, 0xA000), lw(2, DATA as i32, 1), lui(1, 0x0060), lw(2, DATA as i32, 1)]);
+    assert_eq!(cycles_to_run(&mut m, 4), 4 + 2 * RAM_READ_CYCLES);
+}
+
+#[test]
+fn a_read_that_faults_is_not_charged() {
+    let mut m = Machine::new(&[lw(2, DATA as i32 + 1, 0)]);
+    m.step();
+    assert_eq!(m.exc_code(), Exception::AddressErrorLoad as u32);
+    assert_eq!(m.cpu.take_extra_cycles(), 0);
+}
+
+#[test]
+fn reads_overlap_with_a_multiply_in_flight() {
+    // MULT by a small value takes 6 cycles; the wait for a RAM read counts
+    // towards it, so the result is ready by the time MFLO runs.
+    let mut m = Machine::new(&[mult(1, 2), lw(4, DATA as i32, 0), mflo(3)]);
+    m.cpu.regs[1] = 3;
+    m.cpu.regs[2] = 5;
+    assert_eq!(cycles_to_run(&mut m, 3), 3 + RAM_READ_CYCLES, "no stall left for MFLO");
+    assert_eq!(m.reg(3), 15);
+}
+
+#[test]
+fn the_fast_path_and_the_exact_one_agree_on_memory_timing() {
+    let program = [
+        mult(1, 2), lw(3, DATA as i32, 0), lbu(4, DATA as i32 + 1, 0), mflo(5), addiu(6, 6, 1),
+        div(1, 2), lhu(7, DATA as i32, 0), lb(8, DATA as i32, 0), mfhi(9), sw(3, DATA as i32 + 8, 0), lw(10, DATA as i32 + 8, 0), j(CODE), NOP,
+    ];
+    let setup = |m: &mut Machine| {
+        m.cpu.regs[1] = 0x12345;
+        m.cpu.regs[2] = 7;
+        m.poke32(DATA, 0x8899_AABB);
+    };
+    let mut compared = 0;
+    for target in 100..500u64 {
+        let mut fast = Machine::new(&program);
+        setup(&mut fast);
+        let (ran, result) = fast.cpu.run(&mut fast.bus, target);
+        result.unwrap();
+
+        let mut exact = Machine::new(&program);
+        setup(&mut exact);
+        let mut cycles = 0u64;
+        while cycles < target {
+            exact.cpu.set_irq(exact.bus.interrupt.pending());
+            exact.step();
+            let spent = 1 + exact.cpu.take_extra_cycles();
+            exact.bus.tick(spent);
+            cycles += spent as u64;
+        }
+        if cycles != target {
+            continue;
+        }
+        compared += 1;
+        assert_eq!(ran, cycles);
+        assert_eq!(fast.cpu.pc, exact.cpu.pc, "target {target}");
+        assert_eq!(fast.cpu.regs, exact.cpu.regs, "target {target}");
+        assert_eq!(fast.cpu.hilo_busy, exact.cpu.hilo_busy, "target {target}");
+    }
+    assert!(compared > 20, "only {compared} lengths compared");
+}
+
 // ----- GTE timing -----
 
 #[test]

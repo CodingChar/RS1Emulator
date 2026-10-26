@@ -33,7 +33,8 @@ fn find_cue(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn boot(game: &str, steps: u64) -> Option<System> {
+/// A console with the BIOS and the disc of `game`, reset and ready to run.
+fn console(game: &str) -> Option<System> {
     let bios = std::fs::read(rom_test().join("SCPH1001.BIN")).ok()?;
     let cue = find_cue(game)?;
     let text = std::fs::read_to_string(&cue).ok()?;
@@ -45,6 +46,11 @@ fn boot(game: &str, steps: u64) -> Option<System> {
     let mut sys = System::new();
     sys.load_bios(&bios).expect("BIOS image too large");
     sys.insert_disc_image(disc);
+    Some(sys)
+}
+
+fn boot(game: &str, steps: u64) -> Option<System> {
+    let mut sys = console(game)?;
     sys.reset().expect("reset");
     for _ in 0..steps {
         sys.step().expect("the emulated CPU must not fail");
@@ -68,4 +74,39 @@ fn crash_bandicoot_reaches_the_title_menu() {
     // A hung or blank boot shows a flat or black frame.
     let n = colours(&sys);
     assert!(n > 1000, "expected the title screen, found {n} colours");
+}
+
+const START: u16 = 0x0008;
+const DOWN: u16 = 0x0040;
+const CROSS: u16 = 0x4000;
+
+/// Resident Evil waits for the memory card with a loop of a fixed number of
+/// iterations, while the BIOS reads the directory one sector every two frames.
+/// The CPU has to be slow enough (see `RAM_READ_CYCLES`) for the loop to outlast
+/// the 36 sectors, or the game gives up with ACCESS ERROR on a good card.
+#[test]
+#[ignore = "boots a real game for ~2.6 billion cycles"]
+fn resident_evil_reads_a_formatted_card_from_its_load_game_screen() {
+    let Some(mut sys) = console("Resident Evil") else {
+        eprintln!("skipped: no BIOS or Resident Evil disc under rom_test/");
+        return;
+    };
+    sys.insert_formatted_memory_card(0);
+    sys.reset().expect("reset");
+
+    // `(button, first cycle, last cycle)`: any button on the title screen opens the menu,
+    // then down to LOAD GAME and cross.
+    let presses = [(START, 1_430_000_000u64, 1_500_000_000u64), (DOWN, 1_750_000_000, 1_800_000_000), (CROSS, 1_900_000_000, 1_970_000_000)];
+    while sys.cycles < 2_600_000_000 {
+        let held = presses.iter().filter(|(_, first, last)| (*first..*last).contains(&sys.cycles)).fold(0, |m, (b, _, _)| m | b);
+        sys.set_input(0, held, 0, 0, 0, 0);
+        sys.run_cycles(500_000).expect("the emulated CPU must not fail");
+    }
+
+    // The BIOS reads the 36 sectors of the header and directory when the game starts the card
+    // services, and the load game screen reads them again: a game that gave up part way would
+    // leave the count short.
+    let card = sys.bus.controllers.memory_card(0).expect("the card is inserted");
+    assert!(card.sectors_read() >= 72, "only {} sectors read: the game gave up on the card", card.sectors_read());
+    assert!(card.sectors_written() >= 1, "the BIOS writes a test sector when it brings the card up");
 }

@@ -1,29 +1,32 @@
 # Errores conocidos
 
-## 1. «ACCESS ERROR» al guardar en Resident Evil (tarjeta 1, web)
+## 1. «ACCESS ERROR» en la pantalla de tarjetas de Resident Evil (USA)
 
-**Síntoma.** En la pantalla «MEMORY CARD 1» de Resident Evil (USA), al intentar guardar la partida aparece `ACCESS ERROR`. Ocurre en el emulador web (`http://localhost:8080`, navegador Chrome/Edge).
+**Estado.** Resuelto. La causa estaba en el modelo de tiempos de la CPU, no en las tarjetas.
 
-**Captura.** `C:\Users\Pollito\AppData\Local\Temp\claude\C--Users-Pollito-Desktop-developments-RS1Emu\29e30781-238e-4de5-a7e7-e5770378966a\images\1.png`
+**Síntoma.** En la pantalla «MEMORY CARD 1» de Resident Evil (USA), al guardar o cargar, aparecía `ACCESS ERROR` aunque la tarjeta estuviera formateada. Se veía en el emulador web (Chrome/Edge) y se reprodujo igual en el arnés nativo.
 
-**Estado en la captura.** La barra de estado dice «Tarjeta 2 formateada.», así que la tarjeta 2 se formateó, pero el error aparece con la tarjeta 1 seleccionada en el juego. Falta comprobar si la tarjeta 1 llegó a formatearse o si la tarjeta 2 es la que el juego usa.
+**Causa.**
+1. Al abrir la pantalla, el juego pide a la BIOS `_card_load`, que lee 36 sectores (cabecera, directorio y lista de sectores defectuosos). El núcleo de la BIOS atiende la tarjeta desde el manejador del blanking vertical y solo la mira una vez cada dos vblanks, así que cada sector tarda **2 fotogramas**: unos 41 millones de ciclos (1,2 s) para los 36.
+2. Mientras tanto el juego espera los eventos de la tarjeta con un bucle de **249 999 iteraciones** (`0x3D08F`, cuatro `TestEvent` por vuelta), sin mirar el reloj. Si el bucle acaba antes de que llegue el evento, da error.
+3. El modelo de la CPU cobraba **1 ciclo por instrucción**, también para las lecturas de RAM. Cada vuelta costaba ~172 ciclos y el bucle duraba ~40,6 millones: 1 % menos de lo que necesitaba la BIOS. El juego se rendía tras leer 33 de los 36 sectores. En la consola real una lectura de RAM tarda unos 6 ciclos (la R3000A de la PS1 no tiene caché de datos); con esa latencia cada vuelta cuesta ~231 ciclos y el bucle dura ~57,7 millones (1,7 s), un 40 % más de lo que necesita la BIOS.
 
-**Dónde mirar.**
-- Web: `web/app.js` (sección «Memory cards», `CARD_COUNT = 2`), `web/worker.js` (`persistCards`, `cardCommand`, líneas 286–320) y `web/storage.js` (IndexedDB, clave `card${port}`).
-- Núcleo: `crates/ps1-core/src/controllers/memory_card.rs` (formato, cabecera, sectores y checksums) y `crates/ps1-core/src/controllers/sio.rs` (protocolo de la tarjeta).
-- `crates/ps1-core/src/system.rs`: `insert_memory_card`, `insert_formatted_memory_card` y `memory_card_data`.
+**Cómo se comprobó.** Con `boot --card` y `--press` se llevó el juego a LOAD GAME en nativo y se reprodujo el error. Con `--bios-call` se vio que la BIOS leía los sectores 0 a 32 y se paraba, que el juego volvía a pedir `_card_load` justo cuando agotaba el bucle y que el tiempo entre sectores no dependía de la velocidad del puerto serie (se probó con el puerto 4× más rápido). Al cobrar 5 ciclos por cada lectura de RAM, la pantalla pasa por «CHECKING MEMORY CARD» y muestra «THERE IS NO FILE».
 
-**Hipótesis a comprobar (sin verificar).**
-1. El juego escribe en la tarjeta 1, pero el frontend solo guarda la tarjeta cuando `memory_card_dirty` está activo, así que puede que la escritura no llegue a IndexedDB.
-2. La tarjeta 1 no está formateada: el juego lee un sistema de archivos vacío y muestra el error al no encontrarlo.
-3. El protocolo de escritura falla con un checksum o un sector inválido, y el juego lo presenta como `ACCESS ERROR`. Los tests de `memory_card.rs` cubren checksums incorrectos, así que la lógica básica parece correcta; falta comprobar la ruta completa con el juego real.
-4. El estado de la tarjeta se guarda o se carga mal entre el worker y el hilo principal al cambiar de ranura.
+**Arreglo.** `RAM_READ_CYCLES = 5` (`cpu/interpreter.rs`): cada lectura de RAM cuesta 5 ciclos más que el ciclo de la instrucción, en el camino exacto y en el rápido (`cpu/interpreter/fast.rs`). La multiplicación, la división y el GTE siguen trabajando durante la espera. No se cobran escrituras (buffer de escritura), búsquedas de instrucciones (caché de instrucciones no modelada), BIOS ni registros de E/S.
 
-**Cómo reproducir.**
-1. Abrir el emulador web, cargar la BIOS y el disco de Resident Evil.
-2. Entrar en la pantalla de tarjetas del juego (MEMORY CARD 1) y guardar.
-3. Observar si aparece `ACCESS ERROR` y anotar la barra de estado.
+**Pruebas.**
+- `cpu/interpreter/tests.rs`: coste de cada tipo de carga, de escrituras, del scratchpad, de los espejos de RAM, de lecturas que fallan, solapamiento con `mult` y equivalencia entre el camino rápido y el exacto.
+- `tests/boot_games.rs` (ignorado, necesita BIOS y disco): Resident Evil lee los 72 sectores de la tarjeta (36 al arrancar y 36 en LOAD GAME). Sin el arreglo lee 69 y falla.
+- `tests/memory_card_bios.rs` (ignorado, necesita BIOS): el gestor de tarjetas de la BIOS copia una partida de la tarjeta 1 a la 2 con sus propios servicios de lectura y escritura. Si el núcleo descartara las escrituras, falla.
+- `controllers/`: lectura y escritura de los 1024 sectores, errores de checksum y de sector, sesiones cortadas, reinicio de la tarjeta y escritura a través de los registros del puerto serie.
 
-**Pendiente de comprobar.** Si la tarjeta 1 funciona tras formatear desde la interfaz web («Formatear» en el menú de tarjetas). Esto decide si el fallo es de formato o de escritura.
+**Hipótesis descartadas.** La tarjeta 1 sí se formatea y se guarda (IndexedDB) y el protocolo de lectura y escritura sigue la especificación y el comportamiento de DuckStation; el fallo no dependía de ellos.
 
-**Estado.** Abierto. No se ha reproducido con el arnés nativo todavía.
+**Cambios relacionados en las tarjetas.**
+- Al reiniciar la consola las tarjetas vuelven a anunciarse como nuevas (bit 3 del estado), como al encender la consola.
+- Una escritura rechazada (checksum o sector erróneos) activa el bit 2 del estado, y una buena lo borra.
+- Se aceptan imágenes `.gme` (DexDrive) y `.vmp` (PSP/PS3) además del volcado crudo de 128 KB; se guarda siempre el volcado crudo.
+- La página avisa si no puede guardar una tarjeta en el navegador (y lo reintenta) y guarda también al ocultarse la pestaña.
+
+**Sin comprobar.** Guardar una partida desde dentro de Resident Evil (hace falta jugar hasta una máquina de escribir y tener cinta de tinta). Lo que sí se comprobó: el juego lee la tarjeta desde LOAD GAME y la BIOS escribe y copia archivos con los mismos servicios de escritura que usan los juegos. Tampoco se ha probado con una partida real en el navegador; en la página se probaron la importación y el rechazo de archivos, y las funciones nuevas del módulo WebAssembly.

@@ -13,7 +13,7 @@
 //! checksum tests in `examples/bench.rs` check that over billions of
 //! instructions.
 
-use super::{multiply_latency, Interpreter, COP0_SR, DIVIDE_LATENCY, SR_CU2, SR_ISC, SR_KUC};
+use super::{multiply_latency, Interpreter, COP0_SR, DIVIDE_LATENCY, RAM_READ_CYCLES, SR_CU2, SR_ISC, SR_KUC};
 use crate::bus::Bus;
 use crate::gte::Gte;
 use crate::io::{read_le, write_le};
@@ -139,6 +139,14 @@ impl Interpreter {
                     extra += (gte_until - now).min(limit - now - 1);
                 }
                 gte_until = 0;
+            }};
+        }
+        // A data read from main RAM waits for the DRAM (the exact path charges the same).
+        macro_rules! charge_ram_read {
+            ($phys:expr) => {{
+                if $phys < RAM_MIRROR_END {
+                    extra += RAM_READ_CYCLES;
+                }
             }};
         }
         // Where a data address lives, or stop and let the slow path handle it.
@@ -402,6 +410,7 @@ impl Interpreter {
                         break;
                     };
                     commit!();
+                    charge_ram_read!(phys);
                     let value = if instr >> 26 == 0x20 { raw as i8 as i32 as u32 } else { raw as u32 };
                     load!(rt, value);
                 }
@@ -417,6 +426,7 @@ impl Interpreter {
                         break;
                     };
                     commit!();
+                    charge_ram_read!(phys);
                     let value = if instr >> 26 == 0x21 { raw as i16 as i32 as u32 } else { raw as u32 };
                     load!(rt, value);
                 }
@@ -432,6 +442,7 @@ impl Interpreter {
                         break;
                     };
                     commit!();
+                    charge_ram_read!(phys);
                     load!(rt, value);
                 }
                 // ---- stores (RAM and scratchpad only; I/O goes the slow way)
@@ -539,6 +550,7 @@ impl Interpreter {
                     };
                     commit!();
                     stall_for_gte!();
+                    charge_ram_read!(phys);
                     self.gte.write_data(rt, value);
                 }
                 // SWC2: store a GTE data register.

@@ -19,7 +19,7 @@ de memoria persistentes y estados guardados completos.
 | Entrada | pad digital, DualShock (analógico, configuración, vibración), 2 puertos, tarjetas de memoria |
 | Web | emulador en un worker, disco leído bajo demanda, audio por AudioWorklet, ajustes persistentes; menú de ventana, menú rápido a pantalla completa, mandos USB/Bluetooth configurables |
 | Temporización | latencia de mult/div y del GTE, GPU ocupada mientras dibuja, DMA con duración (y troceado), búsqueda del CD según la distancia, timers 0/1 sincronizados con el blanking |
-| Pruebas | 490 tests; benchmark con checksum del estado; ida y vuelta de estados con un juego real |
+| Pruebas | 507 tests (y 3 más, ignorados, que arrancan la BIOS y juegos reales); benchmark con checksum del estado; ida y vuelta de estados con un juego real |
 
 **Velocidad** (portátil Core i3-8130U; las medidas oscilan ±10 % con la temperatura, por eso
 se comparan siempre ejecuciones alternadas): nativo 60–100 M instr/s (2–3× el tiempo real);
@@ -37,7 +37,8 @@ descartaron con una razón técnica están en la sección «Decisiones» del fin
 - [x] README con cómo compilar y probar en host (`.cargo/config.toml` fuerza `wasm32-unknown-unknown`).
 - [x] Harness `examples/boot.rs` (BIOS, disco, capturas, volcados) y test de la imagen de disco local en `rom_test/` (se omite si no existe; la carpeta está en `.gitignore`).
 - [x] `examples/bench.rs`: velocidad, checksum de todo el estado, bucles sintéticos, entrada simulada, `--roundtrip` de estados y, con `--features profile`, el reparto del tiempo por área.
-- [x] `tests/boot_games.rs`: Crash Bandicoot llega al menú del título (ignorado por defecto, ~1 min: `cargo test --release ... --test boot_games -- --ignored`; se omite sin BIOS o disco).
+- [x] `tests/boot_games.rs`: Crash Bandicoot llega al menú del título y Resident Evil lee la tarjeta de memoria desde LOAD GAME (ignorados por defecto, ~1 min cada uno: `cargo test --release ... --test boot_games -- --ignored`; se omiten sin BIOS o disco).
+- [x] `tests/memory_card_bios.rs`: el gestor de tarjetas de la BIOS, manejado con pulsaciones, copia una partida de una tarjeta a otra con sus servicios de lectura y escritura (ignorado, ~30 s; se omite sin BIOS).
 - [x] CI (`.github/workflows/ci.yml`): tests nativos y build de WebAssembly.
 - [ ] ROMs de prueba de CPU de dominio público (`psxtest_cpu`, suite de `amidog`): hacen falta los binarios, que no están en el repositorio.
 
@@ -49,7 +50,8 @@ Archivos: `cpu/interpreter.rs` (referencia, exacto), `cpu/interpreter/fast.rs` (
 - [x] Los accesos a direcciones sin dispositivo lanzan excepciones de bus (IBE/DBE) en lugar de detener la emulación.
 - [x] Camino rápido: ALU, saltos, cargas/almacenamientos a RAM, scratchpad y BIOS, mult/div, movimientos y comandos del GTE en un bucle con el estado en variables locales; cae al camino exacto ante cualquier otra cosa. Los checksums del benchmark son idénticos con y sin él.
 - [x] Temporizar `mult`/`div` (6/9/13 y 36 ciclos): el resultado se lee con espera solo si se pide antes de tiempo, igual en el camino rápido y en el exacto (pruebas de equivalencia). Un lote del camino rápido corta la espera al final para no saltarse ningún evento de dispositivo.
-- [ ] Temporizar los accesos a memoria (hoy cada instrucción cuesta un ciclo): exigiría una caché de instrucciones y el búfer de escritura, y sin una referencia que lo valide cambiaría la velocidad de los juegos a ciegas.
+- [x] Cobrar la latencia de las lecturas de RAM (`RAM_READ_CYCLES`, 5 ciclos más por lectura, igual en el camino rápido y en el exacto, con pruebas de equivalencia). La referencia que la valida: Resident Evil espera la tarjeta con un bucle de iteraciones y daba `ACCESS ERROR` con 1 ciclo por lectura (ver `docs/errores-conocidos.md`).
+- [ ] Resto de la temporización de memoria: escrituras con su búfer, lecturas de BIOS y de E/S, y búsqueda de instrucciones con la caché de 4 KB. Sin una referencia que lo valide cambiaría la velocidad de los juegos a ciegas; las lecturas de RAM, que sí tienen una, ya están.
 
 ## Fase 2 — Bus y mapa de memoria · HECHA
 
@@ -191,3 +193,4 @@ el arranque de la BIOS; WebAssembly 6 → 35 M y 10 → 45 M.
 4. **M4** — Arranca un juego de prueba con imagen y entrada. ✔
 5. **M5** — Juego 3D con audio, FMV y partida jugable en el navegador. ✔ (Resident Evil; el audio se comprobó por espectro, no de oídas).
 6. **M6** — Segundo juego: Crash Bandicoot (USA) llega al menú y, con `boot --press` (Start y Cruz), entra en la primera fase con Crash controlable. (parcial: solo en nativo con entrada simulada, ~3000 M de instrucciones, comprobado con capturas; sin probar en el navegador, con audio ni más allá de los primeros segundos de la fase).
+7. **M7** — Tarjetas de memoria de punta a punta: la BIOS copia una partida de una tarjeta a otra y Resident Evil lee la tarjeta desde LOAD GAME sin `ACCESS ERROR`. ✔ (parcial: no se ha guardado una partida desde dentro de Resident Evil, solo con los servicios de la BIOS, ni se ha probado con una partida real en el navegador).

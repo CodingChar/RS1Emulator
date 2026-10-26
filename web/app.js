@@ -829,7 +829,7 @@ function setupCardControls() {
         const file = document.createElement('input');
         file.type = 'file';
         file.className = 'hidden-input';
-        file.accept = '.mcr,.mcd,.mc,.bin,.srm,.vmp';
+        file.accept = '.mcr,.mcd,.mc,.bin,.srm,.gme,.vmp,.mem,.ps1';
 
         exportButton.addEventListener('click', () => worker.postMessage({ type: 'card', op: 'export', port }));
         importButton.addEventListener('click', () => file.click());
@@ -1019,8 +1019,14 @@ function updatePadLive() {
 }
 
 
-window.addEventListener('pagehide', () => {
+// Store the cards as soon as the page goes away: closing the tab or switching to
+// another one (mobile browsers may never send `pagehide`).
+function flushCards() {
     if (worker) worker.postMessage({ type: 'flush-cards' });
+}
+window.addEventListener('pagehide', flushCards);
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushCards();
 });
 
 // ----- Full screen -----

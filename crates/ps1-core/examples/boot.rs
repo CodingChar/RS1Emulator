@@ -9,6 +9,19 @@
 //!     --bios path/to/your/bios.bin --steps 20000000
 //! ```
 //!
+//! Options to drive a game and see what it does (the cycle counts are CPU
+//! cycles, the same clock as `System::cycles`):
+//!
+//! * `--press MASK@FIRST-LAST`: hold pad buttons (a hex mask) between two cycle counts.
+//! * `--card SLOT=FILE`: plug a memory card (slot 1 or 2); a missing file starts a
+//!   formatted card, and a card the game wrote to is saved back at the end.
+//! * `--exe FILE`: run a PS-X EXE in place of the BIOS shell.
+//! * `--bios-call TABLE:FUNCTION`: log each call to a kernel function (hex, as in
+//!   `B0:4F` for `_card_read`) with its arguments.
+//! * `--log-pc ADDR`: log the arguments each time the CPU reaches an address.
+//! * `--irq-log FROM-TO`: log the changes of the interrupt status between two cycle counts.
+//! * `--gpu-regs`: print the GPU registers at the end.
+//!
 //! Neither a BIOS nor a game is bundled with this repository; bring your own
 //! dumps.
 
@@ -49,16 +62,26 @@ struct Args {
     screenshot: Option<PathBuf>,
     /// Save the whole 1024x512 VRAM as a PNG after the run (`--vram`).
     vram: Option<PathBuf>,
-    /// Scripted button presses `(mask, first, last)` (`--press MASK@FIRST-LAST`, instruction counts).
+    /// Scripted button presses `(mask, first, last)` (`--press MASK@FIRST-LAST`, CPU cycles).
     presses: Vec<(u16, u64, u64)>,
     /// Print the GPU registers after the run (`--gpu-regs`).
     gpu_regs: bool,
+    /// BIOS calls to log, `(table 0xA0/0xB0/0xC0, function)` (`--bios-call B0:07`).
+    bios_calls: Vec<(u32, u32)>,
+    /// Log interrupt-status changes while the cycle counter is in this range (`--irq-log FROM-TO`).
+    irq_log: Option<(u64, u64)>,
+    /// Addresses whose arguments and return address are logged each time they run (`--log-pc`).
+    log_pcs: Vec<u32>,
+    /// A PS-X EXE to run in place of the shell (`--exe`).
+    exe: Option<PathBuf>,
+    /// Memory cards `(slot 0/1, image path)` (`--card 1=card1.mcd`): a missing file starts a formatted card, saved back after the run if the game wrote to it.
+    cards: Vec<(usize, PathBuf)>,
     /// Print the last N executed instructions (`--trace N`; needs `--features trace`).
     trace: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None, trace: 0, presses: Vec::new(), gpu_regs: false };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None, trace: 0, presses: Vec::new(), gpu_regs: false, cards: Vec::new(), bios_calls: Vec::new(), irq_log: None, exe: None, log_pcs: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -91,6 +114,36 @@ fn parse_args() -> Result<Args, String> {
                 args.watch.push(addr);
             }
             "--gpu-regs" => args.gpu_regs = true,
+            "--bios-call" => {
+                let text = value("--bios-call")?;
+                let bad = || "--bios-call TABLE:FUNCTION in hex (A0:78, B0:07)".to_string();
+                let (table, function) = text.split_once(':').ok_or_else(bad)?;
+                let hex = |t: &str| u32::from_str_radix(t, 16).map_err(|_| bad());
+                args.bios_calls.push((hex(table)?, hex(function)?));
+            }
+            "--irq-log" => {
+                let text = value("--irq-log")?;
+                let bad = || "--irq-log FROM-TO in cycles".to_string();
+                let (from, to) = text.split_once('-').ok_or_else(bad)?;
+                let num = |t: &str| t.replace('_', "").parse::<u64>().map_err(|_| bad());
+                args.irq_log = Some((num(from)?, num(to)?));
+            }
+            "--log-pc" => {
+                let text = value("--log-pc")?;
+                let addr = u32::from_str_radix(text.trim_start_matches("0x"), 16).map_err(|e| format!("--log-pc: {e}"))?;
+                args.log_pcs.push(addr);
+            }
+            "--exe" => args.exe = Some(PathBuf::from(value("--exe")?)),
+            "--card" => {
+                let text = value("--card")?;
+                let bad = || "--card SLOT=FILE (slot 1 or 2)".to_string();
+                let (slot, file) = text.split_once('=').ok_or_else(bad)?;
+                let slot: usize = slot.parse().map_err(|_| bad())?;
+                if !(1..=2).contains(&slot) {
+                    return Err(bad());
+                }
+                args.cards.push((slot - 1, PathBuf::from(file)));
+            }
             "--press" => {
                 let text = value("--press")?;
                 let bad = || "--press MASK@FIRST-LAST".to_string();
@@ -248,7 +301,37 @@ fn run_bios(
             }
         }
     }
+    for (slot, path) in &args.cards {
+        match std::fs::read(path) {
+            Ok(data) => match sys.insert_memory_card(*slot, data) {
+                Ok(()) => println!("Card {}: loaded {}", slot + 1, path.display()),
+                Err(e) => {
+                    eprintln!("card: {}: {e}", path.display());
+                    std::process::exit(1);
+                }
+            },
+            Err(_) => {
+                sys.insert_formatted_memory_card(*slot);
+                println!("Card {}: new formatted card for {}", slot + 1, path.display());
+            }
+        }
+        sys.clear_memory_card_dirty(*slot);
+    }
+    if let Some(path) = &args.exe {
+        let data = std::fs::read(path).unwrap_or_else(|e| {
+            eprintln!("exe: {}: {e}", path.display());
+            std::process::exit(1);
+        });
+        if let Err(e) = sys.load_exe(&data) {
+            eprintln!("exe: {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
     sys.reset().expect("reset");
+    // The BIOS has to reach its shell, which the program then replaces.
+    while sys.exe_pending() {
+        sys.run_cycles(100_000).expect("run the BIOS up to its shell");
+    }
 
     let mut recent_pcs = vec![0u32; 16];
     let mut histogram: HashMap<u32, u64> = HashMap::new();
@@ -256,6 +339,8 @@ fn run_bios(
     let mut executed = 0u64;
     // Buttons currently held by the `--press` script.
     let mut held = 0u16;
+    let mut last_stat = 0u32;
+    let mut logged_pcs = 0u32;
     let mut failure = None;
     // Audio drained from the SPU, as interleaved 16-bit samples.
     let mut audio: Vec<i16> = Vec::new();
@@ -273,8 +358,35 @@ fn run_bios(
             entry.1 += 1;
             entry.2.get_or_insert(i);
         }
+        if !args.log_pcs.is_empty() && args.log_pcs.contains(&pc) && logged_pcs < 400 {
+            logged_pcs += 1;
+            let r = &sys.cpu.regs;
+            eprintln!(
+                "  PC {pc:08X} cyc={} line={} a0={:08X} a1={:08X} a2={:08X} sp={:08X} ra={:08X}",
+                sys.cycles, sys.bus.gpu.scanline, r[4], r[5], r[6], r[29], r[31]
+            );
+        }
+        if let Some((from, to)) = args.irq_log {
+            let stat = sys.bus.interrupt.stat;
+            if stat != last_stat {
+                if sys.cycles >= from && sys.cycles < to {
+                    eprintln!("  IRQ cyc={} line={} I_STAT {last_stat:03X} -> {stat:03X} pc={pc:08X}", sys.cycles, sys.bus.gpu.scanline);
+                }
+                last_stat = stat;
+            }
+        }
+        if !args.bios_calls.is_empty() && matches!(pc & 0x1FFF_FFFF, 0xA0 | 0xB0 | 0xC0) {
+            let (table, function) = (pc & 0xFF, sys.cpu.regs[9]);
+            if args.bios_calls.contains(&(table, function)) {
+                let r = &sys.cpu.regs;
+                eprintln!(
+                    "  [{executed:>10}] cyc={} line={} {table:02X}({function:02X}) a0={:08X} a1={:08X} a2={:08X} ra={:08X}",
+                    sys.cycles, sys.bus.gpu.scanline, r[4], r[5], r[6], r[31]
+                );
+            }
+        }
         if !args.presses.is_empty() {
-            let mask = args.presses.iter().filter(|(_, first, last)| i >= *first && i < *last).fold(0, |m, (bits, _, _)| m | bits);
+            let mask = args.presses.iter().filter(|(_, first, last)| sys.cycles >= *first && sys.cycles < *last).fold(0, |m, (bits, _, _)| m | bits);
             if mask != held {
                 held = mask;
                 sys.set_input(0, held, 0, 0, 0, 0);
@@ -341,7 +453,7 @@ fn run_bios(
         #[cfg(not(feature = "trace"))]
         eprintln!("--trace needs the `trace` feature: cargo run --features trace ...");
     }
-    println!("\nExecuted {executed} instructions.");
+    println!("\nExecuted {executed} instructions ({} CPU cycles).", sys.cycles);
     println!("pc = {:#010X}", sys.cpu.pc);
     if let Some(e) = failure {
         println!("STOPPED: {e}");
@@ -405,6 +517,17 @@ fn run_bios(
     }
     if args.gpu_regs {
         println!("gpu registers: {:08X?}", sys.bus.gpu.save_registers());
+    }
+    for (slot, path) in &args.cards {
+        if sys.memory_card_dirty(*slot) {
+            let data = sys.memory_card_data(*slot).expect("the card was inserted");
+            match std::fs::write(path, data) {
+                Ok(()) => println!("Card {}: the game wrote to it, saved to {}", slot + 1, path.display()),
+                Err(e) => eprintln!("card: {}: {e}", path.display()),
+            }
+        } else {
+            println!("Card {}: untouched", slot + 1);
+        }
     }
     if let Some(path) = &args.screenshot {
         let (w, h) = (sys.bus.gpu.display_width(), sys.bus.gpu.display_height());

@@ -332,7 +332,8 @@ impl Ps1 {
         self.inner.load_state(data).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
-    /// Plug a 128 KB memory card image into slot 0 or 1.
+    /// Plug a memory card image into slot 0 or 1: a raw 128 KB dump, or a
+    /// DexDrive `.gme` or PSP/PS3 `.vmp` file.
     pub fn insert_memory_card(&mut self, port: u32, data: &[u8]) -> Result<(), JsValue> {
         self.inner
             .insert_memory_card(port as usize, data.to_vec())
@@ -352,6 +353,11 @@ impl Ps1 {
     /// Whether the game wrote to the card since the last `clear_memory_card_dirty`.
     pub fn memory_card_dirty(&self, port: u32) -> bool {
         self.inner.memory_card_dirty(port as usize)
+    }
+
+    /// Flag a card for saving again after the page failed to store it.
+    pub fn mark_memory_card_dirty(&mut self, port: u32) {
+        self.inner.mark_memory_card_dirty(port as usize);
     }
 
     pub fn clear_memory_card_dirty(&mut self, port: u32) {

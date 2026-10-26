@@ -19,6 +19,15 @@ pub const CARD_SIZE: usize = FRAME_SIZE * FRAME_COUNT;
 
 /// The card's status flag at power-on: "directory not read yet".
 const FLAG_NEW_CARD: u8 = 0x08;
+/// Set when the last write was refused (bad checksum or sector); a good write clears it.
+const FLAG_WRITE_ERROR: u8 = 0x04;
+
+/// Header the DexDrive `.gme` files put before the 128 KB of the card.
+const GME_HEADER_SIZE: usize = 3904;
+const GME_MAGIC: &[u8] = b"123-456-STD";
+/// Header of the PSP and PS3 `.vmp` files.
+const VMP_HEADER_SIZE: usize = 128;
+const VMP_MAGIC: &[u8] = b"\x00PMV";
 
 const WRITE_GOOD: u8 = 0x47; // 'G'
 const WRITE_BAD_CHECKSUM: u8 = 0x4E; // 'N'
@@ -29,12 +38,18 @@ pub struct MemoryCard {
     data: Vec<u8>,
     flag: u8,
     dirty: bool,
+    /// Sectors the console read and wrote successfully since the card was
+    /// created, for diagnostics and tests (not part of a save state).
+    #[serde(skip)]
+    sectors_read: u64,
+    #[serde(skip)]
+    sectors_written: u64,
 }
 
 impl MemoryCard {
     /// A card of zeros: games will offer to format it.
     pub fn blank() -> Self {
-        Self { data: vec![0; CARD_SIZE], flag: FLAG_NEW_CARD, dirty: false }
+        Self { data: vec![0; CARD_SIZE], flag: FLAG_NEW_CARD, dirty: false, sectors_read: 0, sectors_written: 0 }
     }
 
     /// An empty card with a valid file system, as the BIOS formats it.
@@ -73,7 +88,39 @@ impl MemoryCard {
 
     /// Load a raw card image (exactly 128 KB).
     pub fn from_bytes(data: Vec<u8>) -> Option<Self> {
-        (data.len() == CARD_SIZE).then(|| Self { data, flag: FLAG_NEW_CARD, dirty: false })
+        (data.len() == CARD_SIZE).then(|| Self { data, flag: FLAG_NEW_CARD, dirty: false, sectors_read: 0, sectors_written: 0 })
+    }
+
+    /// Load a card image in any of the usual formats: the raw 128 KB dump
+    /// (`.mcr`, `.mcd`, `.bin`...), a DexDrive `.gme` (3904-byte header) or a
+    /// PSP/PS3 `.vmp` (128-byte header).
+    pub fn from_image(image: &[u8]) -> Option<Self> {
+        let data = if image.len() == CARD_SIZE {
+            image
+        } else if image.len() == GME_HEADER_SIZE + CARD_SIZE && image.starts_with(GME_MAGIC) {
+            &image[GME_HEADER_SIZE..]
+        } else if image.len() == VMP_HEADER_SIZE + CARD_SIZE && image.starts_with(VMP_MAGIC) {
+            &image[VMP_HEADER_SIZE..]
+        } else {
+            return None;
+        };
+        Self::from_bytes(data.to_vec())
+    }
+
+    /// Power the card up again: it reports "directory not read yet" until the
+    /// console writes to it, so the BIOS and the games look at it afresh.
+    pub fn reset(&mut self) {
+        self.flag = FLAG_NEW_CARD;
+    }
+
+    /// How many sectors the console has read from the card.
+    pub fn sectors_read(&self) -> u64 {
+        self.sectors_read
+    }
+
+    /// How many sectors the console has written to the card.
+    pub fn sectors_written(&self) -> u64 {
+        self.sectors_written
     }
 
     pub fn data(&self) -> &[u8] {
@@ -162,7 +209,7 @@ impl CardSession {
         }
     }
 
-    fn read_step(&mut self, card: &MemoryCard, step: usize, tx: u8, previous: u8) -> Option<(u8, bool)> {
+    fn read_step(&mut self, card: &mut MemoryCard, step: usize, tx: u8, previous: u8) -> Option<(u8, bool)> {
         match step {
             4 => {
                 self.sector_high = tx;
@@ -190,7 +237,10 @@ impl CardSession {
                 Some((byte, true))
             }
             138 => Some((self.checksum, true)),
-            139 => Some((b'G', false)),
+            139 => {
+                card.sectors_read += 1;
+                Some((b'G', false))
+            }
             _ => None,
         }
     }
@@ -219,14 +269,17 @@ impl CardSession {
             136 => Some((0x5D, true)),
             137 => {
                 let status = if self.sector >= FRAME_COUNT {
+                    card.flag |= FLAG_WRITE_ERROR;
                     WRITE_BAD_SECTOR
                 } else if self.checksum != self.received_checksum {
+                    card.flag |= FLAG_WRITE_ERROR;
                     WRITE_BAD_CHECKSUM
                 } else {
                     let start = self.sector * FRAME_SIZE;
                     card.data[start..start + FRAME_SIZE].copy_from_slice(&self.buffer);
-                    card.flag &= !FLAG_NEW_CARD;
+                    card.flag &= !(FLAG_NEW_CARD | FLAG_WRITE_ERROR);
                     card.dirty = true;
+                    card.sectors_written += 1;
                     WRITE_GOOD
                 };
                 Some((status, false))
@@ -399,5 +452,117 @@ mod tests {
         assert!(card.is_dirty());
         card.clear_dirty();
         assert!(!card.is_dirty());
+    }
+
+    /// The flag a card reports in the first reply byte of a command.
+    fn flag_of(card: &mut MemoryCard) -> u8 {
+        run(card, &[b'S', 0, 0])[0].unwrap().0
+    }
+
+    #[test]
+    fn a_reset_makes_the_card_look_new_again() {
+        let mut card = MemoryCard::blank();
+        let data = [9u8; 128];
+        run(&mut card, &write_command(5, &data, checksum(5, &data)));
+        assert_eq!(flag_of(&mut card), 0x00, "written to: not new any more");
+        card.reset();
+        assert_eq!(flag_of(&mut card), 0x08, "powered up again");
+        assert_eq!(card.frame(5), &data, "the contents are kept");
+    }
+
+    #[test]
+    fn a_refused_write_sets_the_error_flag_and_a_good_one_clears_it() {
+        let mut card = MemoryCard::blank();
+        let data = [3u8; 128];
+        run(&mut card, &write_command(7, &data, checksum(7, &data) ^ 1));
+        assert_eq!(flag_of(&mut card), 0x08 | 0x04, "bad checksum");
+        run(&mut card, &write_command(0x0400, &data, checksum(0x0400, &data)));
+        assert_eq!(flag_of(&mut card), 0x08 | 0x04, "bad sector");
+        run(&mut card, &write_command(7, &data, checksum(7, &data)));
+        assert_eq!(flag_of(&mut card), 0x00, "a good write clears both");
+    }
+
+    #[test]
+    fn the_card_counts_the_sectors_it_serves() {
+        let mut card = MemoryCard::formatted();
+        for sector in [0, 1, 2] {
+            run(&mut card, &read_command(sector));
+        }
+        run(&mut card, &read_command(0x0400));
+        let data = [1u8; 128];
+        run(&mut card, &write_command(70, &data, checksum(70, &data)));
+        run(&mut card, &write_command(71, &data, checksum(71, &data) ^ 0xFF));
+        assert_eq!(card.sectors_read(), 3, "the aborted read does not count");
+        assert_eq!(card.sectors_written(), 1, "the refused write does not count");
+    }
+
+    #[test]
+    fn a_session_cut_short_serves_nothing() {
+        // The console released the card before the last byte: no sector counted, nothing stored.
+        let mut card = MemoryCard::blank();
+        let data = [4u8; 128];
+        let mut bytes = write_command(9, &data, checksum(9, &data));
+        bytes.truncate(100);
+        run(&mut card, &bytes);
+        assert!(card.data().iter().all(|b| *b == 0));
+        assert_eq!(card.sectors_written(), 0);
+        let mut bytes = read_command(1);
+        bytes.truncate(50);
+        run(&mut card, &bytes);
+        assert_eq!(card.sectors_read(), 0);
+    }
+
+    #[test]
+    fn every_sector_of_the_card_can_be_written_and_read_back() {
+        let mut card = MemoryCard::blank();
+        for sector in 0..FRAME_COUNT as u16 {
+            let mut data = [0u8; 128];
+            for (i, byte) in data.iter_mut().enumerate() {
+                *byte = (sector as usize * 3 + i) as u8;
+            }
+            let responses = run(&mut card, &write_command(sector, &data, checksum(sector, &data)));
+            assert_eq!(responses.last().unwrap().unwrap().0, b'G', "sector {sector}");
+        }
+        for sector in 0..FRAME_COUNT as u16 {
+            let responses = run(&mut card, &read_command(sector));
+            let bytes: Vec<u8> = responses.iter().map(|r| r.unwrap().0).collect();
+            let expected: Vec<u8> = (0..128).map(|i| (sector as usize * 3 + i) as u8).collect();
+            assert_eq!(&bytes[9..137], &expected[..], "sector {sector}");
+            assert_eq!(bytes[137], (sector >> 8) as u8 ^ sector as u8 ^ expected.iter().fold(0, |a, b| a ^ b), "checksum of sector {sector}");
+        }
+        assert_eq!(card.sectors_written(), FRAME_COUNT as u64);
+        assert_eq!(card.sectors_read(), FRAME_COUNT as u64);
+    }
+
+    #[test]
+    fn card_images_load_in_the_usual_formats() {
+        let mut raw = vec![0u8; CARD_SIZE];
+        raw[0] = b'M';
+        raw[1] = b'C';
+        raw[CARD_SIZE - 1] = 0x5A;
+
+        let load = |image: &[u8]| MemoryCard::from_image(image).map(|card| card.data().to_vec());
+        assert_eq!(load(&raw).as_deref(), Some(&raw[..]), "a raw dump");
+
+        let mut gme = b"123-456-STD".to_vec();
+        gme.resize(GME_HEADER_SIZE, 0);
+        gme.extend_from_slice(&raw);
+        assert_eq!(load(&gme).as_deref(), Some(&raw[..]), "a DexDrive file");
+
+        let mut vmp = b"\0PMV".to_vec();
+        vmp.resize(VMP_HEADER_SIZE, 0);
+        vmp.extend_from_slice(&raw);
+        assert_eq!(load(&vmp).as_deref(), Some(&raw[..]), "a PSP/PS3 file");
+    }
+
+    #[test]
+    fn images_that_are_not_cards_are_refused() {
+        let mut gme = vec![0u8; GME_HEADER_SIZE + CARD_SIZE];
+        assert!(MemoryCard::from_image(&gme).is_none(), "the right size without the magic");
+        gme[..11].copy_from_slice(b"123-456-STD");
+        assert!(MemoryCard::from_image(&gme).is_some());
+        assert!(MemoryCard::from_image(&gme[..gme.len() - 1]).is_none(), "truncated");
+        assert!(MemoryCard::from_image(&vec![0u8; CARD_SIZE + 1]).is_none());
+        assert!(MemoryCard::from_image(&[]).is_none());
     }
 }

@@ -84,8 +84,11 @@ La vibración funciona si el navegador y el mando la permiten.
 
 ## Partidas guardadas
 
-- **Tarjetas de memoria**: las dos se guardan solas en este navegador. En *Ajustes → Tarjetas
-  de memoria* se pueden exportar (`.mcr`), importar y formatear.
+- **Tarjetas de memoria**: las dos se guardan solas en este navegador (al guardar en el juego, al
+  cabo de un segundo como mucho, y al cambiar de pestaña o cerrarla). En *Ajustes → Tarjetas de
+  memoria* se pueden exportar (`.mcr`), importar (`.mcr`, `.mcd`, `.bin`, `.gme` de DexDrive o
+  `.vmp` de PSP/PS3) y formatear. Si el navegador no puede guardar una tarjeta, la página lo avisa
+  y lo reintenta: exporta la tarjeta para no perder la partida.
 - **Estados guardados**: tres ranuras (**F5** guarda, **F7** carga la ranura elegida). Guardan toda
   la máquina, así que carga el mismo disco antes de restaurar. Un estado solo vale para la misma
   BIOS y la misma versión de RS1Emu.

@@ -221,6 +221,17 @@ impl Interpreter {
         std::mem::take(&mut self.extra_cycles)
     }
 
+    /// Charge the wait of a data read at `addr` (see [`RAM_READ_CYCLES`]). The
+    /// multiply/divide unit and the GTE keep working meanwhile.
+    #[inline(always)]
+    fn charge_read(&mut self, addr: u32) {
+        if Bus::physical(addr) < RAM_MIRROR_END {
+            self.extra_cycles += RAM_READ_CYCLES;
+            self.hilo_busy = self.hilo_busy.saturating_sub(RAM_READ_CYCLES);
+            self.gte_busy = self.gte_busy.saturating_sub(RAM_READ_CYCLES);
+        }
+    }
+
     /// Execute one instruction.
     ///
     /// MIPS exceptions (overflow, syscall, address errors, interrupts...) are
@@ -597,17 +608,20 @@ impl Interpreter {
             0x20 => {
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read8(bus, addr)? as i8 as i32 as u32;
+                self.charge_read(addr);
                 self.load_reg(rt, value);
             }
             0x21 => {
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read16(bus, addr)? as i16 as i32 as u32;
+                self.charge_read(addr);
                 self.load_reg(rt, value);
             }
             0x22 => {
                 // LWL
                 let addr = self.regs[rs].wrapping_add(simm);
                 let word = self.read32_unaligned_base(bus, addr)?;
+                self.charge_read(addr);
                 let cur = self.reg_for_merge(rt);
                 let value = match addr & 3 {
                     0 => (cur & 0x00FF_FFFF) | (word << 24),
@@ -620,22 +634,26 @@ impl Interpreter {
             0x23 => {
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read32(bus, addr)?;
+                self.charge_read(addr);
                 self.load_reg(rt, value);
             }
             0x24 => {
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read8(bus, addr)? as u32;
+                self.charge_read(addr);
                 self.load_reg(rt, value);
             }
             0x25 => {
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read16(bus, addr)? as u32;
+                self.charge_read(addr);
                 self.load_reg(rt, value);
             }
             0x26 => {
                 // LWR
                 let addr = self.regs[rs].wrapping_add(simm);
                 let word = self.read32_unaligned_base(bus, addr)?;
+                self.charge_read(addr);
                 let cur = self.reg_for_merge(rt);
                 let value = match addr & 3 {
                     0 => word,
@@ -693,6 +711,7 @@ impl Interpreter {
                 self.wait_for_gte();
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read32(bus, addr)?;
+                self.charge_read(addr);
                 self.gte.write_data(rt, value);
             }
             0x3A => {
@@ -935,6 +954,22 @@ fn sign_extend16(imm: u32) -> u32 {
 
 /// Cycles a divide takes (R3000A, from the psx-spx timing notes).
 pub(crate) const DIVIDE_LATENCY: u32 = 36;
+
+/// End of main RAM and its mirrors, as a physical address.
+pub(crate) const RAM_MIRROR_END: u32 = 0x80_0000;
+
+/// Cycles a data read from main RAM takes on top of the instruction's own one.
+///
+/// The R3000A in the PS1 has no data cache, so every load that is not for the
+/// scratchpad goes out to the DRAM, which answers a word in about 6 cycles
+/// (psx-spx, "Memory Control"). Code that waits for something with a loop of
+/// iterations, like the memory card routines of many games, is tuned for that
+/// pace: at one cycle per load the loop would end several times too soon.
+///
+/// Writes are not charged (they go through the write buffer), nor are
+/// instruction fetches (the instruction cache is not modelled and loops fit
+/// in it), nor reads of the BIOS or of the I/O registers.
+pub(crate) const RAM_READ_CYCLES: u32 = 5;
 
 /// Cycles a multiply takes: 6, 9 or 13 depending on how many significant bits
 /// `rs` has (for MULT the magnitude of the signed value counts).

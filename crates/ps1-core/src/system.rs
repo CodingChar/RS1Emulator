@@ -132,10 +132,12 @@ impl System {
         Ok(())
     }
 
-    /// Plug a memory card image (exactly 128 KB) into slot 0 or 1.
+    /// Plug a memory card image into slot 0 or 1: a raw 128 KB dump, or a
+    /// DexDrive `.gme` or PSP/PS3 `.vmp` file (see [`MemoryCard::from_image`]).
     pub fn insert_memory_card(&mut self, port: usize, data: Vec<u8>) -> Ps1Result<()> {
-        let card = MemoryCard::from_bytes(data)
-            .ok_or_else(|| crate::types::Ps1Error::Io("a memory card image must be exactly 128 KB".into()))?;
+        let card = MemoryCard::from_image(&data).ok_or_else(|| {
+            crate::types::Ps1Error::Io("a memory card image must be a raw 128 KB dump, a .gme or a .vmp file".into())
+        })?;
         self.bus.controllers.insert_memory_card(port, card);
         Ok(())
     }
@@ -153,6 +155,13 @@ impl System {
     /// Whether the console wrote to the card since `clear_memory_card_dirty`.
     pub fn memory_card_dirty(&self, port: usize) -> bool {
         self.bus.controllers.memory_card(port).is_some_and(|card| card.is_dirty())
+    }
+
+    /// Flag a card for saving again, for a frontend that could not store it.
+    pub fn mark_memory_card_dirty(&mut self, port: usize) {
+        if let Some(card) = self.bus.controllers.memory_card_mut(port) {
+            card.mark_dirty();
+        }
     }
 
     pub fn clear_memory_card_dirty(&mut self, port: usize) {

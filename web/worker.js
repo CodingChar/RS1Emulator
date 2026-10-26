@@ -43,6 +43,7 @@ const lastRumble = [0, 0];
 let lastFrameTime = 0;
 let accumulator = 0;
 let lastCardCheck = 0;
+let cardSaveFailed = false;
 const stats = { frames: 0, since: 0 };
 
 function post(message, transfer = []) {
@@ -207,10 +208,20 @@ async function persistCards(now, force = false) {
     if (!force && now - lastCardCheck < CARD_SAVE_INTERVAL_MS) return;
     lastCardCheck = now;
     for (let port = 0; port < CARD_COUNT; port++) {
-        if (ps1.memory_card_dirty(port)) {
-            const data = ps1.memory_card_data(port);
-            ps1.clear_memory_card_dirty(port);
-            if (data) await storage.put(`card${port}`, data);
+        if (!ps1.memory_card_dirty(port)) continue;
+        const data = ps1.memory_card_data(port);
+        ps1.clear_memory_card_dirty(port);
+        if (!data) continue;
+        try {
+            await storage.put(`card${port}`, data);
+            cardSaveFailed = false;
+        } catch (error) {
+            // Keep the card flagged so the next pass tries again, and say so once.
+            ps1.mark_memory_card_dirty(port);
+            if (!cardSaveFailed) {
+                cardSaveFailed = true;
+                say(`No se pudo guardar la tarjeta ${port + 1} en el navegador (${error}). Usa Exportar para no perder la partida.`, true);
+            }
         }
     }
 }
@@ -304,13 +315,15 @@ async function cardCommand(message) {
         const data = ps1.memory_card_data(port);
         if (data) post({ type: 'card-export', port, data }, [data.buffer]);
     } else if (op === 'import') {
-        const bytes = new Uint8Array(message.bytes);
-        if (bytes.length !== CARD_SIZE) {
-            say(`Una tarjeta de memoria ocupa 128 KB y ese archivo ocupa ${Math.round(bytes.length / 1024)} KB.`, true);
+        // A raw 128 KB dump, or a DexDrive .gme or PSP/PS3 .vmp file: the core tells which.
+        try {
+            ps1.insert_memory_card(port, new Uint8Array(message.bytes));
+        } catch (error) {
+            say(`Ese archivo no es una tarjeta de memoria (${Math.round(message.bytes.byteLength / 1024)} KB): ${error}`, true);
             return;
         }
-        ps1.insert_memory_card(port, bytes);
-        await storage.put(`card${port}`, bytes);
+        // Store the card as the console now has it, without the file's header.
+        await storage.put(`card${port}`, ps1.memory_card_data(port));
         say(`Tarjeta ${port + 1} importada.`);
     } else if (op === 'format') {
         ps1.insert_formatted_memory_card(port);

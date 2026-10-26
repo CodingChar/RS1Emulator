@@ -196,6 +196,7 @@ impl Bus {
         self.post_code = 0;
         self.sio0.reset();
         self.controllers.deselect();
+        self.controllers.reset_memory_cards();
         self.sio1.reset();
         self.mdec.reset();
         self.mdec_out_waiting = false;

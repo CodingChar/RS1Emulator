@@ -194,6 +194,14 @@ impl ControllerManager {
         self.session = Session::Start;
     }
 
+    /// Power the memory cards up again, as a console reset does: they report
+    /// a new card until the console writes to them.
+    pub fn reset_memory_cards(&mut self) {
+        for card in self.memory_cards.iter_mut().flatten() {
+            card.reset();
+        }
+    }
+
     /// Send one byte to the device on `port` (0 or 1). Returns the byte it
     /// answers and whether it pulsed /ACK, or `None` if nothing answered.
     pub fn exchange(&mut self, port: usize, tx: u8) -> Option<(u8, bool)> {
@@ -334,5 +342,34 @@ mod tests {
         assert_eq!((state.right_stick_x, state.right_stick_y), (3, -4));
         manager.set_input(9, 1, 0, 0, 0, 0); // out of range: no panic
         assert!(manager.state(9).is_none());
+    }
+
+    #[test]
+    fn resetting_the_console_powers_the_cards_up_again() {
+        let mut manager = ControllerManager::new();
+        manager.insert_memory_card(0, MemoryCard::formatted());
+        manager.insert_memory_card(1, MemoryCard::blank());
+        let flag = |manager: &mut ControllerManager, port: usize| {
+            manager.deselect();
+            manager.exchange(port, 0x81);
+            manager.exchange(port, b'S').unwrap().0
+        };
+        // Write a sector to card 1 through the protocol, which clears its "new" flag.
+        manager.deselect();
+        let data = [7u8; 128];
+        let checksum = data.iter().fold(0u8, |a, b| a ^ b);
+        let mut bytes = vec![0x81, b'W', 0, 0, 0, 0];
+        bytes.extend_from_slice(&data);
+        bytes.push(checksum);
+        bytes.extend_from_slice(&[0, 0, 0]);
+        for byte in bytes {
+            manager.exchange(0, byte);
+        }
+        assert_eq!(flag(&mut manager, 0), 0x00);
+        assert_eq!(flag(&mut manager, 1), 0x08);
+
+        manager.reset_memory_cards();
+        assert_eq!(flag(&mut manager, 0), 0x08, "card 1 looks new again");
+        assert_eq!(manager.memory_card(0).unwrap().data()[..128], data, "with its contents");
     }
 }
