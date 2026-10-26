@@ -217,6 +217,7 @@ impl Dma {
     }
 
     /// Run a started channel to completion.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_channel(
         &mut self,
         channel: usize,
@@ -225,6 +226,7 @@ impl Dma {
         spu: &mut Spu,
         cdrom: &mut CdRom,
         mdec: &mut Mdec,
+        pgxp: &crate::pgxp::Memory,
     ) {
         let chcr = self.chcr(channel);
         let sync = (chcr >> CHCR_SYNC_SHIFT) & 3;
@@ -235,7 +237,7 @@ impl Dma {
             words_moved = Self::block_length(bcr & 0xFFFF) as u64;
             Self::clear_ordering_table(self.madr(channel), bcr & 0xFFFF, ram)
         } else if channel == CHANNEL_GPU && sync == SYNC_LINKED_LIST {
-            let (end, words) = Self::walk_linked_list(self.madr(channel), ram, gpu);
+            let (end, words) = Self::walk_linked_list(self.madr(channel), ram, gpu, pgxp);
             words_moved = words;
             end
         } else {
@@ -252,7 +254,11 @@ impl Dma {
             for _ in 0..words {
                 if from_ram {
                     let word = ram.read32(address as usize);
-                    Self::write_device(channel, word, gpu, spu, mdec);
+                    if channel == CHANNEL_GPU && pgxp.enabled() {
+                        gpu.write_gp0_precise(word, pgxp.lookup(address, word));
+                    } else {
+                        Self::write_device(channel, word, gpu, spu, mdec);
+                    }
                 } else {
                     let word = Self::read_device(channel, gpu, spu, cdrom, mdec);
                     ram.write32(address as usize, word);
@@ -308,15 +314,21 @@ impl Dma {
     /// Feed a GPU command list to GP0. Each node is a header word (word count
     /// in the top byte, next node in the low 24 bits) followed by that many
     /// command words. Returns the address of the last header's successor.
-    fn walk_linked_list(madr: u32, ram: &mut Ram, gpu: &mut Gpu) -> (u32, u64) {
+    fn walk_linked_list(madr: u32, ram: &mut Ram, gpu: &mut Gpu, pgxp: &crate::pgxp::Memory) -> (u32, u64) {
         let mut node = madr & RAM_ADDRESS_MASK;
         let mut words = 0u64;
         for _ in 0..MAX_LIST_NODES {
             let header = ram.read32(node as usize);
             words += 1 + (header >> 24) as u64;
             for i in 1..=(header >> 24) {
-                let word = ram.read32((node.wrapping_add(i * 4) & RAM_ADDRESS_MASK) as usize);
-                gpu.write(0, 4, word);
+                let address = node.wrapping_add(i * 4) & RAM_ADDRESS_MASK;
+                let word = ram.read32(address as usize);
+                if pgxp.enabled() {
+                    // The precise vertex of the word, if the GTE made it.
+                    gpu.write_gp0_precise(word, pgxp.lookup(address, word));
+                } else {
+                    gpu.write(0, 4, word);
+                }
             }
             let next = header & 0x00FF_FFFF;
             // Bit 23 set means end of list (normally 0xFFFFFF).

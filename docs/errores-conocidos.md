@@ -30,3 +30,13 @@
 - La página avisa si no puede guardar una tarjeta en el navegador (y lo reintenta) y guarda también al ocultarse la pestaña.
 
 **Sin comprobar.** Guardar una partida desde dentro de Resident Evil (hace falta jugar hasta una máquina de escribir y tener cinta de tinta). Lo que sí se comprobó: el juego lee la tarjeta desde LOAD GAME y la BIOS escribe y copia archivos con los mismos servicios de escritura que usan los juegos. Tampoco se ha probado con una partida real en el navegador; en la página se probaron la importación y el rechazo de archivos, y las funciones nuevas del módulo WebAssembly.
+
+## 2. Limitaciones de las opciones de imagen (escalado, PGXP, ensanchado)
+
+**Estado.** Conocidas; no son fallos de la emulación (con todo desactivado la imagen es la de la consola, píxel a píxel).
+
+- **Coste.** El escalado dibuja `escala²` veces más píxeles: en la escena de juego de Crash Bandicoot (512×240) medida en WebAssembly con Node, un cuadro pasa de 8–11 ms (nativo) a 15–22 ms (2×) y 26–40 ms (3× con PGXP); el filtro bilineal es el más caro (27–42 ms a 2×). En un portátil modesto 2× llega a la velocidad real (16,7 ms por cuadro) en escenas ligeras y 3× o el bilineal necesitan un equipo más rápido. El panel de rendimiento (F2) lo muestra.
+- **Ensanchar escenas 3D (16:9).** Solo se estrechan los polígonos cuyos vértices PGXP conoce todos; los elementos 2D se estiran, y los juegos que no envían a la GPU los polígonos fuera de la vista 4:3 dejan huecos en los lados (el fondo se ve donde antes no había nada que dibujar). Es la misma limitación que tiene el truco panorámico de DuckStation.
+- **PGXP en el modo de memoria.** La posición precisa sigue al valor por `swc2`, `mfc2`, `lw`, `sw`, `lwc2` y `mtc2`; si un juego recalcula las posiciones con la CPU (sumas, desplazamientos) antes de entregarlas a la GPU, esos vértices no tienen etiqueta y se dibujan con enteros. Los estados guardados no llevan las etiquetas: tras cargar uno, lo que ya estaba preparado se dibuja con enteros hasta el siguiente cuadro.
+- **Resolución y lecturas de VRAM.** El juego sigue viendo la VRAM nativa: un juego que lea la imagen de la pantalla para hacer efectos (o que la use como textura) ve la versión de la consola, y lo que vuelva a escribir en la VRAM se repite `escala × escala` veces en la imagen escalada.
+- **Audio.** El sonido que produce el SPU se comprobó sin saltos ni recortes (98 s de Crash Bandicoot); lo que cambia es el reproductor del navegador. Si el equipo no alcanza la velocidad real, el sonido se corta aunque la reserva sea grande: no es un fallo del audio sino de la velocidad.

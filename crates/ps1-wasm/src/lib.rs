@@ -2,6 +2,7 @@ use wasm_bindgen::prelude::*;
 use console_error_panic_hook::set_once as set_panic_hook;
 
 use ps1_core::disc::{Disc, MemorySource, SectorSource};
+use ps1_core::gpu::{RenderSettings, TextureFilter};
 use ps1_core::system::System;
 
 /// Size of every PS1 BIOS image.
@@ -79,15 +80,17 @@ pub struct Ps1 {
     ccd: Option<String>,
     /// Replacement subchannel data (`.sbi`) for the next disc inserted, if any.
     sbi: Option<Vec<u8>>,
-    /// The last rendered frame (RGBA8888), see `render_frame`.
-    frame: Vec<u8>,
+    /// The last rendered frame (one `0xAABBGGRR` pixel per entry, which is
+    /// RGBA8888 in memory), see `render_frame`.
+    frame: Vec<u32>,
+    frame_size: (u32, u32),
 }
 
 #[wasm_bindgen]
 impl Ps1 {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        Self { inner: System::new(), disc_files: Vec::new(), incoming: None, ccd: None, sbi: None, frame: Vec::new() }
+        Self { inner: System::new(), disc_files: Vec::new(), incoming: None, ccd: None, sbi: None, frame: Vec::new(), frame_size: (0, 0) }
     }
 
     /// Load the PS1 BIOS ROM (required to boot). Called from JS with a Uint8Array.
@@ -250,19 +253,57 @@ impl Ps1 {
         self.inner.framebuffer()
     }
 
-    /// Render the display into a buffer inside the module, without copying it
-    /// out: read it with `frame_ptr()` / `frame_len()` as a view of the
-    /// module's memory (valid until the next call that can grow the memory).
+    /// Render what is on screen into a buffer inside the module, without
+    /// copying it out: read it with `frame_ptr()` / `frame_len()` as a view of
+    /// the module's memory (valid until the next call that can grow the
+    /// memory) and its size with `frame_width()` / `frame_height()`. With an
+    /// internal resolution above 1x the frame is that many times larger than
+    /// the console's display.
     pub fn render_frame(&mut self) {
-        self.inner.bus.gpu.render_into(&mut self.frame);
+        let (width, height) = self.inner.bus.gpu.render_frame(&mut self.frame);
+        self.frame_size = (width as u32, height as u32);
     }
 
     pub fn frame_ptr(&self) -> *const u8 {
-        self.frame.as_ptr()
+        self.frame.as_ptr() as *const u8
     }
 
+    /// Length of the frame in bytes.
     pub fn frame_len(&self) -> usize {
-        self.frame.len()
+        self.frame.len() * 4
+    }
+
+    pub fn frame_width(&self) -> u32 {
+        self.frame_size.0
+    }
+
+    pub fn frame_height(&self) -> u32 {
+        self.frame_size.1
+    }
+
+    /// How the picture is drawn. `scale` is the internal resolution as a
+    /// multiple of the console's (1 to 4); `true_color` shades with 8 bits per
+    /// channel and no dithering; `bilinear` filters the textures of polygons;
+    /// `pgxp` draws polygons with the sub-pixel positions the GTE computed,
+    /// `pgxp_textures` adds perspective-correct textures and `widescreen`
+    /// squeezes 3D geometry for a picture shown at 16:9 (both need `pgxp`).
+    pub fn set_render_settings(
+        &mut self,
+        scale: u32,
+        true_color: bool,
+        bilinear: bool,
+        pgxp: bool,
+        pgxp_textures: bool,
+        widescreen: bool,
+    ) {
+        self.inner.set_render_settings(RenderSettings {
+            scale,
+            true_color,
+            texture_filter: if bilinear { TextureFilter::Bilinear } else { TextureFilter::Nearest },
+            pgxp,
+            pgxp_textures,
+            widescreen,
+        });
     }
 
     /// Dimensions of the framebuffer returned by `framebuffer()`. They change

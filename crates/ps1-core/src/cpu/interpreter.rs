@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::bus::Bus;
 use crate::gte::Gte;
+use crate::pgxp::PreciseVertex;
 use crate::types::{Ps1Error, Ps1Result};
 
 /// Address the CPU starts executing from after reset (start of the BIOS, KSEG1).
@@ -124,6 +125,10 @@ pub struct Interpreter {
     /// How many times each exception code (Cause.ExcCode) was taken since
     /// reset, for debugging.
     pub exception_counts: [u64; 16],
+    /// PGXP: the tag of the value each general register was last loaded with
+    /// (see `crate::pgxp`); checked against the register's value when used.
+    #[serde(skip)]
+    pgxp_regs: [PreciseVertex; 32],
 
     /// Address of the instruction being executed (for EPC).
     current_pc: u32,
@@ -161,6 +166,7 @@ impl Interpreter {
             cp0: [0u32; 32],
             gte: Gte::new(),
             exception_counts: [0; 16],
+            pgxp_regs: [PreciseVertex::NONE; 32],
             current_pc: RESET_VECTOR,
             in_delay_slot: false,
             branch_pending: false,
@@ -636,6 +642,9 @@ impl Interpreter {
                 let value = self.read32(bus, addr)?;
                 self.charge_read(addr);
                 self.load_reg(rt, value);
+                if bus.pgxp.enabled() && rt != 0 {
+                    self.pgxp_regs[rt] = bus.pgxp.lookup(Bus::physical(addr), value);
+                }
             }
             0x24 => {
                 let addr = self.regs[rs].wrapping_add(simm);
@@ -687,6 +696,10 @@ impl Interpreter {
             0x2B => {
                 let addr = self.regs[rs].wrapping_add(simm);
                 self.write32(bus, addr, self.regs[rt])?;
+                if bus.pgxp.enabled() {
+                    let tag = self.pgxp_regs[rt].matching(self.regs[rt]);
+                    bus.pgxp.store(Bus::physical(addr), tag);
+                }
             }
             0x2E => {
                 // SWR
@@ -712,14 +725,23 @@ impl Interpreter {
                 let addr = self.regs[rs].wrapping_add(simm);
                 let value = self.read32(bus, addr)?;
                 self.charge_read(addr);
-                self.gte.write_data(rt, value);
+                if bus.pgxp.enabled() {
+                    let tag = bus.pgxp.lookup(Bus::physical(addr), value);
+                    self.gte.write_data_tagged(rt, value, tag);
+                } else {
+                    self.gte.write_data(rt, value);
+                }
             }
             0x3A => {
                 // SWC2: store a GTE data register.
                 self.require_cop2()?;
                 self.wait_for_gte();
                 let addr = self.regs[rs].wrapping_add(simm);
-                self.write32(bus, addr, self.gte.read_data(rt))?;
+                let value = self.gte.read_data(rt);
+                self.write32(bus, addr, value)?;
+                if bus.pgxp.enabled() {
+                    bus.pgxp.store(Bus::physical(addr), self.gte.sxy_tag(rt, value));
+                }
             }
             _ => return Err(Trap::exception(Exception::ReservedInstruction)),
         }
@@ -834,12 +856,22 @@ impl Interpreter {
             0x00 => {
                 let value = self.gte.read_data(rd);
                 self.load_reg(rt, value);
+                if self.gte.tags.enabled && rt != 0 {
+                    self.pgxp_regs[rt] = self.gte.sxy_tag(rd, value);
+                }
             }
             0x02 => {
                 let value = self.gte.read_control(rd);
                 self.load_reg(rt, value);
             }
-            0x04 => self.gte.write_data(rd, self.regs[rt]),
+            0x04 => {
+                let value = self.regs[rt];
+                if self.gte.tags.enabled {
+                    self.gte.write_data_tagged(rd, value, self.pgxp_regs[rt].matching(value));
+                } else {
+                    self.gte.write_data(rd, value);
+                }
+            }
             0x06 => self.gte.write_control(rd, self.regs[rt]),
             _ => return Err(Trap::exception(Exception::ReservedInstruction)),
         }

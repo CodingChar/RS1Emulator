@@ -25,7 +25,7 @@ export class Toasts {
 
 /**
  * A stack of pages. A page is `{ title, subtitle?, items() }` and `items()` returns
- * rows `{ label, icon?, value?(), disabled?, accept?(), left?(), right?(), separator? }`.
+ * rows `{ label, icon?, hint?, value?(), disabled?, accept?(), left?(), right?(), separator? }`.
  * It is rebuilt after every action, so rows always show the current state.
  */
 export class MenuUI {
@@ -174,6 +174,12 @@ export class MenuUI {
         label.className = 'fs-label';
         label.textContent = item.label;
         row.append(icon, label);
+        if (item.hint) {
+            const hint = document.createElement('span');
+            hint.className = 'fs-hint';
+            hint.textContent = item.hint;
+            row.append(hint);
+        }
 
         if (item.value || item.left || item.right) {
             const value = document.createElement('span');

@@ -13,11 +13,17 @@
 //! `--roundtrip FIRST,SECOND` checks that a save state taken after FIRST
 //! instructions makes a fresh machine continue exactly like the original.
 //! Built with `--features profile` it also prints the share of time per area.
+//!
+//! Rendering options (what the web page offers): `--scale N` (internal
+//! resolution), `--pgxp`, `--pgxp-textures`, `--true-color`, `--bilinear` and
+//! `--widescreen`. `--shot FILE.png` writes the final picture, as the options
+//! render it, so a run can be looked at.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ps1_core::disc::{Disc, FileSource, SectorSource};
+use ps1_core::gpu::{RenderSettings, TextureFilter};
 use ps1_core::System;
 
 fn open_disc(cue: &Path) -> Result<Disc, String> {
@@ -104,6 +110,8 @@ fn main() {
     let mut cpu_only = false;
     let mut frames: Option<u64> = None;
     let mut roundtrip: Option<(u64, u64)> = None;
+    let mut render = RenderSettings::default();
+    let mut shot: Option<PathBuf> = None;
     // (button mask, first step, last step): held between the two steps.
     let mut presses: Vec<(u16, u64, u64)> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -131,6 +139,13 @@ fn main() {
                 ));
             }
             "--frames" => frames = Some(value().parse().expect("--frames")),
+            "--scale" => render.scale = value().parse().expect("--scale"),
+            "--pgxp" => render.pgxp = true,
+            "--pgxp-textures" => render.pgxp_textures = true,
+            "--true-color" => render.true_color = true,
+            "--bilinear" => render.texture_filter = TextureFilter::Bilinear,
+            "--widescreen" => render.widescreen = true,
+            "--shot" => shot = Some(PathBuf::from(value())),
             "--steps" => steps = value().replace('_', "").parse().expect("--steps"),
             other => panic!("unknown argument {other}"),
         }
@@ -146,6 +161,7 @@ fn main() {
     if let Some(cue) = &disc {
         sys.insert_disc_image(open_disc(cue).expect("open disc"));
     }
+    sys.set_render_settings(render);
     sys.reset().expect("reset");
     if let Some(kind) = &synthetic {
         for (i, word) in synthetic_program(kind).iter().enumerate() {
@@ -228,6 +244,11 @@ fn main() {
             }
         }
     }
+    if let Some(path) = &shot {
+        let (width, height, rgba) = sys.scaled_framebuffer();
+        write_png(path, width, height, &rgba).expect("write the picture");
+        println!("picture {width}x{height} written to {}", path.display());
+    }
     let hash = digest(&mut sys);
     println!(
         "{steps} instructions in {elapsed:.2} s = {:.2} M instr/s ({:.0} % of real time)",
@@ -235,4 +256,62 @@ fn main() {
         steps as f64 / elapsed / 33_868_800.0 * 100.0
     );
     println!("state checksum {hash:016X}");
+}
+
+// ----- PNG output (uncompressed, no dependencies) -----
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for byte in data {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in data {
+        a = (a + *byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let mut body = kind.to_vec();
+    body.extend_from_slice(data);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_be_bytes());
+}
+
+/// Write RGBA pixels as a PNG using stored (uncompressed) deflate blocks.
+fn write_png(path: &Path, width: usize, height: usize, rgba: &[u8]) -> Result<(), String> {
+    let mut raw = Vec::with_capacity((width * 4 + 1) * height);
+    for row in rgba.chunks_exact(width * 4) {
+        raw.push(0); // filter: none
+        raw.extend_from_slice(row);
+    }
+    let mut zlib = vec![0x78, 0x01];
+    let mut blocks = raw.chunks(65535).peekable();
+    while let Some(block) = blocks.next() {
+        zlib.push(blocks.peek().is_none() as u8);
+        zlib.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        zlib.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut header = Vec::new();
+    header.extend_from_slice(&(width as u32).to_be_bytes());
+    header.extend_from_slice(&(height as u32).to_be_bytes());
+    header.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit RGBA
+    png_chunk(&mut png, b"IHDR", &header);
+    png_chunk(&mut png, b"IDAT", &zlib);
+    png_chunk(&mut png, b"IEND", &[]);
+    std::fs::write(path, png).map_err(|e| format!("{}: {e}", path.display()))
 }

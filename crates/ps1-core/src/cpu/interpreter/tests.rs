@@ -1320,3 +1320,141 @@ fn the_fast_path_and_the_exact_one_agree_on_gte_timing() {
     }
     assert!(compared > 20, "only {compared} lengths compared");
 }
+
+// ----- PGXP -----
+
+/// A machine with PGXP on, whose GTE projects with the identity rotation, H = 500
+/// and the screen centre at (160, 120): a vertex (vx, vy, vz) lands at
+/// `160 + 500 * vx / vz`, `120 + 500 * vy / vz`.
+fn pgxp_machine(program: &[u32]) -> Machine {
+    let mut m = gte_machine(program);
+    m.bus.pgxp.set_enabled(true);
+    m.cpu.gte.tags.enabled = true;
+    m.cpu.regs[1] = 500; // H
+    m.cpu.regs[2] = 160 << 16; // OFX
+    m.cpu.regs[3] = 120 << 16; // OFY
+    m.cpu.regs[4] = 0x1000; // 1.0 on the rotation diagonal
+    m.cpu.regs[6] = ((-31i32 as u32) << 16) | 101; // VX0 = 101, VY0 = -31
+    m.cpu.regs[7] = 1000; // VZ0
+    m
+}
+
+/// The setup, then RTPS, then the program under test.
+fn rtps_then(tail: &[u32]) -> Vec<u32> {
+    let mut program = vec![
+        ctc2(1, 26),
+        ctc2(2, 24),
+        ctc2(3, 25),
+        ctc2(4, 0),
+        ctc2(4, 2),
+        ctc2(4, 4),
+        mtc2(6, 0),
+        mtc2(7, 1),
+        gte_command(0x01 | (1 << 19)),
+    ];
+    program.extend_from_slice(tail);
+    program
+}
+
+/// x = 160 + 0.5 * 101, y = 120 - 0.5 * 31: the console shows (210, 104).
+const PRECISE_X: f32 = 210.5;
+const PRECISE_Y: f32 = 104.5;
+const PACKED: u32 = (104 << 16) | 210;
+
+fn assert_tagged(m: &Machine, address: u32, what: &str) {
+    assert_eq!(m.peek32(address), PACKED, "{what}: the integer vertex");
+    let tag = m.bus.pgxp.lookup(address, PACKED);
+    assert!(tag.is_valid(), "{what}: no tag at {address:#X}");
+    assert_eq!((tag.x, tag.y, tag.w), (PRECISE_X, PRECISE_Y, 1000.0), "{what}");
+}
+
+#[test]
+fn rtps_keeps_the_untruncated_position_and_swc2_stores_it_as_a_tag() {
+    let mut m = pgxp_machine(&rtps_then(&[swc2(14, DATA as i32, 0), NOP]));
+    m.run(11);
+    assert_eq!(m.cpu.gte.data[14], PACKED);
+    assert_tagged(&m, DATA, "swc2");
+}
+
+#[test]
+fn tags_follow_values_through_registers_and_memory() {
+    let mut m = pgxp_machine(&rtps_then(&[
+        swc2(14, DATA as i32, 0),
+        lw(9, DATA as i32, 0),
+        NOP,
+        sw(9, DATA as i32 + 16, 0), // memory to register to memory
+        mfc2(10, 14),
+        NOP,
+        sw(10, DATA as i32 + 32, 0), // SXY2 through a general register
+        lwc2(15, DATA as i32 + 32, 0), // back into the FIFO
+        swc2(14, DATA as i32 + 48, 0),
+        NOP,
+    ]));
+    m.run(9 + 10);
+    assert_tagged(&m, DATA, "swc2");
+    assert_tagged(&m, DATA + 16, "lw then sw");
+    assert_tagged(&m, DATA + 32, "mfc2 then sw");
+    assert_tagged(&m, DATA + 48, "lwc2 then swc2");
+}
+
+#[test]
+fn the_fast_path_tags_exactly_like_the_exact_one() {
+    let program = rtps_then(&[
+        swc2(14, DATA as i32, 0),
+        lw(9, DATA as i32, 0),
+        NOP,
+        sw(9, DATA as i32 + 16, 0),
+        mfc2(10, 14),
+        NOP,
+        sw(10, DATA as i32 + 32, 0),
+        lwc2(15, DATA as i32 + 32, 0),
+        swc2(14, DATA as i32 + 48, 0),
+        j(CODE + 4 * 18), // wait here: the jump is the 19th instruction
+        NOP,
+    ]);
+    let mut fast = pgxp_machine(&program);
+    let (ran, result) = fast.cpu.run(&mut fast.bus, 150);
+    result.unwrap();
+    assert!(ran >= 150, "ran {ran}");
+    for (offset, what) in [(0, "swc2"), (16, "lw then sw"), (32, "mfc2 then sw"), (48, "lwc2 then swc2")] {
+        assert_tagged(&fast, DATA + offset, what);
+    }
+}
+
+#[test]
+fn a_changed_value_loses_its_tag() {
+    let mut m = pgxp_machine(&rtps_then(&[
+        swc2(14, DATA as i32, 0),
+        lw(9, DATA as i32, 0),
+        NOP,
+        addiu(9, 9, 1), // the game moved the vertex a pixel to the right
+        sw(9, DATA as i32 + 16, 0),
+        addiu(11, 0, 7),
+        sw(11, DATA as i32, 0), // overwritten with something else
+        NOP,
+    ]));
+    m.run(9 + 8);
+    assert!(!m.bus.pgxp.lookup(DATA + 16, PACKED + 1).is_valid(), "the sum is not the projected vertex");
+    assert!(!m.bus.pgxp.lookup(DATA, 7).is_valid(), "a plain store has no tag");
+}
+
+#[test]
+fn nothing_is_tagged_while_pgxp_is_off() {
+    let mut m = pgxp_machine(&rtps_then(&[swc2(14, DATA as i32, 0), NOP]));
+    m.bus.pgxp.set_enabled(false);
+    m.cpu.gte.tags.enabled = false;
+    m.run(11);
+    assert_eq!(m.peek32(DATA), PACKED);
+    assert!(!m.bus.pgxp.lookup(DATA, PACKED).is_valid());
+}
+
+#[test]
+fn vertices_behind_the_camera_get_no_tag() {
+    // A depth of 100 with H = 500 overflows the divide: the hardware clamps, so there is
+    // nothing precise to keep.
+    let mut m = pgxp_machine(&rtps_then(&[swc2(14, DATA as i32, 0), NOP]));
+    m.cpu.regs[7] = 100;
+    m.run(11);
+    let packed = m.peek32(DATA);
+    assert!(!m.bus.pgxp.lookup(DATA, packed).is_valid());
+}

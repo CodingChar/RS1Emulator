@@ -20,6 +20,7 @@ pub mod mdec;
 pub mod profile;
 mod serde_arrays;
 pub mod memory;
+pub mod pgxp;
 pub mod save_state;
 pub mod sio1;
 pub mod spu;

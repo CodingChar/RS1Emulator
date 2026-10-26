@@ -161,7 +161,14 @@ pub fn load(sys: &mut System, data: &[u8]) -> Ps1Result<()> {
 
     sys.cpu = state.cpu;
     let bus = &mut sys.bus;
+    // How the picture is rendered is the frontend's choice, not part of the
+    // state: keep it (the scaled VRAM is rebuilt from the restored one).
+    let render = bus.gpu.render_settings();
     bus.gpu = state.gpu;
+    bus.gpu.set_render_settings(render);
+    // The PGXP tags are not saved; what was tagged before is no longer there.
+    bus.pgxp.clear();
+    sys.cpu.gte.tags.enabled = bus.pgxp.enabled();
     bus.spu = state.spu;
     // The disc stays the one that is inserted.
     let (disc, total_sectors) = (bus.cdrom.disc.take(), bus.cdrom.total_sectors);

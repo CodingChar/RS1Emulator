@@ -8,6 +8,8 @@
 //! Mirrors DuckStation's `gte.cpp`.
 use serde::{Deserialize, Serialize};
 
+use crate::pgxp::{GteTags, PreciseVertex};
+
 // ----- Data register indices (cop2r0-31) -----
 const VXY0: usize = 0;
 const VZ0: usize = 1;
@@ -92,15 +94,20 @@ pub struct Gte {
     pub data: [u32; 32],
     /// Control registers (`cop2r32`-`cop2r63`), stored as written.
     pub control: [u32; 32],
+    /// PGXP: the precise value of each SXY FIFO entry (see `crate::pgxp`).
+    #[serde(skip)]
+    pub tags: GteTags,
 }
 
 impl Gte {
     pub fn new() -> Self {
-        Self { data: [0; 32], control: [0; 32] }
+        Self { data: [0; 32], control: [0; 32], tags: GteTags::default() }
     }
 
     pub fn reset(&mut self) {
+        let enabled = self.tags.enabled;
         *self = Self::new();
+        self.tags.enabled = enabled;
     }
 
     // ----- Register access (MFC2 / MTC2 / CFC2 / CTC2) -----
@@ -120,6 +127,26 @@ impl Gte {
         }
     }
 
+    /// The PGXP tag of an SXY register that holds `value` (what `MFC2` and `SWC2`
+    /// of it would carry along), or nothing for the other registers.
+    pub fn sxy_tag(&self, reg: usize, value: u32) -> PreciseVertex {
+        match reg & 31 {
+            reg @ 12..=14 => self.tags.sxy[reg - SXY0].matching(value),
+            SXYP => self.tags.sxy[2].matching(value),
+            _ => PreciseVertex::NONE,
+        }
+    }
+
+    /// `write_data` for a value that came with a PGXP tag.
+    pub fn write_data_tagged(&mut self, reg: usize, value: u32, tag: PreciseVertex) {
+        self.write_data(reg, value);
+        match reg & 31 {
+            reg @ 12..=14 => self.tags.sxy[reg - SXY0] = tag,
+            SXYP => self.tags.sxy[2] = tag,
+            _ => {}
+        }
+    }
+
     /// Write a data register (`MTC2`, `LWC2`).
     pub fn write_data(&mut self, reg: usize, value: u32) {
         match reg & 31 {
@@ -128,6 +155,11 @@ impl Gte {
                 self.data[SXY0] = self.data[SXY1];
                 self.data[SXY1] = self.data[SXY2];
                 self.data[SXY2] = value;
+                self.tags.sxy = [self.tags.sxy[1], self.tags.sxy[2], PreciseVertex::NONE];
+            }
+            reg @ 12..=14 => {
+                self.data[reg] = value;
+                self.tags.sxy[reg - SXY0] = PreciseVertex::NONE;
             }
             // Writing IRGB expands 5-bit colour components into IR1..3.
             IRGB => {
@@ -432,12 +464,15 @@ impl Gte {
         let translation = self.control_vector(TR);
 
         let mut z = 0;
+        // The accumulators of X and Y before they are saturated into IR1 and IR2.
+        let mut raw = [0i64; 2];
         for i in 0..3 {
             let mut acc = (translation[i] as i64) << 12;
             for j in 0..3 {
                 acc = self.check_mac(i + 1, acc + rotation[i][j] as i64 * v[j] as i64);
             }
             if i < 2 {
+                raw[i] = acc;
                 self.set_mac_ir(i + 1, acc, shift, lm);
             } else {
                 // IR3's saturation flag looks at the value shifted by 12
@@ -481,9 +516,14 @@ impl Gte {
         self.set_mac0(y);
         let sy = self.clamp_screen((y >> 16) as i32, FLAG_SY_SATURATED);
 
+        let packed = (sx as u16 as u32) | ((sy as u16 as u32) << 16);
         self.data[SXY0] = self.data[SXY1];
         self.data[SXY1] = self.data[SXY2];
-        self.data[SXY2] = (sx as u16 as u32) | ((sy as u16 as u32) << 16);
+        self.data[SXY2] = packed;
+        if self.tags.enabled {
+            let tag = self.precise_screen(raw, shift, h, sz3 as u32, packed);
+            self.tags.sxy = [self.tags.sxy[1], self.tags.sxy[2], tag];
+        }
 
         // Depth cueing.
         let dqa = self.control[DQA] as i16 as i64;
@@ -498,6 +538,22 @@ impl Gte {
             ir0
         };
         self.data[IR0] = ir0 as u32;
+    }
+
+    /// The screen position `rtps` just computed without the truncation: the
+    /// hardware's `(OFX + IR1 * H / SZ3) >> 16`-style result in floating point.
+    /// `raw` are the X and Y accumulators, which are `IR * 2^shift` before their
+    /// saturation. Vertices at (or behind) the camera plane, where the divide
+    /// overflows and the hardware result is meaningless, get no tag.
+    fn precise_screen(&self, raw: [i64; 2], shift: u32, h: u32, sz3: u32, value: u32) -> PreciseVertex {
+        if sz3 == 0 || h >= sz3 * 2 {
+            return PreciseVertex::NONE;
+        }
+        let unit = (1u64 << shift) as f64;
+        let ratio = h as f64 / sz3 as f64;
+        let x = self.control[OFX] as i32 as f64 / 65536.0 + ratio * (raw[0] as f64 / unit);
+        let y = self.control[OFY] as i32 as f64 / 65536.0 + ratio * (raw[1] as f64 / unit);
+        PreciseVertex { x: x as f32, y: y as f32, w: sz3 as f32, value }
     }
 
     /// Clamp a screen coordinate to the 11-bit range.

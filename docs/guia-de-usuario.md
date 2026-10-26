@@ -36,19 +36,39 @@ Los discos se leen a medida que hacen falta, así que uno de 650 MB no consume m
 ## Menú rápido
 
 Se abre con **Esc**, **F1** o el botón **Home** del mando, y también desde la barra de
-herramientas. Pausa el juego mientras está abierto y no deja pasar ningún botón al juego.
-Se maneja con las flechas y Intro, con el mando (cruceta, ✕ para elegir, ○ para volver) o con
-el ratón. Ofrece:
+herramientas. Pausa el juego mientras está abierto, se ve a través de él (el juego queda
+detrás, desenfocado) y no deja pasar ningún botón al juego. Se maneja con las flechas y Intro,
+con el mando (cruceta, ✕ para elegir, ○ para volver) o con el ratón. Arriba está lo que más
+se usa:
 
-- reanudar y reiniciar,
-- guardar y cargar estado en tres ranuras,
-- cambiar el disco con el juego en marcha (los juegos de varios discos lo piden),
-- velocidad, modo analógico, volumen y silencio,
-- relación de aspecto (4:3 o rellenar) y filtro de imagen (píxeles nítidos o suavizado),
-- pantalla completa y ajustes.
+- **Reanudar**,
+- **Guardado rápido y carga rápida** (F5 y F7) de la ranura elegida: ◀ ▶ cambian de ranura sin salir del menú,
+- **ajustes rápidos**: volumen, relación de aspecto, escalado, PGXP, panel de rendimiento, velocidad y modo analógico,
+- páginas completas de **Pantalla y sonido**, **Gráficos** y **Panel de rendimiento**,
+- pantalla completa, cambiar el disco con el juego en marcha (los juegos de varios discos lo piden), reiniciar y ajustes.
 
 En pantalla completa, **Esc** abre el menú rápido (mantenlo pulsado para salir de la pantalla
 completa; si tu navegador no lo permite, usa **F1**). **Alt + Intro** alterna la pantalla completa.
+
+### Atajos de teclado
+
+Funcionan con el juego en marcha, en ventana y en pantalla completa:
+
+| Tecla | Acción |
+|---|---|
+| Esc · F1 · Home (mando) | menú rápido |
+| F5 / F7 | guardado y carga rápidos de la ranura elegida |
+| F6 | siguiente ranura de estado |
+| F2 | mostrar u ocultar el panel de rendimiento |
+| F3 | cambiar la relación de aspecto |
+| F4 | cambiar el escalado (1×, 2×, 3×) |
+| F8 | silenciar o activar el sonido |
+| F9 | modo analógico del mando 1 |
+| F10 | pausar o reanudar |
+| Re Pág / Av Pág | subir o bajar el volumen |
+| Alt + Intro | pantalla completa |
+
+Cada atajo muestra un aviso en pantalla con lo que ha hecho.
 
 ## Controles
 
@@ -106,6 +126,86 @@ barra de estado dice en qué punto está:
 - **Silenciado**: pulsa el altavoz de la barra de herramientas.
 - **Sin sonido a esta velocidad**: con velocidad ×2, ×4 o máxima no se reproduce audio.
 
+El **volumen** se cambia con el deslizador de la barra de herramientas, en *Ajustes → Audio*,
+en el menú rápido o con Re Pág / Av Pág; se recuerda. Es proporcional a lo que se oye (el
+deslizador no es lineal: el 50 % suena a medias, no a un cuarto).
+
+### Cortes y chasquidos
+
+El emulador produce el sonido en ráfagas, un fotograma cada vez, y la tarjeta de sonido lo
+consume con su propio reloj. Para que no se corte, el reproductor guarda una **reserva** de sonido
+y la mantiene estable: acelera o frena su reproducción como mucho un 1 % (no se oye) según se llene
+o se vacíe, y si aun así se vacía hace un fundido en lugar de cortar en seco y espera a que vuelva
+a llenarse. En *Ajustes → Audio → Reserva de sonido* se elige:
+
+- **Automática** (por defecto): empieza en 80 ms, crece sola cuando el sonido se corta y vuelve a
+  bajar tras unos segundos sin cortes.
+- **40, 70, 120 o 200 ms** fijos: más reserva es más seguro en un equipo lento; menos, más inmediato.
+
+Si el sonido se corta aunque la reserva sea grande, el equipo no llega a la velocidad real del juego:
+mira el panel de rendimiento (carga y porcentaje) y baja el escalado.
+
+## Pantalla
+
+*Ajustes → Pantalla* (o *Ver* y el menú rápido):
+
+- **Relación de aspecto**:
+  - *4:3 (original)*: como la consola.
+  - *16:9 (panorámica)*: estira la imagen a una pantalla panorámica. Para que las escenas 3D no se
+    vean estiradas, activa *Ensanchar escenas 3D* en *Gráficos* (necesita PGXP).
+  - *Ampliar sin deformar*: la imagen 4:3 llena toda la ventana o pantalla sin estirarse; recorta un
+    poco por arriba y por abajo en una pantalla panorámica.
+  - *Rellenar la ventana*: llena la ventana estirando la imagen.
+  - *Escala entera*: un número entero de píxeles del equipo por cada línea de la consola (píxeles
+    perfectos, con bandas negras).
+- **Recortar el borde negro** (poco, medio, mucho): la imagen de muchos juegos trae un borde negro; al
+  recortarlo la imagen ocupa más pantalla sin deformarse.
+- **Filtro de la imagen**: píxeles nítidos o suavizado.
+
+## Gráficos
+
+*Ajustes → Gráficos* cambia cómo dibuja el emulador; lo que ve el juego no cambia, y con todo en
+los valores predeterminados la imagen es la de la consola, píxel a píxel.
+
+- **Escalado (resolución interna y texturas)**: *Nativo* (1×, predeterminado), *2×* o *3×*. Dibuja la
+  imagen con 2 o 3 veces más píxeles en cada dirección, y las texturas con ella. La geometría gana
+  definición (bordes finos, sin escalones), las texturas se ven más grandes y nítidas, y el texto y los menús
+  en 2D siguen igual de limpios porque los sprites no se filtran.
+- **Filtro de texturas**: *sin filtro* (los píxeles de la consola) o *bilineal*, que mezcla los 4 texels
+  vecinos (los transparentes no tiñen los bordes y la mezcla no se sale de la textura del polígono).
+- **PGXP: geometría de precisión**: la GTE de la consola redondea cada vértice a píxeles enteros, y de ahí
+  viene el temblor de los polígonos y la deformación de las texturas. PGXP (la técnica de Beetle PSX y de
+  DuckStation) conserva la posición sin redondear que la GTE calculó y la usa para dibujar. Se nota
+  sobre todo con 2× o 3×. Incluye:
+  - **Texturas con perspectiva correcta**: la consola mapea las texturas sin perspectiva (se deforman en
+    suelos y paredes inclinados); con esta opción se interpola con la profundidad de cada vértice.
+  - **Ensanchar escenas 3D (16:9)**: comprime horizontalmente la geometría 3D (3/4 respecto del centro) para
+    que, mostrada a 16:9, no se vea estirada. Los elementos 2D (menús, marcadores) se estiran, y los juegos que
+    no dibujan los polígonos fuera de la pantalla 4:3 dejan huecos en los lados.
+- **Color verdadero (24 bits)**: dibuja y mezcla con 8 bits por canal, sin el recorte a 15 bits ni el
+  tramado de la consola (más degradados suaves, sin patrón de puntos).
+
+Cada mejora cuesta tiempo: con 2× son 4 veces más píxeles y con 3× son 9 veces más; el filtro bilineal
+es el más caro. Si el juego va más lento que la consola (el porcentaje de la barra de estado baja de
+100 %), baja el escalado, quita el filtro bilineal o desactiva PGXP. Los estados guardados no incluyen
+la información de PGXP: tras cargar uno, los polígonos que ya estaban preparados se dibujan con posiciones
+enteras hasta el cuadro siguiente.
+
+## Panel de rendimiento
+
+**F2** (o *Ajustes → Panel de rendimiento*) muestra sobre la imagen las cifras que tú elijas:
+
+- **FPS**: cuadros por segundo del juego,
+- **Velocidad de emulación**: porcentaje respecto de la consola real,
+- **Tiempo por cuadro**: lo que tardan la emulación y el dibujo, y el mayor intervalo entre cuadros,
+- **Carga del procesador**: porcentaje del tiempo de cada cuadro que se gasta (por encima de 100 % no llega),
+- **Resolución y renderizado**: tamaño de la imagen de la consola y de la que se dibuja, escalado, PGXP, filtro,
+- **Búfer de audio**: sonido en reserva, objetivo y cortes,
+- **Memoria** del emulador.
+
+Se puede colocar en cualquiera de las cuatro esquinas. Las cifras que se salen de lo normal se ponen
+en amarillo o rojo. Con el panel oculto no cuesta nada.
+
 ## Velocidad
 
 Normal, ×2, ×4 o máxima, desde el menú rápido o *Ajustes → General*. En un equipo lento el
@@ -120,7 +220,9 @@ porcentaje de la barra de estado baja de 100 %: el juego va más despacio que la
 | El juego no arranca | Comprueba que el disco es de PS1 y que la BIOS es de la misma región o compatible. |
 | No suena | Mira el indicador de sonido (arriba) y que la velocidad sea normal. |
 | El mando no aparece | Pulsa un botón con la página en primer plano; prueba otro puerto USB. |
-| Va a saltos | Baja la velocidad objetivo o cierra otras pestañas pesadas. |
+| Va a saltos | Baja el escalado, desactiva PGXP o el filtro bilineal, baja la velocidad objetivo o cierra otras pestañas pesadas. |
+| El sonido se corta | Pon la reserva de sonido en Automática o más alta, y mira en el panel de rendimiento si la carga pasa de 100 %. |
+| La imagen se ve estirada | Elige *Ampliar sin deformar* o *Escala entera* en Pantalla; con 16:9, activa *Ensanchar escenas 3D*. |
 | Una tarjeta se perdió | El navegador pudo borrar sus datos; importa una copia exportada. |
 
 ## Para quien desarrolla

@@ -46,6 +46,8 @@ impl Interpreter {
         let user_mode = sr & SR_KUC != 0;
         let cache_isolated = sr & SR_ISC != 0;
         let cop2_usable = sr & SR_CU2 != 0;
+        // PGXP tags follow words through registers and memory (see `crate::pgxp`).
+        let pgxp = bus.pgxp.enabled();
 
         let mut pc = self.pc;
         let mut next_pc = self.next_pc;
@@ -444,6 +446,9 @@ impl Interpreter {
                     commit!();
                     charge_ram_read!(phys);
                     load!(rt, value);
+                    if pgxp && rt != 0 {
+                        self.pgxp_regs[rt] = bus.pgxp.lookup(phys, value);
+                    }
                 }
                 // ---- stores (RAM and scratchpad only; I/O goes the slow way)
                 0x28 => {
@@ -493,6 +498,9 @@ impl Interpreter {
                     } else {
                         break;
                     }
+                    if pgxp {
+                        bus.pgxp.store(phys, self.pgxp_regs[rt].matching(value));
+                    }
                 }
                 // ---- the GTE (COP2); without SR.CU2 these raise an exception
                 0x12 => {
@@ -514,6 +522,9 @@ impl Interpreter {
                                 stall_for_gte!();
                                 let value = self.gte.read_data(rd);
                                 load!(rt, value);
+                                if pgxp && rt != 0 {
+                                    self.pgxp_regs[rt] = self.gte.sxy_tag(rd, value);
+                                }
                             }
                             0x02 => {
                                 commit!();
@@ -524,7 +535,12 @@ impl Interpreter {
                             0x04 => {
                                 commit!();
                                 stall_for_gte!();
-                                self.gte.write_data(rd, self.regs[rt]);
+                                let value = self.regs[rt];
+                                if pgxp {
+                                    self.gte.write_data_tagged(rd, value, self.pgxp_regs[rt].matching(value));
+                                } else {
+                                    self.gte.write_data(rd, value);
+                                }
                             }
                             0x06 => {
                                 commit!();
@@ -551,7 +567,12 @@ impl Interpreter {
                     commit!();
                     stall_for_gte!();
                     charge_ram_read!(phys);
-                    self.gte.write_data(rt, value);
+                    if pgxp {
+                        let tag = bus.pgxp.lookup(phys, value);
+                        self.gte.write_data_tagged(rt, value, tag);
+                    } else {
+                        self.gte.write_data(rt, value);
+                    }
                 }
                 // SWC2: store a GTE data register.
                 0x3A => {
@@ -569,6 +590,9 @@ impl Interpreter {
                         write_le(&mut bus.scratchpad, (phys & 0x3FF) as usize, 4, self.gte.read_data(rt));
                     } else {
                         break;
+                    }
+                    if pgxp {
+                        bus.pgxp.store(phys, self.gte.sxy_tag(rt, self.gte.read_data(rt)));
                     }
                 }
                 // COP0, LWL/LWR/SWL/SWR, reserved opcodes...

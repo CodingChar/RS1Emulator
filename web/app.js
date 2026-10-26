@@ -3,7 +3,9 @@
 
 import { AudioOutput } from './audio.js';
 import { Input, BUTTON_LABELS, PAD_ACTIONS, PAD_STICKS, PORT_CHOICES, entryName, keyName } from './input.js';
-import { loadSettings, saveSettings } from './settings.js';
+import { computeLayout } from './layout.js';
+import { PerfOverlay } from './overlay.js';
+import { OVERLAY_ITEMS, OVERLAY_POSITIONS, loadSettings, renderOptions, saveSettings } from './settings.js';
 import { MenuUI, PadNavigator, Toasts } from './ui.js';
 
 const $ = (id) => document.getElementById(id);
@@ -13,12 +15,26 @@ const SLOTS = [1, 2, 3];
 const SPEEDS = ['1', '2', '4', 'max'];
 const SPEED_LABELS = { 1: 'Normal', 2: '×2', 4: '×4', max: 'Máxima' };
 const SPEED_CHIPS = { 1: '×1', 2: '×2', 4: '×4', max: 'Máx.' };
-const ASPECTS = [['4:3', '4:3 (original)'], ['fill', 'Rellenar']];
+const ASPECTS = [
+    ['4:3', '4:3 (original)'],
+    ['16:9', '16:9 (panorámica)'],
+    ['cover', 'Ampliar sin deformar'],
+    ['fill', 'Rellenar (se estira)'],
+    ['integer', 'Escala entera'],
+];
+const CROP_LABELS = ['No recortar', 'Poco', 'Medio', 'Mucho'];
 const FILTERS = [['nearest', 'Píxeles nítidos'], ['linear', 'Suavizado']];
+const SCALES = [1, 2, 3];
+const SCALE_LABELS = { 1: 'Nativo (1×)', 2: '2×', 3: '3×' };
+const TEXTURE_FILTERS = [['nearest', 'Sin filtro'], ['bilinear', 'Bilineal']];
+const LATENCIES = ['auto', 40, 70, 120, 200];
+const latencyName = (value) => (value === 'auto' ? 'Automática' : `${value} ms`);
+
 /// Status texts that only echo a pause or resume the page itself asked for.
 const QUIET_STATUS = new Set(['En pausa.', 'En marcha.']);
 
 const screen = $('screen');
+const viewport = $('viewport');
 const stage = $('stage');
 const statusLine = $('status');
 const statsLine = $('stats');
@@ -36,6 +52,7 @@ const settings = loadSettings();
 const input = new Input();
 const audio = new AudioOutput();
 const toasts = new Toasts($('osd'));
+const overlay = new PerfOverlay($('perf-overlay'));
 const menu = new MenuUI($('fs-overlay'));
 const padNavigator = new PadNavigator();
 const dialog = $('settings-dialog');
@@ -54,6 +71,10 @@ let biosName = '';
 let resumeAfterMenu = false;
 /// Used only when the browser cannot hand the canvas to the worker.
 let fallbackContext = null;
+/// The latest report of the worker (frame rate, timings) and the size of the picture.
+let workerStats = null;
+let frameSize = { width: 320, height: 240, nativeWidth: 320, nativeHeight: 240 };
+let audioStarting = null;
 
 function say(message, isError = false) {
     statusLine.textContent = message;
@@ -74,6 +95,11 @@ function formatBytes(bytes) {
 
 function inGame() {
     return running || paused;
+}
+
+/// Sound is expected only while the game runs at normal speed.
+function refreshAudioActivity() {
+    audio.setActive(running && settings.speed === '1');
 }
 
 function refreshButtons() {
@@ -107,9 +133,17 @@ function connectAudio() {
 }
 
 async function startAudio() {
-    const first = !audio.available;
-    await audio.start();
-    if (first && audio.available) connectAudio();
+    // Several events can ask at once (a click and a key press): only one starts it.
+    if (!audioStarting) {
+        audioStarting = (async () => {
+            const first = !audio.available;
+            await audio.start();
+            if (first && audio.available) connectAudio();
+        })().finally(() => {
+            audioStarting = null;
+        });
+    }
+    return audioStarting;
 }
 
 function onWorkerMessage(event) {
@@ -118,6 +152,7 @@ function onWorkerMessage(event) {
         case 'ready':
             ready = true;
             applySpeed(settings.speed);
+            sendRender();
             if (!message.persistent) {
                 setState('cards-state', 'Este navegador no permite guardar datos: las tarjetas se pierden al recargar. Usa Exportar.');
             }
@@ -128,6 +163,7 @@ function onWorkerMessage(event) {
             break;
         case 'state':
             ({ biosLoaded, discLoaded, running, paused } = message);
+            refreshAudioActivity();
             refreshButtons();
             break;
         case 'bios': {
@@ -145,10 +181,16 @@ function onWorkerMessage(event) {
             break;
         }
         case 'stats': {
+            workerStats = message;
             const percent = Math.round((message.fps / message.full) * 100);
             statsLine.textContent = `${message.fps.toFixed(1)} fps · ${percent} %`;
+            refreshOverlay();
             break;
         }
+        case 'frame-size':
+            frameSize = message;
+            layoutScreen();
+            break;
         case 'frame':
             drawFallbackFrame(message);
             break;
@@ -277,6 +319,7 @@ function applySpeed(choice) {
     const value = choice === 'max' ? 'max' : Number(choice);
     worker.postMessage({ type: 'speed', value });
     $('speed-chip').textContent = SPEED_CHIPS[choice] || '×1';
+    refreshAudioActivity();
     refreshAudioChip();
 }
 
@@ -288,11 +331,15 @@ function setSpeed(choice) {
 }
 
 function setVolume(percent) {
-    settings.volume = Math.max(0, Math.min(100, percent));
-    $('volume').value = settings.volume;
+    settings.volume = Math.max(0, Math.min(100, Math.round(percent)));
     saveSettings(settings);
     audio.setVolume(settings.volume / 100);
     refreshAudioChip();
+}
+
+function adjustVolume(delta) {
+    setVolume(settings.volume + delta);
+    toasts.show(settings.muted ? 'Sonido silenciado' : `Volumen ${settings.volume} %`);
 }
 
 function setMuted(muted) {
@@ -305,13 +352,29 @@ function setMuted(muted) {
     refreshAudioChip();
 }
 
+function setAudioLatency(value) {
+    settings.audioLatency = value;
+    saveSettings(settings);
+    audio.setLatency(value);
+    $('audio-latency').value = String(value);
+}
+
+/// Put a value in a form control unless it already has it (so a slider being dragged is left alone).
+function show(element, value) {
+    const text = String(value);
+    if (element.value !== text) element.value = text;
+}
+
 /// The speaker button, the status-bar chip and the volume sliders, kept in step.
 function refreshAudioChip() {
     const tool = $('btn-mute-tool');
     tool.textContent = settings.muted || settings.volume === 0 ? '🔇' : '🔊';
     tool.setAttribute('aria-pressed', String(settings.muted));
     tool.title = settings.muted ? 'Activar el sonido' : 'Silenciar';
-    $('volume-tool').value = settings.volume;
+    show($('volume-tool'), settings.volume);
+    $('volume-tool').title = `Volumen ${settings.volume} %`;
+    show($('volume'), settings.volume);
+    $('volume-label').textContent = `${settings.volume} %`;
 
     const chip = $('audio-chip');
     let text = '🔊 Sonido activo';
@@ -333,11 +396,42 @@ function refreshAudioChip() {
         : 'Clic para silenciar o activar el sonido';
 }
 
+// ----- Picture: aspect ratio, crop, filter -----
+
+/// Place the picture in the stage according to the aspect option (see `computeLayout`).
+function layoutScreen() {
+    const width = stage.clientWidth;
+    const height = stage.clientHeight;
+    if (!width || !height) return;
+    const { box, image } = computeLayout({
+        width,
+        height,
+        aspect: settings.aspect,
+        crop: settings.crop,
+        lines: frameSize.nativeHeight || 240,
+        ratio: window.devicePixelRatio || 1,
+    });
+    const px = (value) => `${Math.round(value * 100) / 100}px`;
+    const view = viewport.style;
+    view.transform = 'none';
+    view.aspectRatio = 'auto';
+    view.width = px(box.w);
+    view.height = px(box.h);
+    view.left = px(box.x);
+    view.top = px(box.y);
+    const canvas = screen.style;
+    canvas.width = px(image.w);
+    canvas.height = px(image.h);
+    canvas.left = px(image.x);
+    canvas.top = px(image.y);
+}
+
 function applyDisplay() {
-    stage.classList.toggle('aspect-fill', settings.aspect === 'fill');
     stage.classList.toggle('filter-linear', settings.filter === 'linear');
     $('aspect').value = settings.aspect;
+    $('crop').value = String(settings.crop);
     $('filter').value = settings.filter;
+    layoutScreen();
 }
 
 function setAspect(value) {
@@ -346,10 +440,94 @@ function setAspect(value) {
     applyDisplay();
 }
 
+function setCrop(level) {
+    settings.crop = level;
+    saveSettings(settings);
+    applyDisplay();
+}
+
 function setFilter(value) {
     settings.filter = value;
     saveSettings(settings);
     applyDisplay();
+}
+
+// ----- Graphics -----
+
+/// Tell the worker how to render, and keep the controls that show it in step.
+function sendRender() {
+    if (worker) worker.postMessage({ type: 'render', options: renderOptions(settings) });
+    refreshGraphicsControls();
+    refreshOverlay();
+}
+
+function setRender(patch) {
+    Object.assign(settings, patch);
+    saveSettings(settings);
+    sendRender();
+}
+
+function setScale(scale) {
+    setRender({ scale });
+}
+
+function setPgxp(enabled) {
+    setRender({ pgxp: enabled });
+}
+
+function setWidescreen(enabled) {
+    setRender({ widescreen: enabled });
+    // A 16:9 picture is what makes the squeezed geometry look right.
+    if (enabled && settings.pgxp && settings.aspect === '4:3') {
+        setAspect('16:9');
+        toasts.show('Relación de aspecto 16:9 para las escenas ensanchadas');
+    }
+}
+
+function refreshGraphicsControls() {
+    $('scale').value = String(settings.scale);
+    $('texture-filter').value = settings.textureFilter;
+    $('pgxp').checked = settings.pgxp;
+    $('pgxp-textures').checked = settings.pgxpTextures;
+    $('widescreen').checked = settings.widescreen;
+    $('true-color').checked = settings.trueColor;
+    // These two only do something with PGXP.
+    for (const id of ['pgxp-textures', 'widescreen']) {
+        $(id).disabled = !settings.pgxp;
+        $(id).closest('.check').classList.toggle('disabled', !settings.pgxp);
+    }
+}
+
+// ----- Performance overlay -----
+
+function refreshOverlay() {
+    overlay.update({
+        worker: workerStats,
+        running,
+        speed: settings.speed === 'max' ? null : Number(settings.speed),
+        audio: audio.stats,
+        render: renderOptions(settings),
+        native: { width: frameSize.nativeWidth, height: frameSize.nativeHeight },
+    });
+}
+
+function applyOverlay() {
+    overlay.configure(settings.overlay);
+    $('overlay-enabled').checked = settings.overlay.enabled;
+    $('overlay-position').value = settings.overlay.position;
+    for (const key of Object.keys(OVERLAY_ITEMS)) $(`overlay-item-${key}`).checked = !!settings.overlay[key];
+    refreshOverlay();
+}
+
+function setOverlay(patch) {
+    settings.overlay = { ...settings.overlay, ...patch };
+    saveSettings(settings);
+    applyOverlay();
+}
+
+function toggleOverlay() {
+    setOverlay({ enabled: !settings.overlay.enabled });
+    toasts.show(settings.overlay.enabled ? 'Panel de rendimiento activado' : 'Panel de rendimiento oculto');
 }
 
 function toggleAnalog() {
@@ -403,12 +581,20 @@ const menuBarSpec = {
         { label: document.fullscreenElement ? 'Salir de pantalla completa' : 'Pantalla completa', shortcut: 'Alt+Intro', run: toggleFullscreen },
         { rule: true },
         ...ASPECTS.map(([value, name]) => ({ label: `${settings.aspect === value ? '● ' : '○ '}Aspecto: ${name}`, run: () => setAspect(value) })),
+        { rule: true },
+        ...SCALES.map((scale) => ({ label: `${settings.scale === scale ? '● ' : '○ '}Escalado: ${SCALE_LABELS[scale]}`, run: () => setScale(scale) })),
+        { label: `${settings.pgxp ? '☑' : '☐'} PGXP (geometría de precisión)`, run: () => setPgxp(!settings.pgxp) },
+        { rule: true },
+        { label: `${settings.overlay.enabled ? '☑' : '☐'} Panel de rendimiento`, shortcut: 'F2', run: toggleOverlay },
         ...FILTERS.map(([value, name]) => ({ label: `${settings.filter === value ? '● ' : '○ '}Filtro: ${name}`, run: () => setFilter(value) })),
     ],
     settings: () => [
         { label: 'Configuración…', run: () => openSettings('general') },
         { label: 'Controles…', run: () => openSettings('controls') },
         { label: 'Audio…', run: () => openSettings('audio') },
+        { label: 'Pantalla…', run: () => openSettings('display') },
+        { label: 'Gráficos…', run: () => openSettings('graphics') },
+        { label: 'Panel de rendimiento…', run: () => openSettings('overlay') },
         { label: 'Tarjetas de memoria…', run: () => openSettings('cards') },
         { rule: true },
         { label: 'Alternar modo analógico', shortcut: 'F9', run: toggleAnalog },
@@ -484,89 +670,118 @@ function closeQuickMenu() {
     menu.close();
 }
 
-function slotPage(kind) {
-    const saving = kind === 'save';
+/// A row with a yes/no value that left, right and accept all flip.
+function switchRow(icon, label, get, set, disabled = () => false) {
+    const flip = () => set(!get());
+    return { icon, label, disabled: disabled(), value: () => (get() ? 'Sí' : 'No'), left: flip, right: flip };
+}
+
+/// A row that steps through a list of values with left and right.
+function choiceRow(icon, label, values, get, set, name) {
     return {
-        title: saving ? 'Guardar estado' : 'Cargar estado',
-        subtitle: () => 'Elige una ranura',
-        items: () => SLOTS.map((slot) => ({
-            icon: saving ? '💾' : '📂',
-            label: `Ranura ${slot}`,
-            value: () => (settings.slot === slot ? 'Actual' : ''),
-            accept: () => {
-                setSlot(slot);
-                if (saving) saveState(slot);
-                else loadState(slot);
-                closeQuickMenu();
-            },
-        })),
+        icon,
+        label,
+        value: () => name(get()),
+        left: () => set(cycle(values, get(), -1)),
+        right: () => set(cycle(values, get(), 1)),
     };
 }
+
+const aspectRow = () => choiceRow('▭', 'Relación de aspecto', ASPECTS.map(([value]) => value), () => settings.aspect, setAspect,
+    (value) => ASPECTS.find(([id]) => id === value)[1]);
+const cropRow = () => choiceRow('✂', 'Recortar el borde negro', [0, 1, 2, 3], () => settings.crop, setCrop, (level) => CROP_LABELS[level]);
+const volumeRow = () => ({
+    icon: '🔊',
+    label: 'Volumen',
+    value: () => (settings.muted ? 'Silenciado' : `${settings.volume} %`),
+    left: () => setVolume(settings.volume - 5),
+    right: () => setVolume(settings.volume + 5),
+});
+const scaleRow = () => choiceRow('🖥', 'Escalado de imagen y texturas', SCALES, () => settings.scale, setScale, (scale) => SCALE_LABELS[scale]);
+const pgxpRow = () => switchRow('✨', 'PGXP (geometría de precisión)', () => settings.pgxp, setPgxp);
+const overlayRow = () => switchRow('📊', 'Panel de rendimiento', () => settings.overlay.enabled, (enabled) => setOverlay({ enabled }));
 
 function displayPage() {
     return {
         title: 'Pantalla y sonido',
         subtitle: () => 'Se recuerdan en este navegador',
         items: () => [
-            {
-                icon: '▭',
-                label: 'Relación de aspecto',
-                value: () => ASPECTS.find(([value]) => value === settings.aspect)[1],
-                left: () => setAspect(cycle(ASPECTS.map(([value]) => value), settings.aspect, -1)),
-                right: () => setAspect(cycle(ASPECTS.map(([value]) => value), settings.aspect, 1)),
-            },
-            {
-                icon: '◫',
-                label: 'Filtro de la imagen',
-                value: () => FILTERS.find(([value]) => value === settings.filter)[1],
-                left: () => setFilter(cycle(FILTERS.map(([value]) => value), settings.filter, -1)),
-                right: () => setFilter(cycle(FILTERS.map(([value]) => value), settings.filter, 1)),
-            },
-            {
-                icon: '🔊',
-                label: 'Volumen',
-                value: () => `${settings.volume} %`,
-                left: () => setVolume(settings.volume - 10),
-                right: () => setVolume(settings.volume + 10),
-            },
-            {
-                icon: '🔇',
-                label: 'Silenciar',
-                value: () => (settings.muted ? 'Sí' : 'No'),
-                left: () => setMuted(!settings.muted),
-                right: () => setMuted(!settings.muted),
-            },
+            aspectRow(),
+            cropRow(),
+            choiceRow('◫', 'Filtro de la imagen', FILTERS.map(([value]) => value), () => settings.filter, setFilter,
+                (value) => FILTERS.find(([id]) => id === value)[1]),
+            volumeRow(),
+            switchRow('🔇', 'Silenciar', () => settings.muted, setMuted),
+            choiceRow('⏱', 'Reserva de sonido', LATENCIES, () => settings.audioLatency, setAudioLatency, latencyName),
         ],
     };
 }
 
+function graphicsPage() {
+    return {
+        title: 'Gráficos',
+        subtitle: () => 'Más resolución y precisión cuestan velocidad',
+        items: () => [
+            scaleRow(),
+            choiceRow('🧱', 'Filtro de texturas', TEXTURE_FILTERS.map(([value]) => value), () => settings.textureFilter,
+                (textureFilter) => setRender({ textureFilter }), (value) => TEXTURE_FILTERS.find(([id]) => id === value)[1]),
+            pgxpRow(),
+            switchRow('🧭', 'Texturas con perspectiva', () => settings.pgxpTextures, (pgxpTextures) => setRender({ pgxpTextures }), () => !settings.pgxp),
+            switchRow('↔', 'Ensanchar escenas 3D (16:9)', () => settings.widescreen, setWidescreen, () => !settings.pgxp),
+            switchRow('🎨', 'Color verdadero (24 bits)', () => settings.trueColor, (trueColor) => setRender({ trueColor })),
+        ],
+    };
+}
+
+function overlayPage() {
+    return {
+        title: 'Panel de rendimiento',
+        subtitle: () => 'Elige qué datos ver sobre la imagen (F2)',
+        items: () => [
+            overlayRow(),
+            choiceRow('⌖', 'Posición', OVERLAY_POSITIONS.map(([value]) => value), () => settings.overlay.position,
+                (position) => setOverlay({ position }), (value) => OVERLAY_POSITIONS.find(([id]) => id === value)[1]),
+            ...Object.entries(OVERLAY_ITEMS).map(([key, label]) =>
+                switchRow('·', label, () => !!settings.overlay[key], (value) => setOverlay({ [key]: value }))),
+        ],
+    };
+}
+
+/// The quick menu has what is needed most at the top (resume, quick save and load, volume,
+/// picture) and the full pages below it.
 function rootPage() {
     const playing = inGame();
+    const stepSlot = (step) => setSlot(cycle(SLOTS, settings.slot, step));
     return {
         title: playing ? 'Menú rápido' : 'RS1Emu',
         subtitle: () => (playing ? discName || 'Sin disco' : biosLoaded ? 'Listo para jugar' : 'Falta la BIOS'),
         items: () => {
             const items = [];
             if (playing) {
-                items.push({ icon: '▶', label: 'Reanudar', accept: closeQuickMenu });
-                items.push({ separator: true, label: 'Estados' });
-                items.push({ icon: '💾', label: 'Guardar estado', submenu: true, accept: () => menu.push(slotPage('save')) });
-                items.push({ icon: '📂', label: 'Cargar estado', submenu: true, accept: () => menu.push(slotPage('load')) });
-                items.push({ separator: true, label: 'Juego' });
+                items.push({ icon: '▶', label: 'Reanudar', hint: 'Esc', accept: closeQuickMenu });
+                items.push({ separator: true, label: 'Guardado rápido' });
                 items.push({
-                    icon: '⏏',
-                    label: 'Cambiar disco…',
+                    icon: '💾',
+                    label: 'Guardar estado',
+                    hint: 'F5',
+                    value: () => `Ranura ${settings.slot}`,
+                    left: () => stepSlot(-1),
+                    right: () => stepSlot(1),
                     accept: () => {
-                        $('swap-input').click();
+                        saveState();
                         closeQuickMenu();
                     },
                 });
                 items.push({
-                    icon: '↻',
-                    label: 'Reiniciar',
+                    icon: '📂',
+                    label: 'Cargar estado',
+                    hint: 'F7',
+                    value: () => `Ranura ${settings.slot}`,
+                    left: () => stepSlot(-1),
+                    right: () => stepSlot(1),
                     accept: () => {
+                        loadState();
                         closeQuickMenu();
-                        startConsole();
                     },
                 });
             } else {
@@ -597,14 +812,13 @@ function rootPage() {
                     },
                 });
             }
-            items.push({ separator: true, label: 'Opciones rápidas' });
-            items.push({
-                icon: '⏩',
-                label: 'Velocidad',
-                value: () => SPEED_LABELS[settings.speed],
-                left: () => setSpeed(cycle(SPEEDS, settings.speed, -1)),
-                right: () => setSpeed(cycle(SPEEDS, settings.speed, 1)),
-            });
+            items.push({ separator: true, label: 'Ajustes rápidos' });
+            items.push(volumeRow());
+            items.push(aspectRow());
+            items.push(scaleRow());
+            items.push(pgxpRow());
+            items.push(overlayRow());
+            items.push(choiceRow('⏩', 'Velocidad', SPEEDS, () => settings.speed, setSpeed, (value) => SPEED_LABELS[value]));
             items.push({
                 icon: '🎮',
                 label: 'Modo analógico (mando 1)',
@@ -612,22 +826,37 @@ function rootPage() {
                 left: toggleAnalog,
                 right: toggleAnalog,
             });
-            items.push({
-                icon: '🔊',
-                label: 'Volumen',
-                value: () => (settings.muted ? 'Silenciado' : `${settings.volume} %`),
-                left: () => setVolume(settings.volume - 10),
-                right: () => setVolume(settings.volume + 10),
-            });
+            items.push({ separator: true, label: 'Más opciones' });
             items.push({ icon: '🖥', label: 'Pantalla y sonido', submenu: true, accept: () => menu.push(displayPage()) });
+            items.push({ icon: '🎨', label: 'Gráficos', submenu: true, accept: () => menu.push(graphicsPage()) });
+            items.push({ icon: '📊', label: 'Panel de rendimiento', submenu: true, accept: () => menu.push(overlayPage()) });
             items.push({
                 icon: '⛶',
                 label: document.fullscreenElement ? 'Salir de pantalla completa' : 'Pantalla completa',
+                hint: 'Alt+Intro',
                 accept: () => {
                     toggleFullscreen();
                     closeQuickMenu();
                 },
             });
+            if (playing) {
+                items.push({
+                    icon: '⏏',
+                    label: 'Cambiar disco…',
+                    accept: () => {
+                        $('swap-input').click();
+                        closeQuickMenu();
+                    },
+                });
+                items.push({
+                    icon: '↻',
+                    label: 'Reiniciar',
+                    accept: () => {
+                        closeQuickMenu();
+                        startConsole();
+                    },
+                });
+            }
             items.push({
                 icon: '⚙',
                 label: 'Configuración…',
@@ -651,6 +880,38 @@ const MENU_KEYS = {
     Backspace: 'back',
 };
 
+/// Shortcuts that work while the game runs, in a window or in full screen.
+const HOTKEYS = {
+    Escape: () => openQuickMenu(),
+    F1: () => openQuickMenu(),
+    F2: toggleOverlay,
+    F3: () => {
+        setAspect(cycle(ASPECTS.map(([value]) => value), settings.aspect, 1));
+        toasts.show(`Aspecto: ${ASPECTS.find(([value]) => value === settings.aspect)[1]}`);
+    },
+    F4: () => {
+        setScale(cycle(SCALES, settings.scale, 1));
+        toasts.show(`Escalado: ${SCALE_LABELS[settings.scale]}`);
+    },
+    F5: () => saveState(),
+    F6: () => {
+        setSlot(cycle(SLOTS, settings.slot, 1));
+        toasts.show(`Ranura de estado ${settings.slot}`);
+    },
+    F7: () => loadState(),
+    F8: () => {
+        setMuted(!settings.muted);
+        toasts.show(settings.muted ? 'Sonido silenciado' : `Sonido activado (${settings.volume} %)`);
+    },
+    F10: () => {
+        if (!inGame()) return;
+        toasts.show(paused ? 'Juego reanudado' : 'Juego en pausa');
+        togglePause();
+    },
+    PageUp: () => adjustVolume(5),
+    PageDown: () => adjustVolume(-5),
+};
+
 window.addEventListener('keydown', (event) => {
     if (dialog.open) return;
     if (menu.isOpen) {
@@ -663,18 +924,12 @@ window.addEventListener('keydown', (event) => {
         }
         return;
     }
-    if (event.code === 'Escape' || event.code === 'F1') {
-        event.preventDefault();
-        openQuickMenu();
-    } else if (event.code === 'Enter' && event.altKey) {
+    if (event.code === 'Enter' && event.altKey) {
         event.preventDefault();
         toggleFullscreen();
-    } else if (event.code === 'F5') {
+    } else if (HOTKEYS[event.code] && !event.ctrlKey && !event.altKey && !event.metaKey) {
         event.preventDefault();
-        saveState();
-    } else if (event.code === 'F7') {
-        event.preventDefault();
-        loadState();
+        HOTKEYS[event.code]();
     }
 }, true);
 
@@ -710,16 +965,21 @@ dialog.addEventListener('click', (event) => {
 });
 
 $('speed').addEventListener('change', (event) => setSpeed(event.target.value));
-$('volume').addEventListener('input', (event) => setVolume(Number(event.target.value)));
+// Read the slider before anything else: starting the audio refreshes the controls.
+$('volume').addEventListener('input', (event) => {
+    setVolume(Number(event.target.value));
+    startAudio();
+});
 $('btn-mute').addEventListener('click', () => setMuted(!settings.muted));
 $('btn-mute-tool').addEventListener('click', () => {
-    startAudio();
     setMuted(!settings.muted);
+    startAudio();
 });
 $('volume-tool').addEventListener('input', (event) => {
-    startAudio();
     setVolume(Number(event.target.value));
+    startAudio();
 });
+$('audio-latency').addEventListener('change', (event) => setAudioLatency(event.target.value === 'auto' ? 'auto' : Number(event.target.value)));
 $('audio-chip').addEventListener('click', async () => {
     // Unblock a waiting context first; otherwise the chip toggles the sound.
     if (!settings.muted && settings.speed === '1' && audio.status !== 'running') {
@@ -740,17 +1000,51 @@ document.addEventListener('visibilitychange', () => {
     if (!document.hidden && audio.status === 'suspended') audio.context.resume().catch(() => {});
 });
 $('aspect').addEventListener('change', (event) => setAspect(event.target.value));
+$('crop').addEventListener('change', (event) => setCrop(Number(event.target.value)));
 $('filter').addEventListener('change', (event) => setFilter(event.target.value));
+
+$('scale').addEventListener('change', (event) => setScale(Number(event.target.value)));
+$('texture-filter').addEventListener('change', (event) => setRender({ textureFilter: event.target.value }));
+$('pgxp').addEventListener('change', (event) => setPgxp(event.target.checked));
+$('pgxp-textures').addEventListener('change', (event) => setRender({ pgxpTextures: event.target.checked }));
+$('widescreen').addEventListener('change', (event) => setWidescreen(event.target.checked));
+$('true-color').addEventListener('change', (event) => setRender({ trueColor: event.target.checked }));
+
+$('overlay-enabled').addEventListener('change', (event) => setOverlay({ enabled: event.target.checked }));
+$('overlay-position').addEventListener('change', (event) => setOverlay({ position: event.target.value }));
+
+/// The overlay page lists what can be shown, one switch each.
+function buildOverlayControls() {
+    const position = $('overlay-position');
+    for (const [value, name] of OVERLAY_POSITIONS) position.add(new Option(name, value));
+    const list = $('overlay-items');
+    for (const [key, name] of Object.entries(OVERLAY_ITEMS)) {
+        const label = document.createElement('label');
+        label.className = 'check';
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.id = `overlay-item-${key}`;
+        box.addEventListener('change', () => setOverlay({ [key]: box.checked }));
+        const text = document.createElement('span');
+        text.textContent = name;
+        label.append(box, text);
+        list.append(label);
+    }
+}
 
 /// Show the saved preferences and hand them to the audio output and the worker.
 function restoreSettings() {
-    $('volume').value = settings.volume;
     $('speed').value = settings.speed;
     $('slot').value = String(settings.slot);
     $('speed-chip').textContent = SPEED_CHIPS[settings.speed] || '×1';
     audio.setVolume(settings.volume / 100);
+    audio.setLatency(settings.audioLatency);
+    $('audio-latency').value = String(settings.audioLatency);
     setMuted(settings.muted);
+    buildOverlayControls();
     applyDisplay();
+    applyOverlay();
+    refreshGraphicsControls();
     refreshAudioChip();
 }
 
@@ -1036,7 +1330,12 @@ document.addEventListener('fullscreenchange', () => {
     stage.classList.remove('idle-cursor');
     clearTimeout(cursorTimer);
     refreshMenus();
+    layoutScreen();
+    if (document.fullscreenElement) {
+        toasts.show('Pantalla completa: Esc abre el menú rápido · F5 guarda · F7 carga · F2 muestra el rendimiento');
+    }
 });
+new ResizeObserver(() => layoutScreen()).observe(stage);
 stage.addEventListener('mousemove', () => {
     stage.classList.remove('idle-cursor');
     clearTimeout(cursorTimer);

@@ -114,6 +114,8 @@ pub struct Bus {
     pub timers: Timers,
     pub interrupt: InterruptController,
     pub controllers: ControllerManager,
+    /// PGXP: the precise vertices that sit in RAM (see `crate::pgxp`).
+    pub pgxp: crate::pgxp::Memory,
 
     /// The 1 KB data cache used as fast RAM (`0x1F800000`).
     pub scratchpad: [u8; 1024],
@@ -158,6 +160,7 @@ impl Bus {
             timers: Timers::new(),
             interrupt: InterruptController::new(),
             controllers: ControllerManager::new(),
+            pgxp: crate::pgxp::Memory::new(),
             scratchpad: [0; 1024],
             mem_control: MEM_CONTROL_RESET,
             ram_size: RAM_SIZE_RESET,
@@ -189,6 +192,7 @@ impl Bus {
         self.timers.reset();
         self.interrupt.reset();
         self.memory.reset();
+        self.pgxp.clear();
         self.scratchpad = [0; 1024];
         self.mem_control = MEM_CONTROL_RESET;
         self.ram_size = RAM_SIZE_RESET;
@@ -609,6 +613,7 @@ impl Bus {
             &mut self.spu,
             &mut self.cdrom,
             &mut self.mdec,
+            &self.pgxp,
         );
         if channel == CHANNEL_MDEC_IN && self.mdec_out_waiting {
             self.mdec_out_waiting = false;
@@ -1173,6 +1178,76 @@ mod tests {
         assert_eq!(bus.read32(dma_reg(2, 2)).unwrap() & (1 << 24), 0);
     }
 
+
+    /// A flat red triangle (0,0) (8,0) (0,8) as one linked-list node at 0x2000.
+    fn stage_triangle(bus: &mut Bus) {
+        bus.write32(0x2000, (4 << 24) | 0x00FF_FFFF).unwrap();
+        for (i, word) in [0x2000_00FFu32, 0, 8, 8 << 16].iter().enumerate() {
+            bus.write32(0x2004 + i as u32 * 4, *word).unwrap();
+        }
+    }
+
+    fn drawn_in_row(bus: &Bus, y: usize) -> usize {
+        let (pixels, stride) = bus.gpu.scaled_vram().unwrap();
+        pixels[y * stride..(y + 1) * stride].iter().filter(|p| **p != 0).count()
+    }
+
+    #[test]
+    fn gpu_dma_hands_the_gpu_the_precise_vertices_of_the_words_it_reads() {
+        use crate::gpu::RenderSettings;
+        use crate::pgxp::PreciseVertex;
+        let run = |pgxp: bool, tagged: bool| {
+            let mut bus = Bus::new();
+            bus.gpu.set_render_settings(RenderSettings { scale: 4, pgxp, ..RenderSettings::default() });
+            bus.pgxp.set_enabled(pgxp);
+            enable_dma_channel(&mut bus, 2);
+            bus.write32(0x1F80_1810, 0xE300_0000).unwrap(); // draw area: top left
+            bus.write32(0x1F80_1810, 0xE400_0000 | (511 << 10) | 1023).unwrap();
+            stage_triangle(&mut bus);
+            if tagged {
+                // The GTE projected the second vertex to x = 8.5.
+                bus.pgxp.store(0x2008 + 4, PreciseVertex { x: 8.5, y: 0.0, w: 100.0, value: 8 });
+                bus.pgxp.store(0x2008, PreciseVertex { x: 0.0, y: 0.0, w: 100.0, value: 0 });
+                bus.pgxp.store(0x2010, PreciseVertex { x: 0.0, y: 8.0, w: 100.0, value: 8 << 16 });
+            }
+            bus.write32(dma_reg(2, 0), 0x2000).unwrap();
+            bus.write32(dma_reg(2, 2), 0x0100_0401).unwrap();
+            settle(&mut bus);
+            drawn_in_row(&bus, 4)
+        };
+        let plain = run(true, false);
+        assert!(run(true, true) > plain, "the tagged vertex is drawn where the GTE put it");
+        assert_eq!(run(false, true), run(false, false), "without PGXP the tags are not looked at");
+    }
+
+    #[test]
+    fn a_block_dma_to_the_gpu_also_carries_the_precise_vertices() {
+        use crate::gpu::RenderSettings;
+        use crate::pgxp::PreciseVertex;
+        let run = |tagged: bool| {
+            let mut bus = Bus::new();
+            bus.gpu.set_render_settings(RenderSettings { scale: 4, pgxp: true, ..RenderSettings::default() });
+            bus.pgxp.set_enabled(true);
+            enable_dma_channel(&mut bus, 2);
+            bus.write32(0x1F80_1810, 0xE300_0000).unwrap();
+            bus.write32(0x1F80_1810, 0xE400_0000 | (511 << 10) | 1023).unwrap();
+            // The polygon as one block of four words at 0x3000.
+            for (i, word) in [0x2000_00FFu32, 0, 8, 8 << 16].iter().enumerate() {
+                bus.write32(0x3000 + i as u32 * 4, *word).unwrap();
+            }
+            if tagged {
+                bus.pgxp.store(0x3008, PreciseVertex { x: 8.5, y: 0.0, w: 100.0, value: 8 });
+                bus.pgxp.store(0x3004, PreciseVertex { x: 0.0, y: 0.0, w: 100.0, value: 0 });
+                bus.pgxp.store(0x300C, PreciseVertex { x: 0.0, y: 8.0, w: 100.0, value: 8 << 16 });
+            }
+            bus.write32(dma_reg(2, 0), 0x3000).unwrap();
+            bus.write32(dma_reg(2, 1), (1 << 16) | 4).unwrap();
+            bus.write32(dma_reg(2, 2), 0x0100_0201).unwrap(); // request sync, from RAM
+            settle(&mut bus);
+            drawn_in_row(&bus, 4)
+        };
+        assert!(run(true) > run(false), "the block transfer looks the tags up too");
+    }
 
     #[test]
     fn gpu_dma_linked_list_survives_a_cycle() {

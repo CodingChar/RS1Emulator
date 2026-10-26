@@ -12,12 +12,23 @@ use serde::{Deserialize, Serialize};
 use crate::io::extract;
 
 pub mod backend;
+pub mod hires;
+mod lane;
 pub mod sw;
 
+use crate::pgxp::PreciseVertex;
+use hires::{HVertex, HiRes};
+pub use hires::{RenderSettings, TextureFilter};
 use sw::{
     Attributes, DrawSettings, Texture, TextureDepth, TextureWindow, Vertex, Vram, VRAM_HEIGHT,
     VRAM_WIDTH,
 };
+
+/// The range of a screen coordinate: the GTE clamps what it computes to 11 bits.
+const SCREEN_MIN: f32 = -1024.0;
+const SCREEN_MAX: f32 = 1023.0;
+/// Horizontal scale of the widescreen option: 4:3 content in a 16:9 picture.
+const WIDESCREEN_SCALE: f32 = 0.75;
 
 // ----- Video timing -----
 
@@ -179,6 +190,19 @@ pub struct Gpu {
     /// Number of words received through GP0, for debugging.
     pub gp0_word_count: u64,
 
+    // Rendering beyond the console's resolution (not part of the machine, so
+    // not saved: the frontend sets it again after a state is loaded).
+    #[serde(skip)]
+    render: RenderSettings,
+    #[serde(skip)]
+    hires: Option<Box<HiRes>>,
+    /// PGXP: the precise vertex of each word of the command being collected.
+    #[serde(skip)]
+    precise: [PreciseVertex; 12],
+    /// The precise vertex that comes with the word being written.
+    #[serde(skip)]
+    incoming: PreciseVertex,
+
     // Video timing.
     /// Current scanline.
     pub scanline: u32,
@@ -219,6 +243,10 @@ impl Gpu {
             download: None,
             gpuread: 0,
             gp0_word_count: 0,
+            render: RenderSettings::default(),
+            hires: None,
+            precise: [PreciseVertex::NONE; 12],
+            incoming: PreciseVertex::NONE,
             scanline: 0,
             line_clock: 0,
             clock_remainder: 0,
@@ -231,7 +259,44 @@ impl Gpu {
 
     /// Power-on reset: clears VRAM and the timing state.
     pub fn reset(&mut self) {
+        let render = self.render;
         *self = Self::new();
+        self.set_render_settings(render);
+    }
+
+    // ----- Rendering options -----
+
+    pub fn render_settings(&self) -> RenderSettings {
+        self.render
+    }
+
+    /// Choose how the picture is drawn (see [`RenderSettings`]). Changing the
+    /// internal resolution rebuilds the scaled VRAM from the console's VRAM.
+    pub fn set_render_settings(&mut self, settings: RenderSettings) {
+        let settings = settings.sanitized();
+        self.render = settings;
+        if !settings.needs_hires() {
+            self.hires = None;
+            return;
+        }
+        match self.hires.as_deref_mut() {
+            Some(hires) if hires.scale() == settings.scale as usize => hires.configure(&settings),
+            _ => self.hires = Some(Box::new(HiRes::from_vram(&self.vram, &settings))),
+        }
+    }
+
+    /// The scaled VRAM (`0x00BBGGRR`, the mask bit in bit 24) and its width in
+    /// pixels, while scaled rendering is on.
+    pub fn scaled_vram(&self) -> Option<(&[u32], usize)> {
+        self.hires.as_deref().map(|hires| (hires.pixels.as_slice(), VRAM_WIDTH * hires.scale()))
+    }
+
+    /// Write a GP0 word that comes from RAM together with the PGXP vertex the
+    /// GTE made for it (`NONE` when there is none).
+    pub fn write_gp0_precise(&mut self, word: u32, vertex: PreciseVertex) {
+        self.incoming = vertex;
+        self.write_gp0(word);
+        self.incoming = PreciseVertex::NONE;
     }
 
     /// GP1(00h): reset the GPU's registers (VRAM and timing are kept).
@@ -607,6 +672,7 @@ impl Gpu {
             Gp0State::Command => self.start_command(word),
             Gp0State::Parameters { words, len, needed } => {
                 words[*len] = word;
+                self.precise[*len] = self.incoming;
                 *len += 1;
                 if *len == *needed {
                     let (words, needed) = (*words, *needed);
@@ -628,7 +694,14 @@ impl Gpu {
                 for half in 0..2 {
                     if *row < *height {
                         let pixel = (word >> (16 * half)) as u16;
-                        sw::upload_pixel(&mut self.vram, &self.settings, *x + *col, *y + *row, pixel);
+                        let (px, py) = (*x + *col, *y + *row);
+                        if let Some(hires) = self.hires.as_deref_mut() {
+                            let blocked = self.settings.check_mask && self.vram.get(px, py) & 0x8000 != 0;
+                            if !blocked {
+                                hires.upload_pixel(px, py, pixel | if self.settings.set_mask { 0x8000 } else { 0 });
+                            }
+                        }
+                        sw::upload_pixel(&mut self.vram, &self.settings, px, py, pixel);
                         *col += 1;
                         if *col == *width {
                             *col = 0;
@@ -669,6 +742,10 @@ impl Gpu {
                 let (x, y) = (words[1] & 0xFFFF, words[1] >> 16);
                 let (w, h) = (words[2] & 0xFFFF, words[2] >> 16);
                 sw::fill_rectangle(&mut self.vram, x, y, w, h, rgb(command));
+                if let Some(hires) = self.hires.as_deref_mut() {
+                    let (fx, fy, fw, fh) = sw::fill_area(x, y, w, h);
+                    hires.fill_rectangle(fx, fy, fw, fh, rgb(command));
+                }
                 self.add_busy(cost::fill(w, h));
             }
             0x20..=0x3F => self.draw_polygon(words),
@@ -679,6 +756,9 @@ impl Gpu {
                 let dst = (words[2] & 0x3FF, (words[2] >> 16) & 0x1FF);
                 let size = (words[3] & 0xFFFF, words[3] >> 16);
                 sw::copy_rectangle(&mut self.vram, &self.settings, src, dst, size);
+                if let Some(hires) = self.hires.as_deref_mut() {
+                    hires.copy_rectangle(&self.settings, src, dst, size);
+                }
                 self.add_busy(cost::copy(size.0, size.1));
             }
             0xA0..=0xBF => {
@@ -771,6 +851,7 @@ impl Gpu {
 
         let base_color = rgb(command);
         let mut vertices = [Vertex::default(); 4];
+        let mut precise = [PreciseVertex::NONE; 4];
         let mut index = 1;
         let mut clut = 0;
         for (i, vertex) in vertices.iter_mut().enumerate().take(if quad { 4 } else { 3 }) {
@@ -781,6 +862,7 @@ impl Gpu {
                 base_color
             };
             let position = words[index];
+            precise[i] = self.precise[index];
             index += 1;
             *vertex = Vertex {
                 x: sign_extend_11(position & 0x7FF),
@@ -810,11 +892,63 @@ impl Gpu {
             gouraud,
             texture: self.current_texture(clut),
         };
+        // The scaled picture goes first: it reads textures from the console's
+        // VRAM, which the console's own drawing below may overwrite.
+        if self.hires.is_some() {
+            self.draw_polygon_scaled(&vertices, &precise, quad, &attrs);
+        }
         sw::draw_triangle(&mut self.vram, &self.settings, &attrs, [vertices[0], vertices[1], vertices[2]]);
         self.add_busy(cost::triangle(doubled_area(&vertices[0..3]), textured, semi));
         if quad {
             sw::draw_triangle(&mut self.vram, &self.settings, &attrs, [vertices[1], vertices[2], vertices[3]]);
             self.add_busy(cost::triangle(doubled_area(&vertices[1..4]), textured, semi));
+        }
+    }
+
+    /// The same polygon in the scaled VRAM, with PGXP positions where the GTE
+    /// made them: a vertex uses its precise position only if its tag is valid
+    /// and agrees with the integer position the console computed.
+    fn draw_polygon_scaled(&mut self, vertices: &[Vertex; 4], precise: &[PreciseVertex; 4], quad: bool, attrs: &Attributes) {
+        let render = self.render;
+        let count = if quad { 4 } else { 3 };
+        // The polygon is drawn at its precise positions only if every vertex has them: a
+        // vertex the CPU computed has none, and mixing precise and integer vertices would
+        // open seams between neighbouring polygons.
+        let trusted = render.pgxp
+            && (0..count).all(|i| precise[i].is_valid() && agrees(precise[i].x, vertices[i].x) && agrees(precise[i].y, vertices[i].y));
+        let mut scaled = [HVertex::default(); 4];
+        for i in 0..count {
+            let (v, tag) = (&vertices[i], &precise[i]);
+            scaled[i] = HVertex {
+                x: if trusted { tag.x } else { v.x as f32 },
+                y: if trusted { tag.y } else { v.y as f32 },
+                w: if trusted { tag.w } else { 0.0 },
+                color: v.color,
+                u: v.u,
+                v: v.v,
+                ix: v.x,
+                iy: v.y,
+            };
+        }
+
+        // Widescreen: 3D geometry (every vertex precise) is squeezed towards the
+        // middle of the drawing area; 2D elements are left to be stretched.
+        if render.widescreen && trusted {
+            let area = &self.settings.area;
+            let centre = (area.left + area.right + 1) as f32 / 2.0;
+            let offset = self.settings.offset_x as f32;
+            for v in &mut scaled[..count] {
+                v.x = centre + (v.x + offset - centre) * WIDESCREEN_SCALE - offset;
+            }
+        }
+
+        let Some(hires) = self.hires.as_deref_mut() else { return };
+        let perspective = trusted && render.pgxp_textures;
+        let first = [scaled[0], scaled[1], scaled[2]];
+        hires.draw_triangle(&self.vram, &self.settings, attrs, first, perspective);
+        if quad {
+            let second = [scaled[1], scaled[2], scaled[3]];
+            hires.draw_triangle(&self.vram, &self.settings, attrs, second, perspective);
         }
     }
 
@@ -854,6 +988,22 @@ impl Gpu {
             gouraud: false,
             texture: self.current_texture(clut),
         };
+        if let Some(hires) = self.hires.as_deref_mut() {
+            hires.draw_rectangle(
+                &self.vram,
+                &self.settings,
+                &attrs,
+                x,
+                y,
+                width,
+                height,
+                rgb(command),
+                u,
+                v,
+                self.rect_flip_x,
+                self.rect_flip_y,
+            );
+        }
         sw::draw_rectangle(
             &mut self.vram,
             &self.settings,
@@ -908,6 +1058,10 @@ impl Gpu {
         }
         for pair in points.windows(2) {
             sw::draw_line(&mut self.vram, &self.settings, &attrs, pair[0], pair[1]);
+            if let Some(hires) = self.hires.as_deref_mut() {
+                let scaled = |v: &Vertex| HVertex { x: v.x as f32, y: v.y as f32, w: 0.0, color: v.color, u: 0, v: 0, ix: v.x, iy: v.y };
+                hires.draw_line(&self.settings, &attrs, &scaled(&pair[0]), &scaled(&pair[1]));
+            }
             self.add_busy(cost::line(pair[0].x.abs_diff(pair[1].x), pair[0].y.abs_diff(pair[1].y), semi));
         }
     }
@@ -923,53 +1077,75 @@ impl Gpu {
     }
 
     /// Convert the displayed part of VRAM to RGBA8888 in `out`, which is
-    /// resized to `display_width() * display_height() * 4` bytes. Reusing the
-    /// same buffer every frame avoids allocating and zeroing one each time.
+    /// resized to `display_width() * display_height() * 4` bytes. This is the
+    /// console's own picture; `render_frame` is what the frontend shows.
     pub fn render_into(&self, out: &mut Vec<u8>) {
+        let mut pixels = Vec::new();
+        self.render_native(&mut pixels);
+        out.clear();
+        out.extend(pixels.iter().flat_map(|pixel| pixel.to_le_bytes()));
+    }
+
+    /// The console's picture as `0xAABBGGRR` pixels: `display_width() *
+    /// display_height()` of them, converted straight from VRAM.
+    fn render_native(&self, out: &mut Vec<u32>) {
         let _area = crate::profile::enter(crate::profile::Area::Display);
         let (width, height) = (self.display_width(), self.display_height());
-        out.resize(width * height * 4, 0);
+        out.resize(width * height, 0);
         if !self.display_enabled {
-            for pixel in out.chunks_exact_mut(4) {
-                pixel.copy_from_slice(&[0, 0, 0, 255]);
-            }
+            out.fill(0xFF00_0000);
             return;
         }
-
-        // 5-bit channel to 8 bits, replicating the top bits into the low ones.
-        const EXPAND: [u8; 32] = {
-            let mut table = [0u8; 32];
-            let mut c = 0;
-            while c < 32 {
-                table[c] = ((c << 3) | (c >> 2)) as u8;
-                c += 1;
-            }
-            table
-        };
 
         let (start_x, start_y) = (self.display_start.0 as usize, self.display_start.1 as usize);
         let true_color = self.display_mode & (1 << 4) != 0;
         let pixels = &self.vram.pixels;
-        for (y, line) in out.chunks_exact_mut(width * 4).enumerate() {
+        for (y, line) in out.chunks_exact_mut(width).enumerate() {
             let row = ((start_y + y) % sw::VRAM_HEIGHT) * sw::VRAM_WIDTH;
             if true_color {
                 // 24-bit mode: three bytes per pixel packed into the row.
-                let byte = |i: usize| (pixels[row + (start_x + i / 2) % sw::VRAM_WIDTH] >> ((i % 2) * 8)) as u8;
-                for (x, pixel) in line.chunks_exact_mut(4).enumerate() {
-                    pixel.copy_from_slice(&[byte(x * 3), byte(x * 3 + 1), byte(x * 3 + 2), 255]);
+                let byte = |i: usize| (pixels[row + (start_x + i / 2) % sw::VRAM_WIDTH] >> ((i % 2) * 8)) as u32;
+                for (x, pixel) in line.iter_mut().enumerate() {
+                    *pixel = 0xFF00_0000 | byte(x * 3) | byte(x * 3 + 1) << 8 | byte(x * 3 + 2) << 16;
                 }
             } else {
-                for (x, pixel) in line.chunks_exact_mut(4).enumerate() {
-                    let texel = pixels[row + (start_x + x) % sw::VRAM_WIDTH];
-                    pixel.copy_from_slice(&[
-                        EXPAND[(texel & 31) as usize],
-                        EXPAND[((texel >> 5) & 31) as usize],
-                        EXPAND[((texel >> 10) & 31) as usize],
-                        255,
-                    ]);
+                for (x, pixel) in line.iter_mut().enumerate() {
+                    *pixel = hires::expand15(pixels[row + (start_x + x) % sw::VRAM_WIDTH]) & 0x00FF_FFFF | 0xFF00_0000;
                 }
             }
         }
+    }
+
+    /// What is on screen, as `0xAABBGGRR` pixels (the bytes of RGBA8888 on a
+    /// little-endian machine) in `out`, and its size in pixels: the console's
+    /// display size times the internal resolution. Reusing `out` every frame
+    /// avoids allocating and zeroing a buffer each time.
+    pub fn render_frame(&self, out: &mut Vec<u32>) -> (usize, usize) {
+        let (width, height) = (self.display_width(), self.display_height());
+        let Some(hires) = self.hires.as_deref() else {
+            self.render_native(out);
+            return (width, height);
+        };
+        let _area = crate::profile::enter(crate::profile::Area::Display);
+        let scale = hires.scale();
+        let true_color_display = self.display_mode & (1 << 4) != 0;
+        if self.display_enabled && !true_color_display {
+            let start = (self.display_start.0 as usize, self.display_start.1 as usize);
+            hires.render_display(out, start, width, height);
+        } else {
+            // A 24-bit picture (video) or a blank screen has no scaled version:
+            // the console's own picture, each pixel repeated.
+            let mut native = Vec::new();
+            self.render_native(&mut native);
+            out.resize(width * scale * height * scale, 0);
+            for (y, line) in out.chunks_exact_mut(width * scale).enumerate() {
+                let source = &native[(y / scale) * width..][..width];
+                for (x, pixel) in line.iter_mut().enumerate() {
+                    *pixel = source[x / scale];
+                }
+            }
+        }
+        (width * scale, height * scale)
     }
 
     // ----- Save states -----
@@ -1038,6 +1214,9 @@ impl Gpu {
             for (pixel, chunk) in self.vram.pixels.iter_mut().zip(bytes.chunks_exact(2)) {
                 *pixel = u16::from_le_bytes([chunk[0], chunk[1]]);
             }
+            if let Some(hires) = self.hires.as_deref_mut() {
+                hires.rebuild(&self.vram);
+            }
         }
     }
 }
@@ -1048,7 +1227,15 @@ impl Default for Gpu {
     }
 }
 
-/// The 24-bit colour in the low bits of a command word.
+/// Whether a precise coordinate is the one the console's integer coordinate came
+/// from. The GTE rounds down and clamps to 11 bits (so a vertex far off screen has a
+/// saturated integer but keeps a useful precise position); its divider is
+/// approximate, so one pixel more or less is allowed. Anything else is a tag that
+/// belongs to some other value.
+fn agrees(precise: f32, integer: i32) -> bool {
+    (precise.floor().clamp(SCREEN_MIN, SCREEN_MAX) - integer as f32).abs() <= 1.0
+}
+
 /// Twice the area of the triangle the first three vertices make.
 fn doubled_area(vertices: &[Vertex]) -> u64 {
     let (a, b, c) = (vertices[0], vertices[1], vertices[2]);
@@ -1057,6 +1244,7 @@ fn doubled_area(vertices: &[Vertex]) -> u64 {
     cross.unsigned_abs()
 }
 
+/// The 24-bit colour in the low bits of a command word.
 fn rgb(word: u32) -> [u8; 3] {
     [word as u8, (word >> 8) as u8, (word >> 16) as u8]
 }

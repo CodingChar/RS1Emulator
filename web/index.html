@@ -61,6 +61,7 @@
         <div class="viewport" id="viewport">
             <canvas id="screen" width="320" height="240" aria-label="Pantalla de la consola"></canvas>
         </div>
+        <div class="perf-overlay" id="perf-overlay" hidden aria-hidden="true"></div>
 
         <div class="welcome" id="welcome">
             <div class="welcome-card">
@@ -110,6 +111,8 @@
             <button role="tab" data-page="bios">🧩 BIOS y disco</button>
             <button role="tab" data-page="audio">🔊 Audio</button>
             <button role="tab" data-page="display">🖥 Pantalla</button>
+            <button role="tab" data-page="graphics">🎨 Gráficos</button>
+            <button role="tab" data-page="overlay">📊 Rendimiento</button>
             <button role="tab" data-page="controls">⌨ Teclado</button>
             <button role="tab" data-page="pads">🎮 Mandos</button>
             <button role="tab" data-page="cards">💳 Tarjetas de memoria</button>
@@ -128,10 +131,17 @@
                 <p class="state" id="states-state">Los estados guardados capturan toda la máquina; carga el mismo disco antes de restaurar. Ranuras 1 a 3, F5 guarda y F7 carga la ranura elegida.</p>
                 <h3>Atajos</h3>
                 <dl class="shortcuts">
-                    <dt>Esc · F1 · Home (mando)</dt><dd>Menú rápido</dd>
+                    <dt>Esc · F1 · Home (mando)</dt><dd>Menú rápido (guardar, cargar y ajustes; también en pantalla completa)</dd>
                     <dt>Alt + Intro</dt><dd>Pantalla completa</dd>
-                    <dt>F5 / F7</dt><dd>Guardar / cargar estado</dd>
+                    <dt>F5 / F7</dt><dd>Guardado y carga rápidos de la ranura elegida</dd>
+                    <dt>F6</dt><dd>Siguiente ranura de estado</dd>
+                    <dt>F2</dt><dd>Mostrar u ocultar el panel de rendimiento</dd>
+                    <dt>F3</dt><dd>Cambiar la relación de aspecto</dd>
+                    <dt>F4</dt><dd>Cambiar el escalado (1×, 2×, 3×)</dd>
+                    <dt>F8</dt><dd>Silenciar o activar el sonido</dd>
                     <dt>F9</dt><dd>Modo analógico del mando 1</dd>
+                    <dt>F10</dt><dd>Pausar o reanudar</dd>
+                    <dt>Re Pág / Av Pág</dt><dd>Subir o bajar el volumen</dd>
                 </dl>
             </section>
 
@@ -149,7 +159,19 @@
 
             <section data-page="audio" hidden>
                 <h2>Audio</h2>
-                <label class="field">Volumen <input type="range" id="volume" min="0" max="100" value="80"></label>
+                <label class="field">Volumen
+                    <span class="slider"><input type="range" id="volume" min="0" max="100" value="80"><output id="volume-label">80 %</output></span>
+                </label>
+                <label class="field">Reserva de sonido (latencia)
+                    <select id="audio-latency">
+                        <option value="auto">Automática (recomendada)</option>
+                        <option value="40">Mínima (40 ms)</option>
+                        <option value="70">Normal (70 ms)</option>
+                        <option value="120">Segura (120 ms)</option>
+                        <option value="200">Máxima (200 ms)</option>
+                    </select>
+                </label>
+                <p class="state">Una reserva mayor evita cortes y chasquidos en un equipo lento; una menor hace que el sonido siga mejor a la imagen. En «Automática» crece sola si el sonido se corta y vuelve a bajar cuando todo va bien. El reproductor ajusta su velocidad un 1 % como máximo para que la reserva no se vacíe ni se llene.</p>
                 <div class="row"><button id="btn-mute" aria-pressed="false">Silenciar</button></div>
             </section>
 
@@ -158,7 +180,18 @@
                 <label class="field">Relación de aspecto
                     <select id="aspect">
                         <option value="4:3">4:3 (original)</option>
-                        <option value="fill">Rellenar la ventana</option>
+                        <option value="16:9">16:9 (panorámica)</option>
+                        <option value="cover">Ampliar sin deformar (recorta arriba y abajo)</option>
+                        <option value="fill">Rellenar la ventana (se estira)</option>
+                        <option value="integer">Escala entera (píxeles perfectos)</option>
+                    </select>
+                </label>
+                <label class="field">Recortar el borde negro
+                    <select id="crop">
+                        <option value="0">No recortar</option>
+                        <option value="1">Poco</option>
+                        <option value="2">Medio</option>
+                        <option value="3">Mucho</option>
                     </select>
                 </label>
                 <label class="field">Filtro de la imagen
@@ -167,6 +200,39 @@
                         <option value="linear">Suavizado</option>
                     </select>
                 </label>
+                <p class="state">La imagen de la consola es 4:3. «16:9» la estira para llenar una pantalla panorámica; para que las escenas 3D no se vean estiradas activa «Ensanchar escenas 3D» en Gráficos (necesita PGXP). «Ampliar sin deformar» llena la pantalla manteniendo las proporciones, y recortar el borde negro hace la imagen más grande sin deformarla.</p>
+            </section>
+
+            <section data-page="graphics" hidden>
+                <h2>Gráficos</h2>
+                <label class="field">Escalado (resolución interna y texturas)
+                    <select id="scale">
+                        <option value="1">Nativo (1×, predeterminado)</option>
+                        <option value="2">2× (el doble)</option>
+                        <option value="3">3× (el triple)</option>
+                    </select>
+                </label>
+                <label class="field">Filtro de texturas
+                    <select id="texture-filter">
+                        <option value="nearest">Sin filtro (píxeles de la consola)</option>
+                        <option value="bilinear">Bilineal</option>
+                    </select>
+                </label>
+                <label class="check"><input type="checkbox" id="pgxp"> <span>PGXP: geometría de precisión <small>Usa las posiciones sin redondear de la GTE; se nota más con 2× o 3×, y quita el temblor de los polígonos.</small></span></label>
+                <label class="check"><input type="checkbox" id="pgxp-textures"> <span>Texturas con perspectiva correcta <small>Necesita PGXP: quita la deformación de las texturas.</small></span></label>
+                <label class="check"><input type="checkbox" id="widescreen"> <span>Ensanchar escenas 3D (16:9) <small>Necesita PGXP: los elementos en 2D se estiran y algunos juegos recortan los polígonos de los bordes.</small></span></label>
+                <label class="check"><input type="checkbox" id="true-color"> <span>Color verdadero (24 bits) <small>Sin el recorte a 15 bits ni el tramado de la consola.</small></span></label>
+                <p class="state">El escalado dibuja la imagen, y las texturas con ella, con 2 o 3 veces más píxeles en cada dirección: la geometría y las texturas ganan detalle sin cambiar lo que ve el juego. Cuesta tiempo (2× son 4 veces más píxeles y 3× son 9 veces más). Si el juego va lento, baja el escalado, quita el filtro bilineal (el más caro) o desactiva PGXP.</p>
+            </section>
+
+            <section data-page="overlay" hidden>
+                <h2>Panel de rendimiento</h2>
+                <label class="check"><input type="checkbox" id="overlay-enabled"> <span>Mostrar el panel sobre la imagen (F2)</span></label>
+                <label class="field">Posición
+                    <select id="overlay-position"></select>
+                </label>
+                <h3>Qué mostrar</h3>
+                <div id="overlay-items" class="checks"></div>
             </section>
 
             <section data-page="controls" hidden>

@@ -6,18 +6,19 @@
 //! drawing area clip.
 //!
 //! Mirrors DuckStation's `gpu_sw_rasterizer.cpp`.
+use super::lane::Lane;
 use serde::{Deserialize, Serialize};
 
 pub const VRAM_WIDTH: usize = 1024;
 pub const VRAM_HEIGHT: usize = 512;
 
 /// The largest span the hardware draws: bigger primitives are dropped.
-const MAX_PRIMITIVE_WIDTH: i32 = 1023;
-const MAX_PRIMITIVE_HEIGHT: i32 = 511;
+pub(super) const MAX_PRIMITIVE_WIDTH: i32 = 1023;
+pub(super) const MAX_PRIMITIVE_HEIGHT: i32 = 511;
 
 /// 4x4 ordered-dither offsets added to the 8-bit colour before it is cut to
 /// 5 bits.
-const DITHER: [[i32; 4]; 4] = [
+pub(super) const DITHER: [[i32; 4]; 4] = [
     [-4, 0, -3, 1],
     [2, -2, 3, -1],
     [-3, 1, -4, 0],
@@ -149,7 +150,7 @@ pub struct Vertex {
 
 // ----- Pixel pipeline -----
 
-fn blend_component(back: u16, front: u16, mode: u8) -> u16 {
+pub(super) fn blend_component(back: u16, front: u16, mode: u8) -> u16 {
     match mode {
         0 => (back + front) / 2,
         1 => (back + front).min(31),
@@ -158,7 +159,7 @@ fn blend_component(back: u16, front: u16, mode: u8) -> u16 {
     }
 }
 
-fn blend(back: u16, front: u16, mode: u8) -> u16 {
+pub(super) fn blend(back: u16, front: u16, mode: u8) -> u16 {
     let channel = |shift: u32| {
         blend_component((back >> shift) & 31, (front >> shift) & 31, mode) << shift
     };
@@ -168,7 +169,7 @@ fn blend(back: u16, front: u16, mode: u8) -> u16 {
 /// Texel lookup with the texture window and the palette position worked out
 /// once per primitive instead of once per pixel.
 #[derive(Clone, Copy)]
-struct Sampler {
+pub(super) struct Sampler {
     keep_u: u32,
     force_u: u32,
     keep_v: u32,
@@ -181,7 +182,7 @@ struct Sampler {
 }
 
 impl Sampler {
-    fn new(window: &TextureWindow, texture: &Texture) -> Self {
+    pub(super) fn new(window: &TextureWindow, texture: &Texture) -> Self {
         Self {
             keep_u: !(window.mask_x * 8),
             force_u: (window.offset_x & window.mask_x) * 8,
@@ -197,7 +198,7 @@ impl Sampler {
 
     /// Fetch one texel (a 15-bit colour, 0 meaning transparent).
     #[inline(always)]
-    fn sample(&self, vram: &Vram, u: u32, v: u32) -> u16 {
+    pub(super) fn sample(&self, vram: &Vram, u: u32, v: u32) -> u16 {
         let u = (u & self.keep_u) | self.force_u;
         let v = (v & self.keep_v) | self.force_v;
         let py = self.page_y + v as usize;
@@ -320,37 +321,12 @@ fn too_big(a: &Vertex, b: &Vertex) -> bool {
     (a.x - b.x).abs() > MAX_PRIMITIVE_WIDTH || (a.y - b.y).abs() > MAX_PRIMITIVE_HEIGHT
 }
 
-/// Exact `n / d` for the small numerators of the interpolation, as a
-/// multiplication: with `m = ceil(2^64 / d)`, `floor(n * m / 2^64) = n / d`
-/// whenever `n < 2^64 / d`. The numerators here are below `255 * d` and `d`
-/// (twice the triangle's area) below 2^21, so this always holds.
-#[derive(Clone, Copy)]
-struct Divider {
-    reciprocal: u64,
-    divisor_is_one: bool,
-}
-
-impl Divider {
-    fn new(divisor: u64) -> Self {
-        Self { reciprocal: u64::MAX / divisor + 1, divisor_is_one: divisor == 1 }
-    }
-
-    #[inline(always)]
-    fn divide(&self, numerator: u64) -> u64 {
-        if self.divisor_is_one {
-            numerator
-        } else {
-            ((numerator as u128 * self.reciprocal as u128) >> 64) as u64
-        }
-    }
-}
-
 /// Draw a triangle. Vertex coordinates are before the drawing offset.
 ///
 /// The edge functions are stepped incrementally, each scanline's covered span
 /// is found directly from them, and the interpolated values are stepped the
-/// same way, so a pixel costs a couple of additions instead of a dozen
-/// multiplications and divisions.
+/// same way (see `Lane`), so a pixel costs a couple of additions instead of a
+/// dozen multiplications and divisions.
 pub fn draw_triangle(vram: &mut Vram, settings: &DrawSettings, attrs: &Attributes, vertices: [Vertex; 3]) {
     let [mut v0, mut v1, mut v2] = vertices;
     if too_big(&v0, &v1) || too_big(&v1, &v2) || too_big(&v2, &v0) {
@@ -394,8 +370,12 @@ pub fn draw_triangle(vram: &mut Vram, settings: &DrawSettings, attrs: &Attribute
         row_weight[i] = edge(a, b, min_x, min_y);
     }
 
-    let divider = Divider::new(area as u64);
+    let divisor = area;
+    let inverse = 1.0 / divisor as f64;
     let sampler = Sampler::new(&settings.window, &attrs.texture);
+    let shading = Shading::new(settings, attrs);
+    // Whether a pixel reads what is behind it: semi-transparency and the mask check do.
+    let blend = settings.check_mask || attrs.semi_transparent;
     let flat = [v0.color[0] as i32, v0.color[1] as i32, v0.color[2] as i32];
     // Values interpolated across the triangle: R, G, B, U, V.
     let channels: [[i64; 3]; 5] = [
@@ -405,9 +385,17 @@ pub fn draw_triangle(vram: &mut Vram, settings: &DrawSettings, attrs: &Attribute
         [v0.u as i64, v1.u as i64, v2.u as i64],
         [v0.v as i64, v1.v as i64, v2.v as i64],
     ];
-    let mut channel_step = [0i64; 5];
-    for (c, values) in channels.iter().enumerate() {
-        channel_step[c] = (0..3).map(|i| step_x[i] * values[i]).sum();
+    // How each value changes from one pixel to the next, as quotient and remainder.
+    let mut lanes = [Lane::default(); 5];
+    // The lanes in use are `first_used..used`: R, G, B (Gouraud), then U and V (textured).
+    let (first_used, used) = match (attrs.gouraud, attrs.textured) {
+        (false, false) => (0, 0),
+        (true, false) => (0, 3),
+        (false, true) => (3, 5),
+        (true, true) => (0, 5),
+    };
+    for c in first_used..used {
+        lanes[c] = Lane::new((0..3).map(|i| step_x[i] * channels[c][i]).sum(), divisor, inverse);
     }
 
     let width = (max_x - min_x) as i64;
@@ -443,33 +431,176 @@ pub fn draw_triangle(vram: &mut Vram, settings: &DrawSettings, attrs: &Attribute
         }
 
         let yu = y as usize & (VRAM_HEIGHT - 1);
-        let mut numerators = [0i64; 5];
-        for (c, values) in channels.iter().enumerate() {
-            numerators[c] = (0..3).map(|i| (weights[i] + first * step_x[i]) * values[i]).sum();
+        let mut now = lanes;
+        for c in first_used..used {
+            let numerator = (0..3).map(|i| (weights[i] + first * step_x[i]) * channels[c][i]).sum();
+            now[c].start(numerator, divisor, inverse);
         }
-        for k in first..=last {
-            let x = min_x + k as i32;
-            let color = if attrs.gouraud {
-                [
-                    divider.divide(numerators[0] as u64) as i32,
-                    divider.divide(numerators[1] as u64) as i32,
-                    divider.divide(numerators[2] as u64) as i32,
-                ]
+        // The clip rectangle is inside VRAM, so the span does not wrap.
+        let x0 = (min_x + first as i32) as usize;
+        let count = (last - first + 1) as usize;
+        let base = yu * VRAM_WIDTH + x0;
+        let divisor = divisor as i32;
+        match (attrs.gouraud, attrs.textured, blend) {
+            (false, false, false) => span_untextured::<false, false>(&mut vram.pixels[base..base + count], x0, yu, &shading, flat, now, divisor),
+            (false, false, true) => span_untextured::<false, true>(&mut vram.pixels[base..base + count], x0, yu, &shading, flat, now, divisor),
+            (true, false, false) => span_untextured::<true, false>(&mut vram.pixels[base..base + count], x0, yu, &shading, flat, now, divisor),
+            (true, false, true) => span_untextured::<true, true>(&mut vram.pixels[base..base + count], x0, yu, &shading, flat, now, divisor),
+            (false, true, false) => span_textured::<false, false>(vram, base, count, x0, yu, &shading, &sampler, flat, now, divisor),
+            (false, true, true) => span_textured::<false, true>(vram, base, count, x0, yu, &shading, &sampler, flat, now, divisor),
+            (true, true, false) => span_textured::<true, false>(vram, base, count, x0, yu, &shading, &sampler, flat, now, divisor),
+            (true, true, true) => span_textured::<true, true>(vram, base, count, x0, yu, &shading, &sampler, flat, now, divisor),
+        }
+    }
+}
+
+// ----- Spans of a triangle -----
+//
+// The rows of a triangle are shaded by loops specialised for what the triangle
+// needs (Gouraud or flat, textured or not, with or without a read of the pixel
+// behind), which is much faster than one general function per pixel. They do
+// exactly what `shade_pixel` does; the tests compare them with it.
+
+/// A colour channel (0..=255 plus a dither offset of -4..=3, shifted by 4 to keep
+/// the index positive) cut to the 5 bits of the console's VRAM.
+const QUANTIZED_5: [u8; 512] = {
+    let mut table = [0u8; 512];
+    let mut i = 0;
+    while i < 512 {
+        let value = i as i32 - 4;
+        let clamped = if value < 0 { 0 } else if value > 255 { 255 } else { value };
+        table[i] = (clamped >> 3) as u8;
+        i += 1;
+    }
+    table
+};
+
+/// What a row of a triangle needs to know about how it is shaded.
+struct Shading {
+    check_mask: bool,
+    mask_bit: u16,
+    semi: bool,
+    semi_mode: u8,
+    raw: bool,
+    dither: bool,
+}
+
+impl Shading {
+    fn new(settings: &DrawSettings, attrs: &Attributes) -> Self {
+        let modulated = attrs.textured && !attrs.raw_texture;
+        Self {
+            check_mask: settings.check_mask,
+            mask_bit: if settings.set_mask { 0x8000 } else { 0 },
+            semi: attrs.semi_transparent,
+            semi_mode: attrs.semi_mode,
+            raw: attrs.raw_texture,
+            dither: settings.dither && (attrs.gouraud || modulated),
+        }
+    }
+}
+
+#[inline(always)]
+fn pack_quantized(rgb: [i32; 3], offset: i32) -> u16 {
+    let channel = |value: i32| QUANTIZED_5[(value + offset) as usize & 511] as u16;
+    channel(rgb[0]) | channel(rgb[1]) << 5 | channel(rgb[2]) << 10
+}
+
+/// Shade an untextured row. With `BLEND` it reads the pixel behind (mask check,
+/// semi-transparency); without it only writes, and a flat colour is a fill.
+#[inline(never)]
+fn span_untextured<const GOURAUD: bool, const BLEND: bool>(
+    row: &mut [u16],
+    x0: usize,
+    y: usize,
+    sh: &Shading,
+    flat: [i32; 3],
+    mut colors: [Lane; 5],
+    divisor: i32,
+) {
+    if !GOURAUD && !BLEND {
+        row.fill(pack_quantized(flat, 4) | sh.mask_bit);
+        return;
+    }
+    let dither = &DITHER[y & 3];
+    for (i, dst) in row.iter_mut().enumerate() {
+        let back = *dst;
+        if !(BLEND && sh.check_mask && back & 0x8000 != 0) {
+            let color = if GOURAUD {
+                [colors[0].quotient, colors[1].quotient, colors[2].quotient]
             } else {
                 flat
             };
-            let (u, v) = if attrs.textured {
-                (
-                    divider.divide(numerators[3] as u64).min(255) as u32,
-                    divider.divide(numerators[4] as u64).min(255) as u32,
-                )
-            } else {
-                (0, 0)
-            };
-            shade_pixel(vram, settings, attrs, &sampler, x as usize & (VRAM_WIDTH - 1), yu, color, u, v);
-            for c in 0..5 {
-                numerators[c] += channel_step[c];
+            let offset = if sh.dither { dither[(x0 + i) & 3] } else { 0 } + 4;
+            let mut pixel = pack_quantized(color, offset);
+            if BLEND && sh.semi {
+                pixel = blend(back, pixel, sh.semi_mode);
             }
+            *dst = pixel | sh.mask_bit;
+        }
+        if GOURAUD {
+            colors[0].advance(divisor);
+            colors[1].advance(divisor);
+            colors[2].advance(divisor);
+        }
+    }
+}
+
+/// Shade a textured row (`base` is the index in VRAM of its first pixel). The texture
+/// is read from the same VRAM the row is written to, as the console does.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn span_textured<const GOURAUD: bool, const BLEND: bool>(
+    vram: &mut Vram,
+    base: usize,
+    count: usize,
+    x0: usize,
+    y: usize,
+    sh: &Shading,
+    sampler: &Sampler,
+    flat: [i32; 3],
+    mut lanes: [Lane; 5],
+    divisor: i32,
+) {
+    let dither = &DITHER[y & 3];
+    for i in 0..count {
+        let index = base + i;
+        let back = if BLEND { vram.pixels[index] } else { 0 };
+        if !(BLEND && sh.check_mask && back & 0x8000 != 0) {
+            let u = (lanes[3].quotient as u32).min(255);
+            let v = (lanes[4].quotient as u32).min(255);
+            let texel = sampler.sample(vram, u, v);
+            if texel != 0 {
+                let channels = [(texel & 31) as i32, ((texel >> 5) & 31) as i32, ((texel >> 10) & 31) as i32];
+                let rgb = if sh.raw {
+                    [channels[0] << 3, channels[1] << 3, channels[2] << 3]
+                } else {
+                    // texel * colour / 128, with the texel scaled up to 8 bits.
+                    let color = if GOURAUD {
+                        [lanes[0].quotient, lanes[1].quotient, lanes[2].quotient]
+                    } else {
+                        flat
+                    };
+                    [
+                        ((channels[0] * color[0]) >> 4).min(255),
+                        ((channels[1] * color[1]) >> 4).min(255),
+                        ((channels[2] * color[2]) >> 4).min(255),
+                    ]
+                };
+                let offset = if sh.dither { dither[(x0 + i) & 3] } else { 0 } + 4;
+                let mut pixel = pack_quantized(rgb, offset);
+                // Only texels with bit 15 set are blended in a semi-transparent primitive.
+                if BLEND && sh.semi && texel & 0x8000 != 0 {
+                    pixel = blend(back, pixel, sh.semi_mode);
+                }
+                vram.pixels[index] = pixel | sh.mask_bit;
+            }
+        }
+        lanes[3].advance(divisor);
+        lanes[4].advance(divisor);
+        if GOURAUD {
+            lanes[0].advance(divisor);
+            lanes[1].advance(divisor);
+            lanes[2].advance(divisor);
         }
     }
 }
@@ -579,14 +710,22 @@ pub fn draw_line(vram: &mut Vram, settings: &DrawSettings, attrs: &Attributes, a
 
 // ----- VRAM transfers -----
 
+/// The area GP0(02h) really fills for the given parameters: `(x, y, width,
+/// height)`, with X and the width rounded to 16-pixel units.
+pub fn fill_area(x: u32, y: u32, width: u32, height: u32) -> (usize, usize, usize, usize) {
+    (
+        (x & 0x3F0) as usize,
+        (y & 0x1FF) as usize,
+        (((width & 0x3FF) + 0xF) & !0xF) as usize,
+        (height & 0x1FF) as usize,
+    )
+}
+
 /// GP0(02h): fill a rectangle with a solid colour. Ignores the mask bit,
 /// the drawing area and the drawing offset; X and width work in 16-pixel
 /// units.
 pub fn fill_rectangle(vram: &mut Vram, x: u32, y: u32, width: u32, height: u32, color: [u8; 3]) {
-    let x = (x & 0x3F0) as usize;
-    let y = (y & 0x1FF) as usize;
-    let width = (((width & 0x3FF) + 0xF) & !0xF) as usize;
-    let height = (height & 0x1FF) as usize;
+    let (x, y, width, height) = fill_area(x, y, width, height);
     let pixel = rgb888_to_15(color);
     for dy in 0..height {
         let row = ((y + dy) % VRAM_HEIGHT) * VRAM_WIDTH;

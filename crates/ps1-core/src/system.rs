@@ -1,7 +1,7 @@
 use crate::bus::Bus;
 use crate::controllers::memory_card::MemoryCard;
 use crate::cpu::interpreter::Interpreter;
-use crate::gpu::CPU_CYCLES_PER_FRAME;
+use crate::gpu::{RenderSettings, CPU_CYCLES_PER_FRAME};
 use crate::types::Ps1Result;
 
 /// Where the BIOS starts the shell, and where a queued program takes over.
@@ -191,6 +191,7 @@ impl System {
         }
         self.cpu.reset();
         self.bus.reset();
+        self.cpu.gte.tags.enabled = self.bus.pgxp.enabled();
         self.cycles = 0;
         self.cycle_overrun = 0;
         self.frame_cycles_remaining = self.cycles_per_frame;
@@ -254,6 +255,29 @@ impl System {
     /// Copy the current GPU framebuffer (RGBA8) for presentation.
     pub fn framebuffer(&self) -> Vec<u8> {
         self.bus.gpu.framebuffer()
+    }
+
+    /// What is on screen with the chosen rendering options: its width and
+    /// height in pixels and the RGBA8888 bytes. Larger than `framebuffer()`
+    /// when the internal resolution is above 1x.
+    pub fn scaled_framebuffer(&self) -> (usize, usize, Vec<u8>) {
+        let mut frame = Vec::new();
+        let (width, height) = self.bus.gpu.render_frame(&mut frame);
+        (width, height, frame.iter().flat_map(|pixel| pixel.to_le_bytes()).collect())
+    }
+
+    /// Choose how the picture is rendered: internal resolution, true colour,
+    /// texture filtering and PGXP (see [`RenderSettings`]). Can change at any time.
+    pub fn set_render_settings(&mut self, settings: RenderSettings) {
+        let settings = settings.sanitized();
+        self.bus.gpu.set_render_settings(settings);
+        // PGXP tracks vertices through the GTE, the CPU and the DMA.
+        self.bus.pgxp.set_enabled(settings.pgxp);
+        self.cpu.gte.tags.enabled = settings.pgxp;
+    }
+
+    pub fn render_settings(&self) -> RenderSettings {
+        self.bus.gpu.render_settings()
     }
 
     /// Save the entire machine state (for save states).
@@ -376,6 +400,34 @@ mod tests {
         assert_eq!(sys.cpu.regs[28], 0x8002_8000, "global pointer");
         assert_eq!(sys.cpu.regs[29], 0x801F_F100, "stack pointer");
         assert!((0x8001_000C..0x8001_0014).contains(&sys.cpu.pc), "looping at the end");
+    }
+
+    #[test]
+    fn render_settings_switch_pgxp_on_in_the_gte_and_the_bus_and_survive_resets_and_states() {
+        use crate::gpu::RenderSettings;
+        let mut sys = System::new();
+        sys.load_bios(&bios_with(&[0, 0, 0, 0])).unwrap();
+        sys.reset().unwrap();
+        assert!(!sys.bus.pgxp.enabled() && !sys.cpu.gte.tags.enabled);
+
+        let settings = RenderSettings { scale: 2, pgxp: true, pgxp_textures: true, ..RenderSettings::default() };
+        sys.set_render_settings(settings);
+        assert!(sys.bus.pgxp.enabled() && sys.cpu.gte.tags.enabled);
+        assert_eq!(sys.render_settings(), settings);
+
+        sys.reset().unwrap();
+        assert!(sys.cpu.gte.tags.enabled, "a reset keeps PGXP on");
+        assert_eq!(sys.render_settings(), settings);
+
+        let state = sys.save_state();
+        sys.set_render_settings(RenderSettings::default());
+        sys.load_state(&state).unwrap();
+        assert_eq!(sys.render_settings(), RenderSettings::default(), "the state does not choose how to render");
+        sys.set_render_settings(settings);
+        sys.load_state(&state).unwrap();
+        assert_eq!(sys.render_settings(), settings);
+        assert!(sys.cpu.gte.tags.enabled && sys.bus.pgxp.enabled());
+        assert!(sys.bus.gpu.scaled_vram().is_some(), "the scaled picture is rebuilt");
     }
 
     #[test]

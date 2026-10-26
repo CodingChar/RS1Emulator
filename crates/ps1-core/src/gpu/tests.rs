@@ -784,3 +784,227 @@ fn a_gpu_reset_drops_the_queued_work() {
     gp1(&mut gpu, 0);
     assert_eq!(gpu.status() & READY_BITS, READY_BITS);
 }
+
+// ----- Scaled rendering and PGXP -----
+
+fn scaled(settings: RenderSettings) -> Gpu {
+    let mut gpu = gpu();
+    gpu.set_render_settings(settings);
+    gpu
+}
+
+fn tag(x: f32, y: f32, w: f32, word: u32) -> PreciseVertex {
+    PreciseVertex { x, y, w, value: word }
+}
+
+/// How many scaled pixels of row `y` are drawn.
+fn covered(gpu: &Gpu, y: usize) -> usize {
+    let (pixels, stride) = gpu.scaled_vram().unwrap();
+    pixels[y * stride..(y + 1) * stride].iter().filter(|p| **p != 0).count()
+}
+
+/// A flat red triangle (0,0) (8,0) (0,8) whose vertices carry the given tags.
+fn tagged_triangle(gpu: &mut Gpu, tags: [PreciseVertex; 3]) {
+    let words = [xy(0, 0), xy(8, 0), xy(0, 8)];
+    gpu.write(0, 4, 0x2000_00FF);
+    for (word, tag) in words.iter().zip(tags) {
+        gpu.write_gp0_precise(*word, tag);
+    }
+}
+
+#[test]
+fn polygons_are_drawn_into_both_the_console_and_the_scaled_vram() {
+    let mut gpu = scaled(RenderSettings { scale: 2, ..RenderSettings::default() });
+    gp0(&mut gpu, &[0x2000_00FF, xy(10, 10), xy(30, 10), xy(10, 30)]);
+    assert_eq!(gpu.vram.get(12, 12), RED_15);
+    let (pixels, stride) = gpu.scaled_vram().unwrap();
+    assert_eq!(pixels[24 * stride + 24] & 0xFFFFFF, 0x0000FF);
+    assert_eq!(pixels[25 * stride + 25] & 0xFFFFFF, 0x0000FF);
+    assert_eq!(pixels[10 * stride + 10], 0, "outside the triangle");
+}
+
+#[test]
+fn precise_vertices_change_the_scaled_picture_but_not_the_console_one() {
+    let triangle = |tags: [PreciseVertex; 3]| {
+        let mut gpu = scaled(RenderSettings { scale: 4, pgxp: true, ..RenderSettings::default() });
+        tagged_triangle(&mut gpu, tags);
+        gpu
+    };
+    let words = [xy(0, 0), xy(8, 0), xy(0, 8)];
+    let plain = triangle([PreciseVertex::NONE; 3]);
+    let moved = triangle([
+        tag(0.0, 0.0, 100.0, words[0]),
+        tag(8.5, 0.0, 100.0, words[1]),
+        tag(0.0, 8.0, 100.0, words[2]),
+    ]);
+    assert!(covered(&moved, 4) > covered(&plain, 4), "the edge moved outwards");
+    assert_eq!(moved.vram.pixels, plain.vram.pixels, "the console VRAM only sees integers");
+}
+
+#[test]
+fn a_precise_vertex_far_from_the_integer_one_is_not_trusted() {
+    let words = [xy(0, 0), xy(8, 0), xy(0, 8)];
+    let triangle = |x: f32| {
+        let mut gpu = scaled(RenderSettings { scale: 4, pgxp: true, ..RenderSettings::default() });
+        tagged_triangle(
+            &mut gpu,
+            [tag(0.0, 0.0, 100.0, words[0]), tag(x, 0.0, 100.0, words[1]), tag(0.0, 8.0, 100.0, words[2])],
+        );
+        gpu
+    };
+    let plain = triangle(8.0);
+    // The GTE clamped this one: the integer vertex says 8, the "precise" one 30.
+    assert_eq!(covered(&triangle(30.0), 4), covered(&plain, 4));
+    assert!(covered(&triangle(8.75), 4) > covered(&plain, 4), "within a pixel: trusted");
+}
+
+#[test]
+fn without_pgxp_the_tags_are_ignored() {
+    let words = [xy(0, 0), xy(8, 0), xy(0, 8)];
+    let mut gpu = scaled(RenderSettings { scale: 4, ..RenderSettings::default() });
+    tagged_triangle(
+        &mut gpu,
+        [tag(0.0, 0.0, 100.0, words[0]), tag(8.75, 0.0, 100.0, words[1]), tag(0.0, 8.0, 100.0, words[2])],
+    );
+    let mut reference = scaled(RenderSettings { scale: 4, ..RenderSettings::default() });
+    tagged_triangle(&mut reference, [PreciseVertex::NONE; 3]);
+    assert_eq!(covered(&gpu, 4), covered(&reference, 4));
+}
+
+#[test]
+fn widescreen_squeezes_3d_geometry_towards_the_middle_of_the_drawing_area() {
+    // A draw area 320 wide: the middle is x = 160.
+    let draw = |widescreen: bool, precise: bool| {
+        let mut gpu = Gpu::new();
+        gp0(&mut gpu, &[0xE300_0000, 0xE400_0000 | (239 << 10) | 319]);
+        gpu.set_render_settings(RenderSettings { scale: 1, pgxp: true, widescreen, ..RenderSettings::default() });
+        let words = [xy(60, 10), xy(260, 10), xy(60, 30)];
+        gpu.write(0, 4, 0x2000_00FF);
+        for word in words {
+            let vertex = if precise {
+                let (x, y) = ((word & 0x7FF) as f32, (word >> 16) as f32);
+                tag(x, y, 100.0, word)
+            } else {
+                PreciseVertex::NONE
+            };
+            gpu.write_gp0_precise(word, vertex);
+        }
+        let (pixels, stride) = gpu.scaled_vram().unwrap();
+        let row = &pixels[12 * stride..13 * stride];
+        row.iter().position(|p| *p != 0).unwrap()
+    };
+    // 60 -> 160 - 100 * 0.75 = 85.
+    assert_eq!(draw(true, true), 85);
+    assert_eq!(draw(false, true), 60);
+    assert_eq!(draw(true, false), 60, "2D elements (no precise vertices) are left alone");
+}
+
+#[test]
+fn fills_uploads_and_copies_reach_the_scaled_vram() {
+    let mut gpu = scaled(RenderSettings { scale: 2, ..RenderSettings::default() });
+    gp0(&mut gpu, &[0x0200_00FF, xy(32, 8), (2 << 16) | 16]);
+    gp0(&mut gpu, &[0xA000_0000, xy(100, 50), (1 << 16) | 2, 0x7FFF_001F]);
+    gp0(&mut gpu, &[0x8000_0000, xy(100, 50), xy(200, 60), (1 << 16) | 2]);
+    let (pixels, stride) = gpu.scaled_vram().unwrap();
+    assert_eq!(pixels[16 * stride + 64] & 0xFFFFFF, 0x0000FF, "fill");
+    assert_eq!(pixels[100 * stride + 200] & 0xFFFFFF, 0x0000FF, "upload: red, repeated 2x2");
+    assert_eq!(pixels[101 * stride + 201] & 0xFFFFFF, 0x0000FF);
+    assert_eq!(pixels[100 * stride + 202] & 0xFFFFFF, 0xFFFFFF, "upload: white next to it");
+    assert_eq!(pixels[120 * stride + 400] & 0xFFFFFF, 0x0000FF, "copy");
+    assert_eq!(pixels[120 * stride + 402] & 0xFFFFFF, 0xFFFFFF);
+}
+
+#[test]
+fn the_frame_is_as_large_as_the_display_times_the_internal_resolution() {
+    let mut gpu = gpu();
+    gp1(&mut gpu, 0x0300_0000); // display on
+    gp1(&mut gpu, 0x0800_0001); // 320x240
+    let mut frame = Vec::new();
+    assert_eq!(gpu.render_frame(&mut frame), (320, 240));
+    assert_eq!(frame.len(), 320 * 240);
+    gpu.set_render_settings(RenderSettings { scale: 3, ..RenderSettings::default() });
+    assert_eq!(gpu.render_frame(&mut frame), (960, 720));
+    assert_eq!(frame.len(), 960 * 720);
+    gp1(&mut gpu, 0x0800_0007); // 640x480
+    assert_eq!(gpu.render_frame(&mut frame), (1920, 1440));
+    gpu.set_render_settings(RenderSettings::default());
+    assert_eq!(gpu.render_frame(&mut frame), (640, 480));
+}
+
+#[test]
+fn a_24_bit_picture_is_shown_as_the_console_has_it_repeated() {
+    let mut gpu = scaled(RenderSettings { scale: 2, ..RenderSettings::default() });
+    gp1(&mut gpu, 0x0300_0000);
+    gp1(&mut gpu, 0x0800_0010); // 256x240, 24-bit
+    // Two pixels of 24-bit data: the bytes 01 02 03 | 04 05 06 are the words 0x0201, 0x0403, 0x0605.
+    gpu.vram.set(0, 0, 0x0201);
+    gpu.vram.set(1, 0, 0x0403);
+    gpu.vram.set(2, 0, 0x0605);
+    let mut frame = Vec::new();
+    assert_eq!(gpu.render_frame(&mut frame), (512, 480));
+    assert_eq!(frame[0], 0xFF03_0201);
+    assert_eq!(frame[1], 0xFF03_0201, "repeated");
+    assert_eq!(frame[2], 0xFF06_0504);
+    assert_eq!(frame[512], 0xFF03_0201, "and the row below");
+}
+
+#[test]
+fn a_blank_screen_is_black_at_any_scale() {
+    let mut gpu = scaled(RenderSettings { scale: 2, ..RenderSettings::default() });
+    gpu.vram.set(0, 0, 0x7FFF);
+    let mut frame = Vec::new();
+    let (w, h) = gpu.render_frame(&mut frame);
+    assert_eq!((w, h), (512, 480));
+    assert!(frame.iter().all(|p| *p == 0xFF00_0000));
+}
+
+#[test]
+fn the_scaled_vram_follows_the_console_across_a_reset_and_new_settings() {
+    let mut gpu = scaled(RenderSettings { scale: 2, ..RenderSettings::default() });
+    gp0(&mut gpu, &[0x0200_00FF, xy(0, 0), (1 << 16) | 16]);
+    // Switching the resolution rebuilds the scaled picture from the console VRAM.
+    gpu.set_render_settings(RenderSettings { scale: 3, ..RenderSettings::default() });
+    let (pixels, stride) = gpu.scaled_vram().unwrap();
+    assert_eq!(stride, 3072);
+    assert_eq!(pixels[2 * stride + 2] & 0xFFFFFF, 0x0000FF);
+    // A reset clears VRAM but keeps the way of rendering.
+    gpu.reset();
+    assert_eq!(gpu.render_settings().scale, 3);
+    assert_eq!(gpu.scaled_vram().unwrap().0[2 * 3072 + 2], 0);
+    // Turning everything off drops the scaled VRAM.
+    gpu.set_render_settings(RenderSettings::default());
+    assert!(gpu.scaled_vram().is_none());
+}
+
+#[test]
+fn a_saturated_vertex_keeps_its_precise_position_but_a_stale_tag_is_not_trusted() {
+    // The GTE clamps to 11 bits: a vertex 3000 pixels to the right shows as 1023.
+    assert!(agrees(3000.0, 1023));
+    assert!(agrees(-5000.5, -1024));
+    assert!(!agrees(3000.0, 500), "a tag from another value");
+    assert!(!agrees(100.0, 1023));
+    // Inside the range the integer is the precise value rounded down; one pixel of slack.
+    assert!(agrees(10.75, 10) && agrees(10.75, 11) && agrees(-0.25, -1));
+    assert!(!agrees(10.75, 12));
+    assert!(!agrees(f32::NAN, 0));
+}
+
+#[test]
+fn a_polygon_crossing_the_edge_of_the_screen_keeps_its_shape_with_precise_vertices() {
+    // The right corner is really 3000 pixels away; the console's integer vertex says 1023.
+    let words = [xy(0, 0), xy(1023, 0), xy(0, 8)];
+    let triangle = |right: f32| {
+        let mut gpu = scaled(RenderSettings { scale: 2, pgxp: true, ..RenderSettings::default() });
+        let tags = [tag(0.0, 0.0, 100.0, words[0]), tag(right, 0.0, 100.0, words[1]), tag(0.0, 8.0, 100.0, words[2])];
+        gpu.write(0, 4, 0x2000_00FF);
+        for (word, tag) in words.iter().zip(tags) {
+            gpu.write_gp0_precise(*word, tag);
+        }
+        gpu
+    };
+    // With the saturated integer the triangle is 1023 wide, with the precise one 3000 wide: its
+    // slanted edge is far flatter, so a row near the bottom is much wider.
+    let (clamped, precise) = (triangle(1023.0), triangle(3000.0));
+    let width = |gpu: &Gpu| covered(gpu, 12);
+    assert!(width(&precise) > width(&clamped) + 200, "{} <= {}", width(&precise), width(&clamped));
+}

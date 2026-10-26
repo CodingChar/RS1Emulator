@@ -18,6 +18,7 @@ de memoria persistentes y estados guardados completos.
 | MDEC | decodificación de FMV según la documentación |
 | Entrada | pad digital, DualShock (analógico, configuración, vibración), 2 puertos, tarjetas de memoria |
 | Web | emulador en un worker, disco leído bajo demanda, audio por AudioWorklet, ajustes persistentes; menú de ventana, menú rápido a pantalla completa, mandos USB/Bluetooth configurables |
+| Imagen y audio | aspectos 4:3, 16:9, ampliar sin deformar, escala entera y rellenar, recorte del borde; escalado interno 1×/2×/3×, PGXP, texturas con perspectiva, filtro bilineal, color verdadero, panel de rendimiento; audio con reserva estable y control dinámico de la velocidad |
 | Temporización | latencia de mult/div y del GTE, GPU ocupada mientras dibuja, DMA con duración (y troceado), búsqueda del CD según la distancia, timers 0/1 sincronizados con el blanking |
 | Pruebas | 507 tests (y 3 más, ignorados, que arrancan la BIOS y juegos reales); benchmark con checksum del estado; ida y vuelta de estados con un juego real |
 
@@ -145,6 +146,21 @@ Archivos: `web/` (`app.js` interfaz, `worker.js` emulador, `audio*.js`, `input.j
 - [x] Mandos USB y Bluetooth: puerto, mapa de botones, zona muerta y prueba de vibración por mando.
 - [x] Indicador de sonido y desbloqueo automático del audio.
 
+## Fase 13 — Calidad de imagen y audio · HECHA
+
+Archivos: `ps1-core/src/gpu/hires.rs`, `gpu/lane.rs`, `pgxp.rs`; `web/layout.js`, `overlay.js`, `audio*.js`.
+
+- [x] **Volumen de la interfaz.** Fallaba porque `startAudio()` avisaba de forma síncrona, `refreshAudioChip` reescribía el deslizador con el valor guardado y `setVolume` leía después ese valor viejo. Ahora se lee el deslizador primero, la ganancia sigue una curva cuadrática y cambia suavizada (`setTargetAtTime`), y hay Re Pág / Av Pág.
+- [x] **Sonido sin cortes.** Reserva de audio con interpolación lineal y *dynamic rate control* (±1 %), fundido de salida y entrada en lugar de corte seco, reserva automática que crece con los cortes y baja en calma, y cortes que no cuentan mientras el emulador está en pausa o a otra velocidad. El SPU en sí se comprobó grabando 98 s de Crash Bandicoot: sin saltos entre muestras, sin recorte y con silencios solo en las pausas de la música.
+- [x] **Panel de rendimiento** (F2) con FPS, velocidad, tiempo por cuadro, carga, resolución, búfer de audio y memoria, cada uno a elección y en cuatro posiciones.
+- [x] **Aspecto**: 4:3, 16:9, ampliar sin deformar (cubre la ventana), escala entera (múltiplo de las líneas de la consola, con la densidad de píxeles del equipo), rellenar, y recorte del borde negro. La aritmética está en `web/layout.js` con pruebas en Node.
+- [x] **Escalado interno 1×/2×/3×** con una VRAM escalada de 8 bits por canal que se dibuja además de la de la consola: mismas reglas de bordes e interpolación exacta (pruebas diferenciales: píxeles idénticos a 1×, y idénticos en los puntos de muestreo de la consola a 2× y 3×), rellenos, subidas y copias reflejados.
+- [x] **PGXP** (posiciones sin redondear de la GTE que siguen al valor por registros y memoria, validadas con el valor entero) y **texturas con perspectiva correcta**; un vértice saturado por la GTE (polígonos que cruzan el borde de la pantalla) conserva su posición precisa.
+- [x] **Mejoras de calidad**: filtro bilineal con alfa binario y sin sangrado entre texturas, color verdadero de 24 bits, y escenas 3D ensanchadas para 16:9 (con PGXP).
+- [x] **Menú rápido translúcido** con guardado y carga rápidos, ajustes rápidos y atajos de teclado que funcionan en pantalla completa.
+- [ ] Filtros de escalado de texturas tipo xBR/JINC2 y *scaled dithering*: no se han hecho; el escalado actual es resolución interna.
+- [ ] Z-buffer de PGXP y el modo de CPU completo de PGXP (registros por todas las instrucciones): no hacen falta para que los vértices lleguen a la GPU en los juegos probados; el modo de memoria cubre `swc2`, `lw`/`sw` y `mfc2`.
+
 ## Rendimiento: lo hecho y lo medido
 
 Cada optimización se validó con el checksum del estado (`bench`), con pruebas diferenciales
@@ -161,6 +177,11 @@ Cada optimización se validó con el checksum del estado (`bench`), con pruebas 
 | Rasterizador incremental | 3 funciones de borde y hasta 5 divisiones de 64 bits por píxel | triángulos ×2 |
 | GP0 sin asignaciones, cursor de carga | un `Vec` por comando y divisiones por píxel | ≈ 3 % |
 | Worker y lectura perezosa | libera el hilo principal y evita 650 MB duplicados | memoria y fluidez |
+| Interpolación por carriles (`gpu/lane.rs`) en el rasterizador de la consola | la multiplicación de 128 bits de `Divider` es una llamada a `__multi3` en WebAssembly (5 % del tiempo); cociente y resto se actualizan con sumas | ≈ 5 % en WebAssembly, igual en nativo |
+| Bucles de fila planos en el rasterizador escalado | un `put` genérico por píxel costaba 3–4× más; especializados por tipo (plano, Gouraud, texturado, con mezcla, con perspectiva) y con la cuantización en una tabla | ×2–3 |
+
+Medidas de la escena de juego de Crash Bandicoot (512×240) en WebAssembly con Node (el mismo motor que Chrome), ms por cuadro de emulación, portátil Core i3-8130U; varían entre tandas por la temperatura, por eso se dan intervalos:
+nativo 8–11, 2× 15–22, 2× con PGXP 17–25, 3× con PGXP 26–40, 2× con filtro bilineal 27–42, 2× con color verdadero 19–22 (antes de optimizar los rasterizadores: 12, 22, 25, 39, 51 y 30). Con PGXP desactivado y 1× el estado de la máquina es idéntico bit a bit al de antes (mismo checksum del `bench` en la BIOS y en Crash Bandicoot) y la velocidad nativa es la misma. En el navegador, con el emulador en su worker, una escena repetible (estado guardado) dio 7,8 ms a 1×, 14,0 a 2× y 15,3 a 2× con PGXP.
 
 Globalmente (nativo, mismo trabajo): 21 → 75 M instr/s en el arranque del juego y 11 → 65 M en
 el arranque de la BIOS; WebAssembly 6 → 35 M y 10 → 45 M.
@@ -169,7 +190,8 @@ el arranque de la BIOS; WebAssembly 6 → 35 M y 10 → 45 M.
 
 - **SIMD de WebAssembly (`+simd128`)**: medido en ejecuciones alternadas, sin ganancia (la carga es de enteros escalares con saltos); pierde compatibilidad con navegadores antiguos.
 - **Caché de bloques o recompilador**: el perfil muestra la CPU en ~80 % pero tras el camino rápido el coste por instrucción ya es de ~12 ns; un recompilador no puede emitir código nativo en WebAssembly y generar módulos al vuelo añade latencia y complejidad. Se reevaluará si hace falta más margen.
-- **Backend WebGL2 para la GPU**: la GPU por software ocupa 4–8 % del tiempo tras optimizarla; un renderizador por hardware cambia la semántica de máscaras y transparencias y exigiría una suite de referencia que no hay.
+- **Backend WebGL2 para la GPU**: la GPU por software ocupa 4–8 % del tiempo tras optimizarla; un renderizador por hardware cambia la semántica de máscaras y transparencias y exigiría una suite de referencia que no hay. El escalado interno se hace por eso con la VRAM escalada por software (Fase 13), que sí se puede comprobar píxel a píxel contra el rasterizador de la consola.
+- **Saltarse el dibujo a resolución nativa cuando hay escalado**: la VRAM nativa es de donde el juego lee texturas y lecturas de la GPU; derivarla de la escalada exigiría seguimiento de regiones sucias y no sería idéntica con PGXP, color verdadero o filtro, así que se dibuja en las dos.
 - **Registros de I/O sin sincronizar dentro del camino rápido**: se implementó (las lecturas del BIOS al registro de retardo de la SPU eran 7 M de las 200 M de instrucciones del arranque) y se verificó idéntico, pero no dio ganancia medible en ejecuciones alternadas; se revirtió para no conservar complejidad sin beneficio.
 - **`wasm-opt`**: no está instalado y descargarlo no se justifica sin medir antes; el módulo ya se compila con LTO y `opt-level=3`.
 - **Dibujo por campos en 480i / `draw_to_display`**: el emulador presenta cuadros completos; ignorar la restricción da la misma imagen final, solo cambia qué líneas se escriben a medio cuadro.

@@ -44,7 +44,15 @@ let lastFrameTime = 0;
 let accumulator = 0;
 let lastCardCheck = 0;
 let cardSaveFailed = false;
-const stats = { frames: 0, since: 0 };
+/// What the page's overlay shows, gathered over half a second.
+const REPORT_INTERVAL_MS = 500;
+const stats = newStats(0);
+let renderOptions = { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false };
+let shownSize = { width: 0, height: 0 };
+
+function newStats(since) {
+    return { since, frames: 0, presented: 0, emuTotal: 0, emuWorst: 0, presentTotal: 0, intervalWorst: 0, lastPresent: 0 };
+}
 
 function post(message, transfer = []) {
     postMessage(message, transfer);
@@ -177,8 +185,12 @@ function stop(error) {
 
 function present() {
     ps1.render_frame();
-    const width = ps1.framebuffer_width();
-    const height = ps1.framebuffer_height();
+    const width = ps1.frame_width();
+    const height = ps1.frame_height();
+    if (width !== shownSize.width || height !== shownSize.height) {
+        shownSize = { width, height };
+        post({ type: 'frame-size', width, height, nativeWidth: ps1.framebuffer_width(), nativeHeight: ps1.framebuffer_height() });
+    }
     // A view of the frame inside the module's memory: no copy until it is drawn.
     const pixels = new Uint8ClampedArray(wasm.memory.buffer, ps1.frame_ptr(), ps1.frame_len());
     if (context) {
@@ -194,14 +206,26 @@ function present() {
     }
 }
 
-function updateStats(now, frames) {
-    stats.frames += frames;
-    if (now - stats.since >= 1000) {
-        const fps = (stats.frames * 1000) / (now - stats.since);
-        post({ type: 'stats', fps, full: ps1.frames_per_second() });
-        stats.frames = 0;
-        stats.since = now;
-    }
+function updateStats(now) {
+    const elapsed = now - stats.since;
+    if (elapsed < REPORT_INTERVAL_MS) return;
+    post({
+        type: 'stats',
+        fps: (stats.frames * 1000) / elapsed,
+        full: ps1.frames_per_second(),
+        presented: (stats.presented * 1000) / elapsed,
+        emuAverage: stats.frames > 0 ? stats.emuTotal / stats.frames : 0,
+        emuWorst: stats.emuWorst,
+        presentAverage: stats.presented > 0 ? stats.presentTotal / stats.presented : 0,
+        intervalWorst: stats.intervalWorst,
+        width: shownSize.width,
+        height: shownSize.height,
+        scale: renderOptions.scale,
+        heap: wasm.memory.buffer.byteLength,
+    });
+    const lastPresent = stats.lastPresent;
+    Object.assign(stats, newStats(now));
+    stats.lastPresent = lastPresent;
 }
 
 async function persistCards(now, force = false) {
@@ -263,6 +287,7 @@ function tick() {
         const now = performance.now();
         applyInput();
         let frames = 0;
+        const emuStart = performance.now();
         if (speed === 'max') {
             do {
                 ps1.run_frame();
@@ -279,7 +304,16 @@ function tick() {
         }
         lastFrameTime = now;
         if (frames > 0) {
+            const presentStart = performance.now();
             present();
+            const done = performance.now();
+            stats.frames += frames;
+            stats.presented++;
+            stats.emuTotal += presentStart - emuStart;
+            stats.emuWorst = Math.max(stats.emuWorst, (presentStart - emuStart) / frames);
+            stats.presentTotal += done - presentStart;
+            if (stats.lastPresent > 0) stats.intervalWorst = Math.max(stats.intervalWorst, presentStart - stats.lastPresent);
+            stats.lastPresent = presentStart;
             const samples = ps1.drain_audio();
             // Audio only makes sense at normal speed.
             if (audioPort && speed === 1 && samples.length > 0) {
@@ -287,10 +321,34 @@ function tick() {
             }
         }
         if (frames > 0) reportRumble();
-        updateStats(now, frames);
+        updateStats(performance.now());
         persistCards(now);
     } catch (error) {
         stop(error);
+    }
+}
+
+// ----- Rendering options -----
+
+/// Hand the page's choices to the core. A frame already on the screen is drawn
+/// again so that a change shows up even while the game is paused.
+function applyRender(options) {
+    renderOptions = options;
+    if (!ps1) return;
+    ps1.set_render_settings(
+        options.scale,
+        options.trueColor,
+        options.bilinear,
+        options.pgxp,
+        options.pgxpTextures,
+        options.widescreen,
+    );
+    if (running || paused) {
+        try {
+            present();
+        } catch (error) {
+            say(`No se pudo dibujar el cuadro: ${error}`, true);
+        }
     }
 }
 
@@ -365,6 +423,7 @@ async function start(message) {
         return;
     }
     ps1 = new Ps1();
+    applyRender(renderOptions);
     if (message.canvas) {
         canvas = message.canvas;
         context = canvas.getContext('2d');
@@ -414,6 +473,7 @@ onmessage = async (event) => {
             say('En marcha.');
             return publishState();
         case 'speed': speed = message.value; return;
+        case 'render': return applyRender(message.options);
         case 'input':
             pads = message.pads;
             analog = message.analog;

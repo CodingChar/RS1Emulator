@@ -30,7 +30,7 @@ jobs:
       - name: Build the web page
         run: sh web/build.sh
       - name: Drop what the page does not serve
-        run: rm -f web/build.sh web/build.ps1
+        run: rm -f web/build.sh web/build.ps1 web/*.test.mjs
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

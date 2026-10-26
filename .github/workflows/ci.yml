@@ -37,3 +37,14 @@ jobs:
         run: cargo build --release -p ps1-wasm
       - name: Check the whole workspace
         run: cargo check --workspace
+
+  web:
+    name: Web page (layout, settings and audio player)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Tests of the page's pure code
+        run: node --test web/layout.test.mjs web/audio-worklet.test.mjs
