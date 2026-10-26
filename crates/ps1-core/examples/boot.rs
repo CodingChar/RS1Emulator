@@ -49,12 +49,16 @@ struct Args {
     screenshot: Option<PathBuf>,
     /// Save the whole 1024x512 VRAM as a PNG after the run (`--vram`).
     vram: Option<PathBuf>,
+    /// Scripted button presses `(mask, first, last)` (`--press MASK@FIRST-LAST`, instruction counts).
+    presses: Vec<(u16, u64, u64)>,
+    /// Print the GPU registers after the run (`--gpu-regs`).
+    gpu_regs: bool,
     /// Print the last N executed instructions (`--trace N`; needs `--features trace`).
     trace: usize,
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None, trace: 0 };
+    let mut args = Args { bios: None, disc: None, steps: 10_000_000, peek: Vec::new(), disasm: Vec::new(), dump_ram: None, screenshot: None, vram: None, watch: Vec::new(), shots_every: 0, shots_prefix: None, wav: None, trace: 0, presses: Vec::new(), gpu_regs: false };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = |name: &str| it.next().ok_or_else(|| format!("{name} needs a value"));
@@ -85,6 +89,16 @@ fn parse_args() -> Result<Args, String> {
                 let addr = u32::from_str_radix(text.trim_start_matches("0x"), 16)
                     .map_err(|e| format!("--watch-pc: {e}"))?;
                 args.watch.push(addr);
+            }
+            "--gpu-regs" => args.gpu_regs = true,
+            "--press" => {
+                let text = value("--press")?;
+                let bad = || "--press MASK@FIRST-LAST".to_string();
+                let (mask, range) = text.split_once('@').ok_or_else(bad)?;
+                let (first, last) = range.split_once('-').ok_or_else(bad)?;
+                let mask = u16::from_str_radix(mask.trim_start_matches("0x"), 16).map_err(|e| format!("--press: {e}"))?;
+                let count = |t: &str| t.replace('_', "").parse::<u64>().map_err(|e| format!("--press: {e}"));
+                args.presses.push((mask, count(first)?, count(last)?));
             }
             "--trace" => {
                 args.trace = value("--trace")?.parse().map_err(|e| format!("--trace: {e}"))?;
@@ -240,6 +254,8 @@ fn run_bios(
     let mut histogram: HashMap<u32, u64> = HashMap::new();
     let mut last_post = 0u8;
     let mut executed = 0u64;
+    // Buttons currently held by the `--press` script.
+    let mut held = 0u16;
     let mut failure = None;
     // Audio drained from the SPU, as interleaved 16-bit samples.
     let mut audio: Vec<i16> = Vec::new();
@@ -256,6 +272,13 @@ fn run_bios(
         for entry in watched.iter_mut().filter(|e| e.0 == pc) {
             entry.1 += 1;
             entry.2.get_or_insert(i);
+        }
+        if !args.presses.is_empty() {
+            let mask = args.presses.iter().filter(|(_, first, last)| i >= *first && i < *last).fold(0, |m, (bits, _, _)| m | bits);
+            if mask != held {
+                held = mask;
+                sys.set_input(0, held, 0, 0, 0, 0);
+            }
         }
         if let Err(e) = sys.step() {
             failure = Some(e);
@@ -379,6 +402,9 @@ fn run_bios(
             Ok(v) => println!("  [{addr:#010X}] = {v:08X}"),
             Err(e) => println!("  [{addr:#010X}] = <{e}>"),
         }
+    }
+    if args.gpu_regs {
+        println!("gpu registers: {:08X?}", sys.bus.gpu.save_registers());
     }
     if let Some(path) = &args.screenshot {
         let (w, h) = (sys.bus.gpu.display_width(), sys.bus.gpu.display_height());

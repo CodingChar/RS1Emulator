@@ -37,6 +37,7 @@ descartaron con una razón técnica están en la sección «Decisiones» del fin
 - [x] README con cómo compilar y probar en host (`.cargo/config.toml` fuerza `wasm32-unknown-unknown`).
 - [x] Harness `examples/boot.rs` (BIOS, disco, capturas, volcados) y test de la imagen de disco local en `rom_test/` (se omite si no existe; la carpeta está en `.gitignore`).
 - [x] `examples/bench.rs`: velocidad, checksum de todo el estado, bucles sintéticos, entrada simulada, `--roundtrip` de estados y, con `--features profile`, el reparto del tiempo por área.
+- [x] `tests/boot_games.rs`: Crash Bandicoot llega al menú del título (ignorado por defecto, ~1 min: `cargo test --release ... --test boot_games -- --ignored`; se omite sin BIOS o disco).
 - [x] CI (`.github/workflows/ci.yml`): tests nativos y build de WebAssembly.
 - [ ] ROMs de prueba de CPU de dominio público (`psxtest_cpu`, suite de `amidog`): hacen falta los binarios, que no están en el repositorio.
 
@@ -189,3 +190,4 @@ el arranque de la BIOS; WebAssembly 6 → 35 M y 10 → 45 M.
 3. **M3** — Se ve la pantalla de arranque de la BIOS. ✔
 4. **M4** — Arranca un juego de prueba con imagen y entrada. ✔
 5. **M5** — Juego 3D con audio, FMV y partida jugable en el navegador. ✔ (Resident Evil; el audio se comprobó por espectro, no de oídas).
+6. **M6** — Segundo juego: Crash Bandicoot (USA) llega al menú y, con `boot --press` (Start y Cruz), entra en la primera fase con Crash controlable. (parcial: solo en nativo con entrada simulada, ~3000 M de instrucciones, comprobado con capturas; sin probar en el navegador, con audio ni más allá de los primeros segundos de la fase).
