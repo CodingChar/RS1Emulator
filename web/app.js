@@ -491,6 +491,7 @@ function refreshGraphicsControls() {
     $('pgxp-textures').checked = settings.pgxpTextures;
     $('widescreen').checked = settings.widescreen;
     $('true-color').checked = settings.trueColor;
+    $('smooth-2d').checked = settings.smooth2d;
     // These two only do something with PGXP.
     for (const id of ['pgxp-textures', 'widescreen']) {
         $(id).disabled = !settings.pgxp;
@@ -729,6 +730,7 @@ function graphicsPage() {
             switchRow('🧭', 'Texturas con perspectiva', () => settings.pgxpTextures, (pgxpTextures) => setRender({ pgxpTextures }), () => !settings.pgxp),
             switchRow('↔', 'Ensanchar escenas 3D (16:9)', () => settings.widescreen, setWidescreen, () => !settings.pgxp),
             switchRow('🎨', 'Color verdadero (24 bits)', () => settings.trueColor, (trueColor) => setRender({ trueColor })),
+            switchRow('🪄', 'Suavizar fondos, menús y vídeo', () => settings.smooth2d, (smooth2d) => setRender({ smooth2d })),
         ],
     };
 }
@@ -979,6 +981,16 @@ $('volume-tool').addEventListener('input', (event) => {
     setVolume(Number(event.target.value));
     startAudio();
 });
+// Let go of the slider when the drag ends so the keyboard goes back to the game.
+for (const id of ['volume-tool', 'btn-mute-tool']) {
+    $(id).addEventListener('change', (event) => event.target.blur());
+    $(id).addEventListener('pointerup', (event) => event.target.blur());
+}
+$('volume-tool').addEventListener('wheel', (event) => {
+    event.preventDefault();
+    adjustVolume(event.deltaY < 0 ? 5 : -5);
+    startAudio();
+}, { passive: false });
 $('audio-latency').addEventListener('change', (event) => setAudioLatency(event.target.value === 'auto' ? 'auto' : Number(event.target.value)));
 $('audio-chip').addEventListener('click', async () => {
     // Unblock a waiting context first; otherwise the chip toggles the sound.
@@ -1009,6 +1021,7 @@ $('pgxp').addEventListener('change', (event) => setPgxp(event.target.checked));
 $('pgxp-textures').addEventListener('change', (event) => setRender({ pgxpTextures: event.target.checked }));
 $('widescreen').addEventListener('change', (event) => setWidescreen(event.target.checked));
 $('true-color').addEventListener('change', (event) => setRender({ trueColor: event.target.checked }));
+$('smooth-2d').addEventListener('change', (event) => setRender({ smooth2d: event.target.checked }));
 
 $('overlay-enabled').addEventListener('change', (event) => setOverlay({ enabled: event.target.checked }));
 $('overlay-position').addEventListener('change', (event) => setOverlay({ position: event.target.value }));

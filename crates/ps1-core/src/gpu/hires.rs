@@ -76,6 +76,9 @@ pub struct RenderSettings {
     /// With PGXP: squeeze 3D geometry horizontally by 3/4 around the centre of
     /// the drawing area, for a picture that is shown at 16:9 instead of 4:3.
     pub widescreen: bool,
+    /// Smooth what the console only draws at its own resolution (pre-rendered
+    /// backgrounds, menus, video) when the internal resolution is above 1x.
+    pub smooth_2d: bool,
 }
 
 impl Default for RenderSettings {
@@ -87,6 +90,7 @@ impl Default for RenderSettings {
             pgxp: false,
             pgxp_textures: false,
             widescreen: false,
+            smooth_2d: false,
         }
     }
 }
@@ -292,6 +296,57 @@ fn edge(a: Point, b: Point, px: i64, py: i64) -> i64 {
 fn is_top_left(a: Point, b: Point) -> bool {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     dy < 0 || (dy == 0 && dx > 0)
+}
+
+/// Smooth the parts of a scaled picture that carry no extra detail: every block of
+/// `scale` x `scale` pixels that is one flat colour (a console pixel repeated, as
+/// uploads, fills and video are) is replaced by a bilinear blend of the console
+/// pixels around it. Blocks with detail (drawn polygons) are left as they are.
+pub fn smooth_flat_blocks(pixels: &mut [u32], width: usize, height: usize, scale: usize) {
+    if scale < 2 || width % scale != 0 || height % scale != 0 || pixels.len() != width * height {
+        return;
+    }
+    let (bw, bh) = (width / scale, height / scale);
+    // One colour per block (its centre) and whether the block is flat.
+    let mut native = vec![0u32; bw * bh];
+    let mut flat = vec![false; bw * bh];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let first = pixels[by * scale * width + bx * scale];
+            let is_flat = (0..scale).all(|k| pixels[(by * scale + k) * width + bx * scale..][..scale].iter().all(|&p| p == first));
+            native[by * bw + bx] = first;
+            flat[by * bw + bx] = is_flat;
+        }
+    }
+    // For the pixel `i` of a block: which neighbour it leans to (-1 or 1) and by how much (of 256).
+    let lean: Vec<(isize, u32)> = (0..scale)
+        .map(|i| {
+            let off = 2 * i as isize + 1 - scale as isize;
+            (if off < 0 { -1 } else { 1 }, (off.unsigned_abs() * 256 / (2 * scale)) as u32)
+        })
+        .collect();
+    let at = |bx: isize, by: isize| native[by.clamp(0, bh as isize - 1) as usize * bw + bx.clamp(0, bw as isize - 1) as usize];
+    for by in 0..bh {
+        for bx in 0..bw {
+            if !flat[by * bw + bx] {
+                continue;
+            }
+            for j in 0..scale {
+                let (dy, wy) = lean[j];
+                for i in 0..scale {
+                    let (dx, wx) = lean[i];
+                    let (x, y) = (bx as isize, by as isize);
+                    let corners = [(at(x, y), (256 - wx) * (256 - wy)), (at(x + dx, y), wx * (256 - wy)), (at(x, y + dy), (256 - wx) * wy), (at(x + dx, y + dy), wx * wy)];
+                    let mut out = OPAQUE;
+                    for shift in [0, 8, 16] {
+                        let sum: u32 = corners.iter().map(|&(c, w)| ((c >> shift) & 0xFF) * w).sum();
+                        out |= (sum >> 16) << shift;
+                    }
+                    pixels[(by * scale + j) * width + bx * scale + i] = out;
+                }
+            }
+        }
+    }
 }
 
 // ----- The scaled VRAM -----

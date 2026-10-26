@@ -47,7 +47,7 @@ let cardSaveFailed = false;
 /// What the page's overlay shows, gathered over half a second.
 const REPORT_INTERVAL_MS = 500;
 const stats = newStats(0);
-let renderOptions = { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false };
+let renderOptions = { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false, smooth2d: false };
 let shownSize = { width: 0, height: 0 };
 
 function newStats(since) {
@@ -342,6 +342,7 @@ function applyRender(options) {
         options.pgxp,
         options.pgxpTextures,
         options.widescreen,
+        options.smooth2d,
     );
     if (running || paused) {
         try {

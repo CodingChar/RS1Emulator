@@ -39,6 +39,7 @@ const DEFAULTS = {
     pgxp: false,
     pgxpTextures: true,
     widescreen: false,
+    smooth2d: false,
     overlay: {
         enabled: false,
         position: 'top-left',
@@ -100,5 +101,6 @@ export function renderOptions(settings) {
         pgxp: settings.pgxp,
         pgxpTextures: settings.pgxp && settings.pgxpTextures,
         widescreen: settings.pgxp && settings.widescreen,
+        smooth2d: settings.smooth2d && settings.scale > 1,
     };
 }

@@ -286,7 +286,8 @@ impl Ps1 {
     /// channel and no dithering; `bilinear` filters the textures of polygons;
     /// `pgxp` draws polygons with the sub-pixel positions the GTE computed,
     /// `pgxp_textures` adds perspective-correct textures and `widescreen`
-    /// squeezes 3D geometry for a picture shown at 16:9 (both need `pgxp`).
+    /// squeezes 3D geometry for a picture shown at 16:9 (both need `pgxp`);
+    /// `smooth_2d` blends the flat blocks of the picture (backgrounds, video) above 1x.
     pub fn set_render_settings(
         &mut self,
         scale: u32,
@@ -295,6 +296,7 @@ impl Ps1 {
         pgxp: bool,
         pgxp_textures: bool,
         widescreen: bool,
+        smooth_2d: bool,
     ) {
         self.inner.set_render_settings(RenderSettings {
             scale,
@@ -303,6 +305,7 @@ impl Ps1 {
             pgxp,
             pgxp_textures,
             widescreen,
+            smooth_2d,
         });
     }
 

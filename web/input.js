@@ -181,7 +181,12 @@ export class Input {
             return;
         }
         const target = event.target;
-        if (target instanceof HTMLElement && /^(INPUT|SELECT|TEXTAREA)$/.test(target.tagName)) {
+        // Typing in a field is left alone; a slider or a switch that kept the focus must not
+        // take the game's keys (the pad would stop answering after the volume was changed).
+        if (target instanceof HTMLElement && /^(SELECT|TEXTAREA)$/.test(target.tagName)) {
+            return;
+        }
+        if (target instanceof HTMLInputElement && !/^(range|checkbox|radio|button)$/.test(target.type)) {
             return;
         }
         if (event.code === KEY_ANALOG) {

@@ -1145,6 +1145,9 @@ impl Gpu {
                 }
             }
         }
+        if self.render.smooth_2d {
+            hires::smooth_flat_blocks(out, width * scale, height * scale, scale);
+        }
         (width * scale, height * scale)
     }
 

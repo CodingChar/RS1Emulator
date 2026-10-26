@@ -75,6 +75,7 @@ export class PerfOverlay {
                 if (render.bilinear) tags.push('bilineal');
                 if (render.trueColor) tags.push('24 bits');
                 if (render.widescreen) tags.push('ancho');
+                if (render.smooth2d) tags.push('suavizado 2D');
                 const native = info.native ? `${info.native.width}×${info.native.height}` : '';
                 const out = `${worker.width}×${worker.height}`;
                 lines.push({ text: `Imagen ${native && native !== out ? `${native} → ${out}` : out}${tags.length ? ` · ${tags.join(' · ')}` : ''}`, level: '' });

@@ -619,3 +619,30 @@ fn triangles_and_sprites_agree_in_every_colour_mode() {
         }
     }
 }
+
+#[test]
+fn smoothing_blends_flat_blocks_and_keeps_detail() {
+    // A 4x2 console picture at 2x: left half black, right half white, with one block of detail.
+    let (width, height, scale) = (8usize, 4usize, 2usize);
+    let mut pixels = vec![0xFF00_0000u32; width * height];
+    for y in 0..height {
+        for x in 4..width {
+            pixels[y * width + x] = 0xFFFF_FFFF;
+        }
+    }
+    pixels[1] = 0xFF12_3456; // the block at the top left is no longer flat
+    let before = pixels.clone();
+    smooth_flat_blocks(&mut pixels, width, height, scale);
+    for i in [0, 1, width, width + 1] {
+        assert_eq!(pixels[i], before[i], "detail stays");
+    }
+    // Across the black/white edge the pixels graduate instead of jumping.
+    let row = &pixels[2 * width..3 * width];
+    assert!(row[3] & 0xFF > 0 && row[3] & 0xFF < 255, "{:#x}", row[3]);
+    assert!(row[4] & 0xFF > row[3] & 0xFF);
+    assert_eq!(row[7], 0xFFFF_FFFF);
+    // Wrong sizes change nothing.
+    let mut same = before.clone();
+    smooth_flat_blocks(&mut same, width, height, 3);
+    assert_eq!(same, before);
+}
