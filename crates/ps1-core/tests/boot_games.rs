@@ -110,3 +110,25 @@ fn resident_evil_reads_a_formatted_card_from_its_load_game_screen() {
     assert!(card.sectors_read() >= 72, "only {} sectors read: the game gave up on the card", card.sectors_read());
     assert!(card.sectors_written() >= 1, "the BIOS writes a test sector when it brings the card up");
 }
+
+/// Silent Hill streams its warning-screen sound from the disc while the game waits for the GPU
+/// with every interrupt masked. The handler of each CD interrupt acknowledges it and only then asks
+/// for the sector, and libcd compares the sector header it reads with the position it expects: if
+/// the next sector replaced the buffer in between, the read started over, 1200 frames later
+/// `CdReadSync` returned an error the game takes for "still busy", and the warning screen never
+/// ended. With the controller holding the next interrupt back after an acknowledge the game goes on
+/// to its intro video within a few thousand million cycles.
+#[test]
+#[ignore = "boots a real game for ~2.5 billion instructions"]
+fn silent_hill_leaves_the_warning_screen_for_its_intro_video() {
+    let Some(sys) = boot("Silent Hill", 2_500_000_000) else {
+        eprintln!("skipped: no BIOS or Silent Hill disc under rom_test/");
+        return;
+    };
+    // Before the fix libcd re-issued the same 4 commands over 1200 times until it gave up.
+    let commands = sys.bus.cdrom.command_count;
+    assert!(commands < 600, "{commands} CD commands: the sector reads keep being retried");
+    // The warning is a flat, dark picture; the intro is full-colour video.
+    let n = colours(&sys);
+    assert!(n > 2000, "expected the intro video, found {n} colours");
+}

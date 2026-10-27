@@ -40,3 +40,25 @@
 - **PGXP en el modo de memoria.** La posición precisa sigue al valor por `swc2`, `mfc2`, `lw`, `sw`, `lwc2` y `mtc2`; si un juego recalcula las posiciones con la CPU (sumas, desplazamientos) antes de entregarlas a la GPU, esos vértices no tienen etiqueta y se dibujan con enteros. Los estados guardados no llevan las etiquetas: tras cargar uno, lo que ya estaba preparado se dibuja con enteros hasta el siguiente cuadro.
 - **Resolución y lecturas de VRAM.** El juego sigue viendo la VRAM nativa: un juego que lea la imagen de la pantalla para hacer efectos (o que la use como textura) ve la versión de la consola, y lo que vuelva a escribir en la VRAM se repite `escala × escala` veces en la imagen escalada.
 - **Audio.** El sonido que produce el SPU se comprobó sin saltos ni recortes (98 s de Crash Bandicoot); lo que cambia es el reproductor del navegador. Si el equipo no alcanza la velocidad real, el sonido se corta aunque la reserva sea grande: no es un fallo del audio sino de la velocidad.
+
+## 3. Silent Hill (USA) se quedaba en la pantalla de aviso
+
+**Estado.** Resuelto. La causa estaba en el controlador del CD-ROM, no en el juego ni en la carga del disco.
+
+**Síntoma.** Con el disco de Silent Hill (USA) el emulador arrancaba, mostraba «There are violent and disturbing images in this game» y no pasaba de ahí (ni en el navegador ni en el arnés nativo, con o sin tarjeta de memoria). No hay fallo ni pánico: el juego sigue ejecutando su bucle a 60 cuadros por segundo.
+
+**Causa.**
+1. Durante la pantalla de aviso el juego transmite desde el disco el sonido de fondo (lecturas de 25 sectores con `CdRead`, modo doble velocidad y sector completo de 2340 bytes). Mientras espera a la GPU entre dibujos, enmascara todas las interrupciones (`I_MASK = 0`), a veces durante más de un sector (225 792 ciclos a doble velocidad).
+2. El manejador de la interrupción del CD-ROM primero **reconoce** la interrupción y solo unos 300 ciclos después pide los datos (BFRD) y lee la cabecera de 12 bytes. Nuestro controlador entregaba el siguiente sector **en el mismo ciclo del reconocimiento** si ya le tocaba, así que el búfer ya contenía el sector N+1 cuando el juego pedía el N.
+3. `libcd` compara el minuto/segundo/cuadro de la cabecera con el sector que espera. Al no coincidir marca error y repite toda la lectura desde el principio (Pause, Setloc, SetMode, ReadN). Eso se repetía unas 330 veces hasta que a los 1200 cuadros (20 s) `CdReadSync` se rendía y devolvía `-1`.
+4. El controlador de sonido del juego solo espera a que `CdReadSync` devuelva 0 y trata cualquier otro valor como «ocupado», de modo que no volvía a intentarlo y la pantalla de aviso quedaba para siempre.
+
+**Cómo se comprobó.** Se siguió el juego desde el bucle de la pantalla hasta `CdReadSync` desensamblando su código y vigilando la variable que bloquea al controlador de sonido (`0x800C166D`). Un seguimiento de los registros del CD-ROM mostró dos INT1 seguidos sin petición de datos entre ellos, con el reconocimiento llegando 228 204 ciclos después del INT1 (más que el período de un sector) y las cabeceras saltándose un sector (`0x28` seguido de `0x30`).
+
+**Arreglo.** Tras reconocer una interrupción, el controlador espera `ACK_TO_NEXT_INTERRUPT = 5000` ciclos antes de lanzar la siguiente (sector o respuesta en cola), lo bastante para que el manejador pida y lea los datos del sector anunciado (`cdrom.rs`). El estado guardado cambia (`SAVE_STATE_VERSION = 9`).
+
+**Pruebas.**
+- `cdrom.rs`: `a_late_acknowledge_still_gets_the_data_of_the_announced_sector` (falla sin el arreglo).
+- `tests/boot_games.rs` (ignorado, necesita BIOS y disco): `silent_hill_leaves_the_warning_screen_for_its_intro_video`. Sin el arreglo emite 1255 órdenes al CD; con él, menos de 200 y llega al vídeo de introducción.
+
+**Pendiente.** La estimación del tiempo de dibujo de la GPU (`gpu/mod.rs`, `cost`) cobra 2 relojes por píxel a los sprites texturizados; si es demasiado pesimista, los juegos pasan más tiempo con las interrupciones enmascaradas que en la consola real. No se tocó: con el arreglo del CD el juego funciona y los cambios en esa estimación afectarían a la temporización de otros juegos.

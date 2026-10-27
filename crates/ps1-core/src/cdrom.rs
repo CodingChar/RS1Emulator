@@ -67,6 +67,11 @@ const SCAN_STEP: u32 = 8;
 const TOC_DELAY: u32 = 0x10_0000;
 /// Extra wait before the first sector of a read, for the head to settle.
 const READ_START_DELAY: u32 = 0x1_0000;
+/// CPU cycles after the CPU acknowledges an interrupt before the controller raises the next one.
+/// A handler acknowledges first and only then asks for the sector data and reads its header (about
+/// 300 cycles later in Silent Hill's libcd), so a sector that was already due must not replace the
+/// buffer in between: the next sector would be read in place of the one the interrupt announced.
+const ACK_TO_NEXT_INTERRUPT: u32 = 5000;
 const CPU_CLOCK: u32 = 33_868_800;
 
 /// Parameter and response FIFOs are 16 bytes deep.
@@ -136,6 +141,8 @@ pub struct CdRom {
     // Pending responses; `countdown` is the wait for the one at the front.
     queue: VecDeque<Scheduled>,
     countdown: u32,
+    /// Cycles left until the next interrupt may be raised after an acknowledge.
+    ack_latency: u32,
 
     // Drive state.
     motor_on: bool,
@@ -185,6 +192,7 @@ impl CdRom {
             irq_line: false,
             queue: VecDeque::new(),
             countdown: 0,
+            ack_latency: 0,
             motor_on: false,
             reading: false,
             mode: 0,
@@ -327,7 +335,11 @@ impl CdRom {
             }
             (3, 1) => {
                 // Acknowledge interrupts (write 1 to clear) / reset parameters.
+                let pending = self.interrupt_flag != 0;
                 self.interrupt_flag &= !(value & INTERRUPT_MASK);
+                if pending && self.interrupt_flag == 0 {
+                    self.ack_latency = ACK_TO_NEXT_INTERRUPT;
+                }
                 if value & 0x40 != 0 {
                     self.parameters.clear();
                 }
@@ -363,10 +375,10 @@ impl CdRom {
     pub fn cycles_until_event(&self) -> u32 {
         let mut next = u32::MAX;
         if !self.queue.is_empty() {
-            next = next.min(if self.countdown > 0 {
+            next = next.min(if self.interrupt_flag == 0 {
+                self.countdown.max(self.ack_latency).max(1)
+            } else if self.countdown > 0 {
                 self.countdown
-            } else if self.interrupt_flag == 0 {
-                1
             } else {
                 u32::MAX
             });
@@ -378,7 +390,7 @@ impl CdRom {
             next = next.min(if self.read_countdown > 0 {
                 self.read_countdown
             } else if self.interrupt_flag == 0 && self.queue.is_empty() {
-                1
+                self.ack_latency.max(1)
             } else {
                 u32::MAX
             });
@@ -389,6 +401,7 @@ impl CdRom {
     /// Advance by `cycles` cycles in which [`CdRom::cycles_until_event`]
     /// promised nothing happens.
     pub fn skip_cycles(&mut self, cycles: u32) {
+        self.ack_latency = self.ack_latency.saturating_sub(cycles);
         if !self.queue.is_empty() {
             self.countdown = self.countdown.saturating_sub(cycles);
         }
@@ -402,10 +415,11 @@ impl CdRom {
 
     /// Advance the drive by one CPU cycle.
     pub fn step(&mut self) {
+        self.ack_latency = self.ack_latency.saturating_sub(1);
         if !self.queue.is_empty() {
             self.countdown = self.countdown.saturating_sub(1);
             // A new interrupt waits until the previous one is acknowledged.
-            if self.countdown == 0 && self.interrupt_flag == 0 {
+            if self.countdown == 0 && self.interrupt_flag == 0 && self.ack_latency == 0 {
                 self.deliver_next_response();
             }
         }
@@ -421,7 +435,7 @@ impl CdRom {
         if self.reading {
             if self.read_countdown > 0 {
                 self.read_countdown -= 1;
-            } else if self.interrupt_flag == 0 && self.queue.is_empty() {
+            } else if self.interrupt_flag == 0 && self.queue.is_empty() && self.ack_latency == 0 {
                 self.deliver_sector();
             }
         }
@@ -1251,6 +1265,36 @@ mod tests {
         drive.ack();
         drive.wait_interrupt();
         assert_eq!(drive.cd.current_sector, position + 1);
+    }
+
+    /// A handler acknowledges INT1 and only then asks for the data. If the next sector was already
+    /// due (the CPU kept interrupts masked for longer than a sector takes), it must not replace the
+    /// sector the interrupt announced before the data is requested: libcd compares the header it
+    /// reads with the sector it expects and starts the whole read again on a mismatch.
+    #[test]
+    fn a_late_acknowledge_still_gets_the_data_of_the_announced_sector() {
+        let mut drive = Drive::with_disc(32);
+        drive.run(0x02, &[0x00, 0x02, 0x08]); // LBA 8
+        drive.run(0x06, &[]);
+        assert_eq!(drive.wait_interrupt(), INT1_DATA_READY);
+        for _ in 0..(2 * 451_584) {
+            drive.cd.step();
+        }
+        drive.ack();
+        // The handler needs a few hundred cycles between the acknowledge and the data request.
+        for _ in 0..400 {
+            drive.cd.step();
+        }
+        drive.select(0);
+        drive.cd.write(3, 1, 0x80);
+        assert_eq!(drive.cd.read(2, 1) as u8, 8, "the data of the sector the interrupt announced");
+
+        // The following sector is still delivered, right after the latency.
+        assert_eq!(drive.wait_interrupt(), INT1_DATA_READY);
+        drive.select(0);
+        drive.cd.write(3, 1, 0x00);
+        drive.cd.write(3, 1, 0x80);
+        assert_eq!(drive.cd.read(2, 1) as u8, 9);
     }
 
     #[test]
