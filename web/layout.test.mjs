@@ -71,12 +71,19 @@ test('saved settings are cleaned up when loaded', () => {
     assert.equal(settings.aspect, '4:3');
     assert.equal(settings.scale, 1);
     assert.equal(settings.audioLatency, 'auto');
-    assert.deepEqual(renderOptions(settings), { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false });
+    assert.deepEqual(renderOptions(settings), { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false, smooth2d: false });
 });
 
 test('perspective textures and widescreen only count with PGXP', () => {
     const options = renderOptions({ scale: 2, trueColor: true, textureFilter: 'bilinear', pgxp: false, pgxpTextures: true, widescreen: true });
-    assert.deepEqual(options, { scale: 2, trueColor: true, bilinear: true, pgxp: false, pgxpTextures: false, widescreen: false });
+    assert.deepEqual(options, { scale: 2, trueColor: true, bilinear: true, pgxp: false, pgxpTextures: false, widescreen: false, smooth2d: false });
     const withPgxp = renderOptions({ scale: 3, trueColor: false, textureFilter: 'nearest', pgxp: true, pgxpTextures: true, widescreen: true });
-    assert.deepEqual(withPgxp, { scale: 3, trueColor: false, bilinear: false, pgxp: true, pgxpTextures: true, widescreen: true });
+    assert.deepEqual(withPgxp, { scale: 3, trueColor: false, bilinear: false, pgxp: true, pgxpTextures: true, widescreen: true, smooth2d: false });
+});
+
+test('2D smoothing only counts when the picture is scaled', () => {
+    const base = { trueColor: false, textureFilter: 'nearest', pgxp: false, pgxpTextures: false, widescreen: false };
+    assert.equal(renderOptions({ ...base, scale: 1, smooth2d: true }).smooth2d, false);
+    assert.equal(renderOptions({ ...base, scale: 2, smooth2d: true }).smooth2d, true);
+    assert.equal(renderOptions({ ...base, scale: 2, smooth2d: false }).smooth2d, false);
 });

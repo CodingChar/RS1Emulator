@@ -242,8 +242,11 @@ fn shade_pixel(
     let mut rgb = color;
     let mut semi = attrs.semi_transparent;
     let mut modulated = false;
+    // A textured pixel keeps the texel's bit 15 in VRAM (a later pass can test it with the mask check).
+    let mut stp = 0;
     if attrs.textured {
         let texel = sampler.sample(vram, u, v);
+        stp = texel & 0x8000;
         if texel == 0 {
             return; // fully transparent
         }
@@ -281,7 +284,7 @@ fn shade_pixel(
     if settings.set_mask {
         pixel |= 0x8000;
     }
-    vram.set(x, y, pixel);
+    vram.set(x, y, pixel | stp);
 }
 
 /// Shade and write one pixel, if it is inside the drawing area.
@@ -592,7 +595,8 @@ fn span_textured<const GOURAUD: bool, const BLEND: bool>(
                 if BLEND && sh.semi && texel & 0x8000 != 0 {
                     pixel = blend(back, pixel, sh.semi_mode);
                 }
-                vram.pixels[index] = pixel | sh.mask_bit;
+                // The texel's bit 15 stays in VRAM, where a later pass can test it with the mask check.
+                vram.pixels[index] = pixel | sh.mask_bit | (texel & 0x8000);
             }
         }
         lanes[3].advance(divisor);

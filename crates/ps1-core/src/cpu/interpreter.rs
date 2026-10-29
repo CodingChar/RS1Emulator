@@ -322,6 +322,7 @@ impl Interpreter {
         self.pending_load = std::mem::replace(&mut self.next_load, (0, 0));
 
         let result = if self.interrupt_pending() {
+            self.run_gte_command_under_interrupt(bus);
             Err(Trap::exception(Exception::Interrupt))
         } else {
             self.fetch_and_execute(bus)
@@ -336,6 +337,25 @@ impl Interpreter {
         self.hilo_busy = self.hilo_busy.saturating_sub(1);
         self.gte_busy = self.gte_busy.saturating_sub(1);
         result
+    }
+
+    /// A GTE command the interrupt lands on still runs. The R3000A has started it by the time the
+    /// exception is taken, and the BIOS exception handler relies on that: it looks at the
+    /// instruction at EPC and, if it is a GTE command, returns past it. Without the command's
+    /// result the program reads the stale GTE registers (Silent Hill built polygons whose code byte
+    /// was missing, and the GPU took their words for commands). A command in a branch delay slot
+    /// is not affected: EPC then points at the branch and the command runs after the return.
+    fn run_gte_command_under_interrupt(&mut self, bus: &mut Bus) {
+        let pc = self.pc;
+        if self.in_delay_slot || pc & 3 != 0 || self.is_forbidden_address(pc) || self.cp0[COP0_SR] & SR_CU2 == 0 {
+            return;
+        }
+        let Some(instr) = bus.load(pc, 4) else { return };
+        if instr >> 26 == 0x12 && instr & (1 << 25) != 0 {
+            let _area = crate::profile::enter(crate::profile::Area::Gte);
+            self.gte.execute(instr & 0x01FF_FFFF);
+            self.gte_busy = Gte::latency(instr);
+        }
     }
 
     /// Deal with the outcome of an instruction that did not complete: take the

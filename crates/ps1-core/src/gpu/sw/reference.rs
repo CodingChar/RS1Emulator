@@ -69,8 +69,10 @@ fn put_pixel(
     let mut rgb = color;
     let mut semi = attrs.semi_transparent;
     let mut modulated = false;
+    let mut stp = 0;
     if attrs.textured {
         let texel = sample_texture(vram, &settings.window, &attrs.texture, uv.0, uv.1);
+        stp = texel & 0x8000;
         if texel == 0 {
             return; // fully transparent
         }
@@ -108,7 +110,7 @@ fn put_pixel(
     if settings.set_mask {
         pixel |= 0x8000;
     }
-    vram.set(xu, yu, pixel);
+    vram.set(xu, yu, pixel | stp);
 }
 
 // ----- Triangles -----

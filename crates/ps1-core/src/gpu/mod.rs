@@ -150,6 +150,24 @@ struct Download {
     index: usize,
 }
 
+/// The lines of the picture that show VRAM (see `Gpu::visible_lines`).
+#[derive(Clone, Copy)]
+struct VisibleLines {
+    /// Blank lines at the top of the picture.
+    blank: usize,
+    /// Rows of the display area skipped because their scanlines come before the picture.
+    skipped: usize,
+    /// Lines that show VRAM, after the blank ones; the rest of the picture is blank too.
+    shown: usize,
+}
+
+impl VisibleLines {
+    /// The row of the display area that line `y` of the picture shows, if it shows one.
+    fn row(&self, y: usize) -> Option<usize> {
+        (y >= self.blank && y < self.blank + self.shown).then(|| self.skipped + y - self.blank)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Gpu {
     pub vram: Vram,
@@ -348,6 +366,25 @@ impl Gpu {
     /// Height in lines of the displayed area.
     pub fn display_height(&self) -> usize {
         if self.display_mode & (1 << 2) != 0 { 480 } else { 240 }
+    }
+
+    /// Which lines of the picture the vertical display range (GP1(07h)) lets through. The
+    /// picture has `display_height()` lines that start at scanline 16 (35 on PAL); the
+    /// scanlines outside the range are blank, and the first scanline of the range shows the
+    /// first row of the display area. A game that draws fewer lines than the picture holds
+    /// (224 of 240 is common) sets the range to match, and what lies below its drawing in
+    /// VRAM must not be shown.
+    fn visible_lines(&self) -> VisibleLines {
+        let height = self.display_height();
+        // A 480-line picture counts two lines for each scanline of the range.
+        let per_scanline = height / 240;
+        let first_scanline = if self.is_pal() { 0x23 } else { 0x10 };
+        let top = first_scanline * per_scanline;
+        let (start, end) = (self.vertical_range.0 as usize * per_scanline, self.vertical_range.1 as usize * per_scanline);
+        let blank = start.saturating_sub(top).min(height);
+        let skipped = top.saturating_sub(start);
+        let shown = end.saturating_sub(start).saturating_sub(skipped).min(height - blank);
+        VisibleLines { blank, skipped, shown }
     }
 
     /// GPU clocks per dot at the current horizontal resolution.
@@ -1100,8 +1137,13 @@ impl Gpu {
         let (start_x, start_y) = (self.display_start.0 as usize, self.display_start.1 as usize);
         let true_color = self.display_mode & (1 << 4) != 0;
         let pixels = &self.vram.pixels;
+        let visible = self.visible_lines();
         for (y, line) in out.chunks_exact_mut(width).enumerate() {
-            let row = ((start_y + y) % sw::VRAM_HEIGHT) * sw::VRAM_WIDTH;
+            let Some(offset) = visible.row(y) else {
+                line.fill(0xFF00_0000);
+                continue;
+            };
+            let row = ((start_y + offset) % sw::VRAM_HEIGHT) * sw::VRAM_WIDTH;
             if true_color {
                 // 24-bit mode: three bytes per pixel packed into the row.
                 let byte = |i: usize| (pixels[row + (start_x + i / 2) % sw::VRAM_WIDTH] >> ((i % 2) * 8)) as u32;
@@ -1130,8 +1172,17 @@ impl Gpu {
         let scale = hires.scale();
         let true_color_display = self.display_mode & (1 << 4) != 0;
         if self.display_enabled && !true_color_display {
-            let start = (self.display_start.0 as usize, self.display_start.1 as usize);
-            hires.render_display(out, start, width, height);
+            // The renderer shows `height` consecutive rows from its start: start `blank` rows
+            // early so the first line of the range lands after the blank ones.
+            let visible = self.visible_lines();
+            let start_y = (self.display_start.1 as usize + visible.skipped + 4 * VRAM_HEIGHT - visible.blank) % VRAM_HEIGHT;
+            hires.render_display(out, (self.display_start.0 as usize, start_y), width, height);
+            let line = width * scale;
+            for (y, pixels) in out.chunks_exact_mut(line * scale).enumerate() {
+                if visible.row(y).is_none() {
+                    pixels.fill(0xFF00_0000);
+                }
+            }
         } else {
             // A 24-bit picture (video) or a blank screen has no scaled version:
             // the console's own picture, each pixel repeated.

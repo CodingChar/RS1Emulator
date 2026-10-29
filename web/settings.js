@@ -101,6 +101,6 @@ export function renderOptions(settings) {
         pgxp: settings.pgxp,
         pgxpTextures: settings.pgxp && settings.pgxpTextures,
         widescreen: settings.pgxp && settings.widescreen,
-        smooth2d: settings.smooth2d && settings.scale > 1,
+        smooth2d: Boolean(settings.smooth2d) && settings.scale > 1,
     };
 }

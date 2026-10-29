@@ -62,3 +62,42 @@
 - `tests/boot_games.rs` (ignorado, necesita BIOS y disco): `silent_hill_leaves_the_warning_screen_for_its_intro_video`. Sin el arreglo emite 1255 órdenes al CD; con él, menos de 200 y llega al vídeo de introducción.
 
 **Pendiente.** La estimación del tiempo de dibujo de la GPU (`gpu/mod.rs`, `cost`) cobra 2 relojes por píxel a los sprites texturizados; si es demasiado pesimista, los juegos pasan más tiempo con las interrupciones enmascaradas que en la consola real. No se tocó: con el arreglo del CD el juego funciona y los cambios en esa estimación afectarían a la temporización de otros juegos.
+
+## 4. Silent Hill (USA): gráficos rotos al jugar (recuadro alrededor de Harry, texturas borradas, líneas basura)
+
+**Estado.** Resuelto. Eran tres fallos distintos, dos de la GPU y uno de la CPU; afectaban a cualquier juego que use esas funciones, no solo a Silent Hill.
+
+### 4.1 El bit 15 de la textura se perdía (recuadro claro alrededor de los personajes)
+
+**Síntoma.** En la demo del título y en la partida, Harry aparecía dentro de un rectángulo más claro, y en otras escenas como una silueta oscura.
+
+**Causa.** Silent Hill aplica la niebla en dos pasadas: dibuja el polígono texturizado y encima otro polígono semitransparente del color de la niebla con «set mask + check mask» (`E6h = 3`), de modo que donde dos polígonos se solapan la niebla no se suma dos veces. Para que eso funcione, los píxeles que escribe un polígono **texturizado** conservan en la VRAM el bit 15 del texel (STP), que es el que mira después el «check mask». Nosotros solo escribíamos el bit 15 cuando el juego activaba «set mask», así que el recuadro de niebla del personaje se aplicaba también sobre el fondo ya pintado.
+
+**Arreglo.** Un píxel texturizado se guarda con el bit 15 del texel además del «set mask» (`gpu/sw.rs`, `gpu/sw/reference.rs` y `gpu/hires.rs`, en todos los caminos de dibujo: triángulos y rectángulos, en el renderizador exacto, en el rápido y en el escalado). Los primitivos sin textura siguen escribiendo solo el bit de «set mask».
+
+**Pruebas.** `gpu/sw/tests.rs` (`textured_pixels_keep_the_texel_bit_15_for_a_later_mask_check`, `a_blended_texel_keeps_bit_15_and_an_opaque_one_does_not_get_it`) y `gpu/hires/tests.rs` (la misma comprobación en el renderizador escalado). Las pruebas de equivalencia entre el renderizador exacto, el rápido y el escalado a 1× siguen pasando.
+
+### 4.2 La imagen mostraba líneas fuera del rango vertical (líneas basura arriba o abajo)
+
+**Síntoma.** Algunos fotogramas traían una o dos líneas de píxeles de colores arriba o franjas rosas abajo.
+
+**Causa.** El emulador mostraba siempre 240 líneas desde el inicio del área de visualización y no hacía caso del rango vertical (`GP1(07h)`). Un juego que dibuja 224 líneas (Silent Hill usa el rango `0x18..0xF8`) deja debajo de su imagen datos de otras cosas en la VRAM, y la consola no los muestra: las líneas fuera del rango salen en negro.
+
+**Arreglo.** `Gpu::visible_lines` calcula qué líneas de la imagen enseñan la VRAM: la imagen empieza en el scanline 16 (35 en PAL), las líneas antes y después del rango se pintan negras y la primera línea del rango muestra la primera fila del área. Vale para la imagen de la consola, la escalada y los modos de 480 líneas. Con el rango por defecto no cambia nada.
+
+**Pruebas.** `gpu/tests.rs`: `the_vertical_display_range_blanks_the_lines_outside_it`, `a_range_that_starts_before_the_picture_skips_the_first_rows`, `an_empty_range_shows_nothing_and_the_default_shows_everything` y `the_scaled_picture_is_cropped_like_the_console_picture`.
+
+### 4.3 Un comando de la GTE bajo una interrupción se perdía (texturas borradas, GPU desincronizada)
+
+**Síntoma.** Al empezar una partida nueva la escena se veía casi sin texturas (suelo verde, siluetas planas) y se quedaba así.
+
+**Causa.**
+1. La instrucción `DPCS` de la GTE (niebla por profundidad) estaba seguida de `swc2` para guardar el color en el paquete de la GPU. Cuando una interrupción caía justo sobre el `DPCS`, nosotros tomábamos la excepción **antes** de ejecutarlo, con `EPC` apuntando a él.
+2. El manejador de excepciones de la BIOS (en `0xC80`) mira la instrucción que hay en `EPC` y, si es un comando de la GTE, **vuelve a la siguiente**: en la consola real la CPU ya ha lanzado el comando cuando llega la excepción. Resultado: el `DPCS` no se ejecutaba nunca y `swc2` guardaba el color de un cálculo anterior.
+3. Ese color traía el byte de código en 0 (`02030303` en lugar de `3E030303`). La GPU tomó el paquete por un comando de relleno (`02h`) y trató las palabras del polígono como más comandos: miles de rellenos con coordenadas sin sentido que borraron las texturas de la VRAM.
+
+**Cómo se comprobó.** Un registro de los comandos GP0 mostró el primer `02030303` en medio de una lista de polígonos; la dirección del paquete en la RAM y un vigilante de la palabra en el bloc de notas de la CPU dieron la instrucción responsable, y el rastro de instrucciones (`--features trace`) mostró la excepción entre un `nop` y el `DPCS`, y la vuelta directa al `swc2`.
+
+**Arreglo.** Si hay una interrupción pendiente y la instrucción que iba a ejecutarse es un comando de la GTE (y no está en un hueco de salto, donde `EPC` apunta al salto), se ejecuta el comando antes de entrar en el manejador (`cpu/interpreter.rs`, `run_gte_command_under_interrupt`). Es lo que hace el hardware y lo que hace DuckStation.
+
+**Pruebas.** `cpu/interpreter/tests.rs`: `an_interrupt_on_a_gte_command_still_runs_the_command`, `an_interrupt_on_other_instructions_runs_no_gte_command` y `an_interrupt_on_a_gte_command_in_a_delay_slot_runs_it_once_after_the_return`.

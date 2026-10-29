@@ -458,6 +458,52 @@ fn set_mask_marks_pixels_and_check_mask_protects_them() {
     assert_eq!(vram.get(2, 0), 0x03E0, "unprotected pixels are drawn");
 }
 
+/// Texels 0..4 of every row carry bit 15 (red), the rest do not (green).
+fn stp_texture() -> Vram {
+    let mut vram = Vram::new();
+    for v in 0..16 {
+        for u in 0..16 {
+            vram.set(512 + u, v, if u < 4 { 0x8000 | 0x001F } else { 0x03E0 });
+        }
+    }
+    vram
+}
+
+#[test]
+fn textured_pixels_keep_the_texel_bit_15_for_a_later_mask_check() {
+    // Silent Hill draws a polygon, then a fog pass over it with "set and check mask", so
+    // the fog is not applied twice where polygons overlap: the first pass must leave the
+    // texel's bit 15 in VRAM for the second one to find.
+    let mut vram = stp_texture();
+    draw_rectangle(&mut vram, &settings(), &textured(true), 100, 100, 8, 1, [0; 3], 0, 0, false, false);
+    assert_eq!(vram.get(101, 100), 0x8000 | 0x001F, "rectangle, texel with bit 15");
+    assert_eq!(vram.get(106, 100), 0x03E0, "rectangle, texel without it");
+
+    let quad = [tv(0, 20, 0, 0), tv(8, 20, 8, 0), tv(0, 28, 0, 8), tv(8, 28, 8, 8)];
+    draw_triangle(&mut vram, &settings(), &textured(true), [quad[0], quad[1], quad[2]]);
+    draw_triangle(&mut vram, &settings(), &textured(true), [quad[1], quad[2], quad[3]]);
+    assert_eq!(vram.get(1, 21), 0x8000 | 0x001F, "triangle, texel with bit 15");
+    assert_eq!(vram.get(6, 21), 0x03E0, "triangle, texel without it");
+
+    // A pass that checks the mask skips the first pixel and draws over the second.
+    let mut checking = settings();
+    checking.check_mask = true;
+    draw_rectangle(&mut vram, &checking, &flat(), 100, 100, 8, 1, [0, 0, 255], 0, 0, false, false);
+    assert_eq!(vram.get(101, 100), 0x8000 | 0x001F, "protected by the texel's bit");
+    assert_eq!(vram.get(106, 100), 0x7C00, "drawn over");
+}
+
+#[test]
+fn a_blended_texel_keeps_bit_15_and_an_opaque_one_does_not_get_it() {
+    let mut vram = stp_texture();
+    vram.set(0, 0, 0x0010);
+    vram.set(5, 0, 0x0010);
+    let attrs = Attributes { semi_transparent: true, semi_mode: 1, ..textured(true) };
+    draw_rectangle(&mut vram, &settings(), &attrs, 0, 0, 8, 1, [0; 3], 0, 0, false, false);
+    assert_eq!(vram.get(0, 0), 0x8000 | 0x001F, "0x10 + 0x1F saturates, bit 15 stays");
+    assert_eq!(vram.get(5, 0), 0x03E0, "opaque texel replaces the pixel, bit 15 clear");
+}
+
 #[test]
 fn dithering_varies_gouraud_colours_by_position() {
     let attrs = Attributes { gouraud: true, ..Attributes::default() };

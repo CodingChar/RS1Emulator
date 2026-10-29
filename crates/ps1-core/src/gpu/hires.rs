@@ -946,6 +946,12 @@ fn flat_pixel(sh: &Shading, color: [i32; 3]) -> u32 {
 /// Stands for a transparent texel in a row of sprite pixels (no pixel has bits 25 to 31).
 const TRANSPARENT: u32 = u32::MAX;
 
+/// A textured pixel keeps the texel's bit 15 (the semi-transparency flag) in VRAM, where a later
+/// pass can test it with the mask check, as the console does.
+fn stp_bit(texel: &Texel) -> u32 {
+    if texel.stp { MASK } else { 0 }
+}
+
 /// The pixel a textured sprite shows for a texel with 5-bit channels, without dithering,
 /// semi-transparency or true colour.
 fn sprite_pixel(sh: &Shading, color: [i32; 3], texel: &Texel) -> u32 {
@@ -956,7 +962,7 @@ fn sprite_pixel(sh: &Shading, color: [i32; 3], texel: &Texel) -> u32 {
         [((t[0] * color[0]) >> 4).min(255), ((t[1] * color[1]) >> 4).min(255), ((t[2] * color[2]) >> 4).min(255)]
     };
     let channel = |value: i32| QUANTIZED[(value + 4) as usize & 511] as u32;
-    (channel(rgb[0]) | channel(rgb[1]) << 8 | channel(rgb[2]) << 16) | sh.mask_bit
+    (channel(rgb[0]) | channel(rgb[1]) << 8 | channel(rgb[2]) << 16) | sh.mask_bit | stp_bit(texel)
 }
 
 /// Shade and write one pixel. `color` is the interpolated vertex colour
@@ -1011,7 +1017,7 @@ fn put(dst: &mut u32, sh: &Shading, dither: &[i32; 4], x: usize, color: [i32; 3]
             quantized
         }
     };
-    *dst = pixel | sh.mask_bit;
+    *dst = pixel | sh.mask_bit | stp_bit(texel);
 }
 
 // ----- Spans -----
@@ -1242,7 +1248,7 @@ fn shade_span_nearest<const GOURAUD: bool, const BLEND: bool, const PERSPECTIVE:
                     let quantized = channel(rgb[0]) | channel(rgb[1]) << 8 | channel(rgb[2]) << 16;
                     if blended { blend_quantized(*dst, quantized, mode) } else { quantized }
                 };
-                *dst = pixel | mask_bit;
+                *dst = pixel | mask_bit | if texel & 0x8000 != 0 { MASK } else { 0 };
             }
         }
         if PERSPECTIVE {

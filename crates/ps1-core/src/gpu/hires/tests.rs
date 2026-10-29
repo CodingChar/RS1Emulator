@@ -406,6 +406,28 @@ fn draw_quad(hires: &mut HiRes, vram: &Vram, attrs: &Attributes, quad: [[HVertex
 }
 
 #[test]
+fn textured_pixels_keep_the_texel_bit_15_for_a_later_mask_check() {
+    // Texels 0..4 of a row have bit 15 (the console keeps it in VRAM as the mask bit).
+    let vram = texture_vram(|u, _| if u < 4 { 0x8000 | 0x001F } else { 0x03E0 });
+    let mut hires = HiRes::from_vram(&vram, &settings_for(2));
+    hires.draw_rectangle(&vram, &open_area(), &textured(), 10, 10, 8, 1, [128; 3], 0, 0, false, false);
+    let at = |hires: &HiRes, x: usize, y: usize| hires.pixels[y * hires.stride + x];
+    assert_ne!(at(&hires, 21, 20) & MASK, 0, "sprite, texel with bit 15");
+    assert_eq!(at(&hires, 33, 20) & MASK, 0, "sprite, texel without it");
+
+    draw_quad(&mut hires, &vram, &textured(), sampled_quad(0, 8, 0, 8.0));
+    assert_ne!(at(&hires, 2, 4) & MASK, 0, "triangle, texel with bit 15");
+    assert_eq!(at(&hires, 12, 4) & MASK, 0, "triangle, texel without it");
+
+    // A later pass that checks the mask leaves the marked pixels alone.
+    let mut checking = open_area();
+    checking.check_mask = true;
+    hires.draw_rectangle(&vram, &checking, &Attributes::default(), 10, 10, 8, 1, [0, 0, 255], 0, 0, false, false);
+    assert_eq!(at(&hires, 21, 20) & COLOR, expand15(0x001F), "protected");
+    assert_eq!(at(&hires, 33, 20) & COLOR, expand15(0x7C00), "drawn over");
+}
+
+#[test]
 fn nearest_sampling_repeats_each_texel() {
     // Texels alternate black (non-transparent) and white along u.
     let vram = texture_vram(|u, _| if u % 2 == 0 { 0x0001 } else { 0x7FFF });

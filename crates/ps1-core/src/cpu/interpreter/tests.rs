@@ -1064,6 +1064,50 @@ fn interrupt_in_a_delay_slot_returns_to_the_branch() {
 }
 
 #[test]
+fn an_interrupt_on_a_gte_command_still_runs_the_command() {
+    // The BIOS exception handler returns past a GTE command at EPC, because the CPU has started
+    // it by then: the command must have run, and EPC still points at it.
+    let mut m = gte_machine(&[gte_command(0x2D), NOP]);
+    m.cpu.cp0[COP0_SR] |= SR_IEC | CAUSE_IP2;
+    m.cpu.gte.control[29] = 0x155; // ZSF3
+    m.cpu.gte.data[17] = 100; // SZ1
+    m.cpu.gte.data[18] = 200; // SZ2
+    m.cpu.gte.data[19] = 300; // SZ3
+    m.cpu.set_irq(true);
+    m.step();
+    assert_eq!(m.exc_code(), Exception::Interrupt as u32);
+    assert_eq!(m.epc(), CODE);
+    // AVSZ3: OTZ = (SZ1 + SZ2 + SZ3) * ZSF3 / 4096.
+    assert_eq!(m.cpu.gte.data[7], (600 * 0x155) >> 12, "the command ran before the handler");
+}
+
+#[test]
+fn an_interrupt_on_other_instructions_runs_no_gte_command() {
+    let mut m = gte_machine(&[mtc2(1, 17), gte_command(0x2D)]);
+    m.cpu.cp0[COP0_SR] |= SR_IEC | CAUSE_IP2;
+    m.cpu.gte.control[29] = 0x155;
+    m.cpu.regs[1] = 600;
+    m.cpu.set_irq(true);
+    m.step();
+    assert_eq!(m.cpu.gte.data[7], 0);
+    assert_eq!(m.cpu.gte.data[17], 0, "the interrupted mtc2 has not run either");
+}
+
+#[test]
+fn an_interrupt_on_a_gte_command_in_a_delay_slot_runs_it_once_after_the_return() {
+    let mut m = gte_machine(&[j(CODE + 0x10), gte_command(0x2D), NOP, NOP, NOP]);
+    m.cpu.cp0[COP0_SR] |= SR_IEC | CAUSE_IP2;
+    m.cpu.gte.control[29] = 0x155;
+    m.cpu.gte.data[19] = 300;
+    m.step(); // the jump
+    m.cpu.set_irq(true);
+    m.step(); // the interrupt fires before the delay slot
+    assert!(m.in_delay_slot_flag());
+    assert_eq!(m.epc(), CODE, "EPC points at the branch");
+    assert_eq!(m.cpu.gte.data[7], 0, "the command is run after the return, not now");
+}
+
+#[test]
 fn interrupt_lets_a_pending_load_complete() {
     let mut m = Machine::new(&[lw(1, DATA as i32, 0), NOP]);
     m.poke32(DATA, 0xABCD);

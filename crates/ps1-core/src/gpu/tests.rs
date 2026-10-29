@@ -540,6 +540,82 @@ fn true_colour_mode_reads_packed_24_bit_pixels() {
     assert_eq!(&fb[4..8], &[40, 50, 60, 255]);
 }
 
+/// A 320x240 display whose VRAM column 0 holds the row number (+1, so row 0 is not black).
+fn numbered_rows() -> Gpu {
+    let mut gpu = Gpu::new();
+    gp1(&mut gpu, 0x0800_0001);
+    gp1(&mut gpu, 0x0300_0000);
+    for y in 0..512 {
+        gpu.vram.set(0, y, (y as u16 + 1) & 0x1F | 0x0400);
+    }
+    gpu
+}
+
+/// The red channel the marker of VRAM row `y` has on the display (5 bits widened to 8).
+fn marker(y: usize) -> u32 {
+    let value = (y as u32 + 1) & 0x1F;
+    value << 3 | value >> 2
+}
+
+/// The red channel of a line of the picture (the marker of the row it shows), `None` if it is black.
+fn shown_row(fb: &[u8], line: usize) -> Option<u32> {
+    let pixel = &fb[line * 320 * 4..][..4];
+    (pixel[..3] != [0, 0, 0]).then(|| pixel[0] as u32)
+}
+
+#[test]
+fn the_vertical_display_range_blanks_the_lines_outside_it() {
+    // A game that draws 224 lines sets the range to 0x18..0xF8; the 8 lines before and after
+    // belong to the overscan, and what VRAM holds below its picture must not show.
+    let mut gpu = numbered_rows();
+    gp1(&mut gpu, 0x0700_0000 | (0xF8 << 10) | 0x18);
+    let fb = gpu.framebuffer();
+    assert_eq!(fb.len(), 320 * 240 * 4);
+    for line in (0..8).chain(232..240) {
+        assert_eq!(shown_row(&fb, line), None, "line {line} is blank");
+    }
+    assert!(shown_row(&fb, 8).is_some(), "the first line of the range shows the first row");
+    assert!(shown_row(&fb, 231).is_some(), "the last line of the range shows row 223");
+    assert_eq!(shown_row(&fb, 8), Some(marker(0)), "line 8 is VRAM row 0");
+    assert_eq!(shown_row(&fb, 231), Some(marker(223)), "line 231 is VRAM row 223");
+}
+
+#[test]
+fn a_range_that_starts_before_the_picture_skips_the_first_rows() {
+    // Scanlines 0x0A..0x10 are above the picture, so the line at 0x10 shows row 6 of the area.
+    let mut gpu = numbered_rows();
+    gp1(&mut gpu, 0x0700_0000 | (0x10A << 10) | 0x0A);
+    let fb = gpu.framebuffer();
+    assert_eq!(shown_row(&fb, 0), Some(marker(6)));
+    assert_eq!(shown_row(&fb, 239), Some(marker(245)));
+}
+
+#[test]
+fn an_empty_range_shows_nothing_and_the_default_shows_everything() {
+    let mut gpu = numbered_rows();
+    assert!(shown_row(&gpu.framebuffer(), 0).is_some() && shown_row(&gpu.framebuffer(), 239).is_some());
+    gp1(&mut gpu, 0x0700_0000 | (0x10 << 10) | 0x10);
+    let fb = gpu.framebuffer();
+    assert!((0..240).all(|line| shown_row(&fb, line).is_none()));
+}
+
+#[test]
+fn the_scaled_picture_is_cropped_like_the_console_picture() {
+    let mut gpu = numbered_rows();
+    gp1(&mut gpu, 0x0700_0000 | (0xF8 << 10) | 0x18);
+    let mut native = Vec::new();
+    gpu.render_frame(&mut native);
+    gpu.set_render_settings(RenderSettings { scale: 2, ..RenderSettings::default() });
+    let mut scaled = Vec::new();
+    let (width, height) = gpu.render_frame(&mut scaled);
+    assert_eq!((width, height), (640, 480));
+    for line in 0..240 {
+        for k in 0..2 {
+            assert_eq!(scaled[(line * 2 + k) * 640], native[line * 320], "line {line}");
+        }
+    }
+}
+
 #[test]
 fn drawing_is_visible_on_the_display() {
     let mut gpu = gpu();
