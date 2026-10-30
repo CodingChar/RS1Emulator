@@ -40,6 +40,8 @@ const DEFAULTS = {
     pgxpTextures: true,
     widescreen: false,
     smooth2d: false,
+    // Lower the rendering options by itself while the game cannot run at full speed (quality.js).
+    adaptiveQuality: true,
     overlay: {
         enabled: false,
         position: 'top-left',
@@ -68,6 +70,7 @@ function sanitize(saved) {
     merged.slot = number(merged.slot, DEFAULTS.slot, 1, 3);
     merged.crop = Math.round(number(merged.crop, 0, 0, 3));
     merged.scale = Math.round(number(merged.scale, 1, 1, 3));
+    merged.adaptiveQuality = merged.adaptiveQuality !== false;
     if (!ASPECTS.includes(merged.aspect)) merged.aspect = DEFAULTS.aspect;
     if (merged.audioLatency !== 'auto') merged.audioLatency = Number(merged.audioLatency);
     if (!LATENCIES.includes(merged.audioLatency)) merged.audioLatency = DEFAULTS.audioLatency;

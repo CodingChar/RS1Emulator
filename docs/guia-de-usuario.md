@@ -184,10 +184,20 @@ los valores predeterminados la imagen es la de la consola, píxel a píxel.
     no dibujan los polígonos fuera de la pantalla 4:3 dejan huecos en los lados.
 - **Color verdadero (24 bits)**: dibuja y mezcla con 8 bits por canal, sin el recorte a 15 bits ni el
   tramado de la consola (más degradados suaves, sin patrón de puntos).
+- **Calidad adaptativa** (activada de serie): si el juego no llega a la velocidad real, el emulador baja
+  solo lo más caro, de un escalón en un escalón, y lo recupera cuando hay holgura. El orden es: filtro
+  bilineal, escalado (3× → 2× → 1×), PGXP y color verdadero; con *Ensanchar escenas 3D* activo no se
+  quita PGXP, porque sin él la imagen solo se estiraría. Avisa con un mensaje cada vez que cambia algo y
+  el panel de rendimiento muestra «calidad adaptada» mientras haya algo reducido. Mira el tiempo que
+  tarda cada cuadro durante un par de segundos antes de decidir, no se mueve por un tirón aislado, y
+  espera como mínimo 15 s antes de volver a subir un escalón (el doble si el escalón no aguantó). Solo
+  actúa a velocidad normal o más lenta: con ×2, ×4 o máxima se supone que pides todo lo que dé el
+  equipo. Cambiar cualquier ajuste de imagen la reinicia con lo que hayas elegido.
 
 Cada mejora cuesta tiempo: con 2× son 4 veces más píxeles y con 3× son 9 veces más; el filtro bilineal
 es el más caro. Si el juego va más lento que la consola (el porcentaje de la barra de estado baja de
-100 %), baja el escalado, quita el filtro bilineal o desactiva PGXP. Los estados guardados no incluyen
+100 %) y has quitado la calidad adaptativa, baja el escalado, quita el filtro bilineal o desactiva
+PGXP a mano. Los estados guardados no incluyen
 la información de PGXP: tras cargar uno, los polígonos que ya estaban preparados se dibujan con posiciones
 enteras hasta el cuadro siguiente.
 
@@ -220,7 +230,7 @@ porcentaje de la barra de estado baja de 100 %: el juego va más despacio que la
 | El juego no arranca | Comprueba que el disco es de PS1 y que la BIOS es de la misma región o compatible. |
 | No suena | Mira el indicador de sonido (arriba) y que la velocidad sea normal. |
 | El mando no aparece | Pulsa un botón con la página en primer plano; prueba otro puerto USB. |
-| Va a saltos | Baja el escalado, desactiva PGXP o el filtro bilineal, baja la velocidad objetivo o cierra otras pestañas pesadas. |
+| Va a saltos | Deja activada la *Calidad adaptativa* (Gráficos), que baja sola el escalado, PGXP o el filtro bilineal; si la tienes quitada, hazlo a mano. También ayuda bajar la velocidad objetivo o cerrar otras pestañas pesadas. |
 | El sonido se corta | Pon la reserva de sonido en Automática o más alta, y mira en el panel de rendimiento si la carga pasa de 100 %. |
 | La imagen se ve estirada | Elige *Ampliar sin deformar* o *Escala entera* en Pantalla; con 16:9, activa *Ensanchar escenas 3D*. |
 | Una tarjeta se perdió | El navegador pudo borrar sus datos; importa una copia exportada. |

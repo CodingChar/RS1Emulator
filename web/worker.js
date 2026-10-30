@@ -7,6 +7,7 @@
 import init, { Ps1 } from './pkg/ps1_wasm.js';
 import * as storage from './storage.js';
 import { createPresenter } from './present.js';
+import { QualityController } from './quality.js';
 
 const BIOS_KEY = 'bios';
 const CARD_COUNT = 2;
@@ -56,7 +57,11 @@ let cardSaveFailed = false;
 /// What the page's overlay shows, gathered over half a second.
 const REPORT_INTERVAL_MS = 500;
 const stats = newStats(0);
+/// The rendering options in force: the ones the page asked for, or a cheaper rung of them while
+/// the machine cannot keep up (see quality.js).
 let renderOptions = { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false, smooth2d: false };
+let adaptiveQuality = true;
+const quality = new QualityController();
 let shownSize = { width: 0, height: 0 };
 
 function newStats(since) {
@@ -181,6 +186,7 @@ function startConsole() {
     running = true;
     accumulator = 0;
     lastFrameTime = performance.now();
+    quality.skip();
     say(discLoaded ? 'En marcha.' : 'En marcha (sin disco: menú de la BIOS).');
     publishState();
 }
@@ -226,6 +232,8 @@ function updateStats(now) {
         width: shownSize.width,
         height: shownSize.height,
         scale: renderOptions.scale,
+        render: renderOptions,
+        quality: quality.reduction,
         heap: wasm.memory.buffer.byteLength,
         presenter: presenter ? presenter.kind : 'page',
     });
@@ -327,6 +335,7 @@ function tick() {
             if (audioPort && speed === 1 && samples.length > 0) {
                 audioPort.postMessage(samples, [samples.buffer]);
             }
+            adaptQuality(frames, done - emuStart, done);
         }
         if (frames > 0) reportRumble();
         updateStats(performance.now());
@@ -338,11 +347,9 @@ function tick() {
 
 // ----- Rendering options -----
 
-/// Hand the page's choices to the core. A frame already on the screen is drawn
-/// again so that a change shows up even while the game is paused.
-function applyRender(options) {
+/// Give the core these options.
+function useRender(options) {
     renderOptions = options;
-    if (!ps1) return;
     ps1.set_render_settings(
         options.scale,
         options.trueColor,
@@ -352,6 +359,32 @@ function applyRender(options) {
         options.widescreen,
         options.smooth2d,
     );
+}
+
+/// Watch how much of the time it is allowed each frame takes (emulating it and drawing it) and,
+/// when the machine cannot keep up, lower the rendering options a rung; raise them again when
+/// there is room. Only at normal speed or slower: a faster speed is asking for all the machine has.
+function adaptQuality(frames, spent, now) {
+    if (speed === 'max' || speed > 1) {
+        quality.skip();
+        return;
+    }
+    const allowed = (frames * 1000) / ps1.frames_per_second() / speed;
+    const change = quality.sample(spent / allowed, now);
+    if (!change) return;
+    const previous = renderOptions;
+    useRender(change.options);
+    post({ type: 'quality', level: change.level, reason: change.reason, previous, options: change.options });
+}
+
+/// Hand the page's choices to the core. A frame already on the screen is drawn
+/// again so that a change shows up even while the game is paused.
+function applyRender(options, adaptive = adaptiveQuality) {
+    renderOptions = options;
+    adaptiveQuality = adaptive;
+    quality.configure(options, adaptive, performance.now());
+    if (!ps1) return;
+    useRender(options);
     if (running || paused) {
         try {
             present();
@@ -478,10 +511,11 @@ onmessage = async (event) => {
             running = true;
             lastFrameTime = performance.now();
             accumulator = 0;
+            quality.skip();
             say('En marcha.');
             return publishState();
         case 'speed': speed = message.value; return;
-        case 'render': return applyRender(message.options);
+        case 'render': return applyRender(message.options, message.adaptive !== false);
         case 'input':
             pads = message.pads;
             analog = message.analog;

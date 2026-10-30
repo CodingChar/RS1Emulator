@@ -187,6 +187,9 @@ function onWorkerMessage(event) {
             refreshOverlay();
             break;
         }
+        case 'quality':
+            onQualityChange(message);
+            break;
         case 'frame-size':
             frameSize = message;
             layoutScreen();
@@ -458,8 +461,26 @@ function setFilter(value) {
 
 /// Tell the worker how to render, and keep the controls that show it in step.
 function sendRender() {
-    if (worker) worker.postMessage({ type: 'render', options: renderOptions(settings) });
+    // The worker starts again from the options asked for.
+    if (workerStats) workerStats = { ...workerStats, quality: 0 };
+    if (worker) worker.postMessage({ type: 'render', options: renderOptions(settings), adaptive: settings.adaptiveQuality });
     refreshGraphicsControls();
+    refreshOverlay();
+}
+
+/// What changed between two sets of rendering options, for the message about it.
+function describeQualityChange(from, to) {
+    if (from.bilinear !== to.bilinear) return `filtro bilineal ${to.bilinear ? 'activado' : 'desactivado'}`;
+    if (from.scale !== to.scale) return `escalado ${from.scale}× → ${to.scale}×`;
+    if (from.pgxp !== to.pgxp) return `PGXP ${to.pgxp ? 'activado' : 'desactivado'}`;
+    return `color verdadero ${to.trueColor ? 'activado' : 'desactivado'}`;
+}
+
+/// The worker lowered the rendering options because the game was not keeping up, or raised them again.
+function onQualityChange({ level, reason, previous, options }) {
+    workerStats = workerStats && { ...workerStats, render: options, quality: level };
+    const what = describeQualityChange(previous, options);
+    toasts.show(reason === 'slow' ? `Calidad reducida para mantener la velocidad: ${what}` : `Calidad restaurada: ${what}`);
     refreshOverlay();
 }
 
@@ -494,6 +515,7 @@ function refreshGraphicsControls() {
     $('widescreen').checked = settings.widescreen;
     $('true-color').checked = settings.trueColor;
     $('smooth-2d').checked = settings.smooth2d;
+    $('adaptive-quality').checked = settings.adaptiveQuality;
     // These two only do something with PGXP.
     for (const id of ['pgxp-textures', 'widescreen']) {
         $(id).disabled = !settings.pgxp;
@@ -509,7 +531,8 @@ function refreshOverlay() {
         running,
         speed: settings.speed === 'max' ? null : Number(settings.speed),
         audio: audio.stats,
-        render: renderOptions(settings),
+        // What is really being drawn: the worker may have lowered the options the user chose.
+        render: settings.adaptiveQuality && workerStats && workerStats.quality > 0 ? workerStats.render : renderOptions(settings),
         native: { width: frameSize.nativeWidth, height: frameSize.nativeHeight },
     });
 }
@@ -733,6 +756,7 @@ function graphicsPage() {
             switchRow('↔', 'Ensanchar escenas 3D (16:9)', () => settings.widescreen, setWidescreen, () => !settings.pgxp),
             switchRow('🎨', 'Color verdadero (24 bits)', () => settings.trueColor, (trueColor) => setRender({ trueColor })),
             switchRow('🪄', 'Suavizar fondos, menús y vídeo', () => settings.smooth2d, (smooth2d) => setRender({ smooth2d })),
+            switchRow('🎚', 'Calidad adaptativa', () => settings.adaptiveQuality, (adaptiveQuality) => setRender({ adaptiveQuality })),
         ],
     };
 }
@@ -1024,6 +1048,7 @@ $('pgxp-textures').addEventListener('change', (event) => setRender({ pgxpTexture
 $('widescreen').addEventListener('change', (event) => setWidescreen(event.target.checked));
 $('true-color').addEventListener('change', (event) => setRender({ trueColor: event.target.checked }));
 $('smooth-2d').addEventListener('change', (event) => setRender({ smooth2d: event.target.checked }));
+$('adaptive-quality').addEventListener('change', (event) => setRender({ adaptiveQuality: event.target.checked }));
 
 $('overlay-enabled').addEventListener('change', (event) => setOverlay({ enabled: event.target.checked }));
 $('overlay-position').addEventListener('change', (event) => setOverlay({ position: event.target.value }));

@@ -46,7 +46,7 @@ disc: a `.cue` with its `.bin` files, a single `.bin`, an `.iso`, or a PS-EXE pr
 | Analog | F9 or the quick menu toggles the DualShock analog mode; vibration uses the Gamepad API |
 | Interface | menu bar, toolbar and a settings dialog; a see-through quick menu (Esc, F1 or the gamepad Home button; Alt+Enter for full screen) with quick save/load, volume, aspect, scaling, PGXP, overlay, speed and analog mode, navigable by keyboard, gamepad or mouse; keyboard shortcuts that work in full screen (F2 overlay, F3 aspect, F4 scaling, F5/F7 quick save/load, F6 slot, F8 mute, F10 pause, PgUp/PgDn volume); on-screen messages |
 | Picture | aspect ratio 4:3, 16:9, zoom-to-cover without stretching, whole-number scale or fill; border crop; nearest or smooth scaling |
-| Rendering | internal resolution 1x (default), 2x, 3x; PGXP (sub-pixel geometry and perspective-correct textures); bilinear texture filtering with binary alpha; true colour (24-bit); a widescreen option for 3D scenes (see below) |
+| Rendering | internal resolution 1x (default), 2x, 3x; PGXP (sub-pixel geometry and perspective-correct textures); bilinear texture filtering with binary alpha; true colour (24-bit); a widescreen option for 3D scenes (see below); adaptive quality, which steps the options above down by itself while the game cannot keep up and back up when there is room |
 | Overlay | optional performance panel: FPS, speed, frame time, CPU load, resolution and renderer, audio buffer, memory |
 | Audio | steady audio reserve with dynamic rate control and fades instead of cuts; automatic or fixed latency; smooth volume |
 | Saves | memory cards 1 and 2 persist in IndexedDB (export, import of raw dumps, DexDrive `.gme` and PSP/PS3 `.vmp`, format); three save-state slots |
@@ -103,7 +103,7 @@ pure code (aspect-ratio layout, settings, and the audio player's reserve, rate c
 simulated with a jittery producer and clock drift) has tests that run with Node:
 
 ```bash
-node --test web/layout.test.mjs web/audio-worklet.test.mjs
+node --test web/layout.test.mjs web/audio-worklet.test.mjs web/quality.test.mjs
 ```
 
 ### Test ROMs and BIOS

@@ -71,7 +71,24 @@ test('saved settings are cleaned up when loaded', () => {
     assert.equal(settings.aspect, '4:3');
     assert.equal(settings.scale, 1);
     assert.equal(settings.audioLatency, 'auto');
+    assert.equal(settings.adaptiveQuality, true, 'adaptive quality is on unless it was switched off');
     assert.deepEqual(renderOptions(settings), { scale: 1, trueColor: false, bilinear: false, pgxp: false, pgxpTextures: false, widescreen: false, smooth2d: false });
+});
+
+test('adaptive quality stays off once the user switched it off', () => {
+    const saved = (value) => {
+        globalThis.localStorage = { getItem: () => JSON.stringify(value) };
+    };
+    try {
+        saved({ adaptiveQuality: false });
+        assert.equal(loadSettings().adaptiveQuality, false);
+        saved({ adaptiveQuality: 'sí' });
+        assert.equal(loadSettings().adaptiveQuality, true, 'anything else counts as the default');
+        saved({ scale: 2 });
+        assert.equal(loadSettings().adaptiveQuality, true, 'settings saved before it existed get the default');
+    } finally {
+        delete globalThis.localStorage;
+    }
 });
 
 test('perspective textures and widescreen only count with PGXP', () => {

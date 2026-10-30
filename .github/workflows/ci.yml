@@ -47,4 +47,4 @@ jobs:
         with:
           node-version: 22
       - name: Tests of the page's pure code
-        run: node --test web/layout.test.mjs web/audio-worklet.test.mjs
+        run: node --test web/layout.test.mjs web/audio-worklet.test.mjs web/quality.test.mjs
