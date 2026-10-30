@@ -68,6 +68,11 @@ impl Interpreter {
         let mut code_page = u32::MAX;
         let mut code_phys = 0usize;
         let mut code_in_bios = false;
+        // A wait-for-the-GPU loop seen once (see `poll_loop`): where it starts, when this
+        // iteration began, and the registers it reads the status into and the mask from.
+        let mut poll_head = u32::MAX;
+        let mut poll_start = 0u32;
+        let mut poll_regs = (0usize, 0usize);
 
         // Write a register now, cancelling a delayed load to it.
         macro_rules! set {
@@ -440,6 +445,27 @@ impl Interpreter {
                         read_le(&bus.scratchpad, (phys & 0x3FF) as usize, 4)
                     } else if phys.wrapping_sub(BIOS_START) < BIOS_SIZE {
                         bus.memory.bios.read32((phys - BIOS_START) as usize)
+                    } else if phys == Bus::GPU_STATUS {
+                        // The wait-for-the-GPU loops of the games read this register over and over:
+                        // answer from where the GPU will be, instead of leaving the batch.
+                        if !BREAKPOINT && pc == poll_head && count + extra == poll_start + POLL_LOOP_CYCLES {
+                            // The loop has come round once: the iterations that cannot end it
+                            // are skipped in one go.
+                            poll_head = u32::MAX;
+                            count += POLL_LOOP_CYCLES * skippable_polls(bus, self.regs[poll_regs.1], self.regs[poll_regs.0], count + extra, limit);
+                            // The batch ends where the turns that were skipped would have ended
+                            // it: before this read, if they used up all the cycles.
+                            if count + extra >= limit {
+                                break;
+                            }
+                        } else if !BREAKPOINT && !code_in_bios && (pc & 0xFFF) <= 0x1000 - 4 * POLL_LOOP_WORDS as u32 {
+                            if let Some(registers) = poll_loop(bus, offset, instr) {
+                                poll_head = pc;
+                                poll_start = count + extra;
+                                poll_regs = registers;
+                            }
+                        }
+                        bus.gpu_status_after(count + extra)
                     } else {
                         break;
                     };
@@ -617,4 +643,61 @@ impl Interpreter {
         self.extra_cycles = extra;
         count
     }
+}
+
+/// Instructions (and cycles: none of them stalls) of the loop `poll_loop` recognises.
+const POLL_LOOP_WORDS: usize = 5;
+const POLL_LOOP_CYCLES: u32 = POLL_LOOP_WORDS as u32;
+
+/// Whether the `lw` of GPUSTAT at `offset` (in RAM) starts the loop the libraries of the games
+/// wait for the GPU with:
+///
+/// ```text
+/// start: lw   rt, imm(rs)     ; GPUSTAT
+///        nop
+///        and  rt, rt, rm      ; rm holds the bits it waits for
+///        beq  rt, zero, start
+///        nop
+/// ```
+///
+/// It returns `(rt, rm)`. Nothing else changes while it runs: the only thing that decides when it
+/// ends is the GPU.
+fn poll_loop(bus: &Bus, offset: usize, lw: u32) -> Option<(usize, usize)> {
+    let word = |i: usize| bus.memory.ram.read32(offset + 4 * i);
+    let (rt, rs) = (((lw >> 16) & 0x1F) as usize, ((lw >> 21) & 0x1F) as usize);
+    let (and, branch) = (word(2), word(3));
+    let (and_rs, and_rt, and_rd) = (((and >> 21) & 0x1F) as usize, ((and >> 16) & 0x1F) as usize, ((and >> 11) & 0x1F) as usize);
+    let mask = if and_rs == rt { and_rt } else if and_rt == rt { and_rs } else { return None };
+    let is_loop = lw >> 26 == 0x23
+        && word(1) == 0
+        && and >> 26 == 0
+        && and & 0x3F == 0x24
+        && and_rd == rt
+        && branch >> 26 == 4
+        && (branch >> 21) & 0x1F == rt as u32
+        && (branch >> 16) & 0x1F == 0
+        // Back to the `lw`: the branch is relative to its delay slot, 4 words after the `lw`.
+        && branch & 0xFFFF == 0xFFFC
+        && word(4) == 0;
+    (is_loop && rt != 0 && rt != rs && rt != mask).then_some((rt, mask))
+}
+
+/// How many whole turns of the loop `poll_loop` found can be skipped when the next read of GPUSTAT
+/// is `elapsed` cycles into the batch, which has `limit` cycles. The skipped turns are the ones
+/// that read a GPU that is still busy (with a mask that does not see the bits that follow the
+/// scanlines), so each would have stored 0 in `rt` and branched back, which is what `rt` holds
+/// already: the registers do not change, only the time goes by.
+fn skippable_polls(bus: &Bus, mask: u32, status_read: u32, elapsed: u32, limit: u32) -> u32 {
+    // Bit 31 and bit 13 (odd/even line or field) change with the scanlines, not with the GPU's work.
+    const FOLLOW_THE_BEAM: u32 = 1 << 31 | 1 << 13;
+    if mask & FOLLOW_THE_BEAM != 0 || status_read != 0 || bus.gpu_status_after(elapsed) & mask != 0 {
+        return 0;
+    }
+    let turns = match bus.gpu_idle_in(elapsed) {
+        // The turn that reads the GPU idle ends the loop, if it sees what it waits for.
+        Some(wait) if bus.gpu_status_after(elapsed + wait) & mask != 0 => wait.div_ceil(POLL_LOOP_CYCLES),
+        // Nothing the GPU does ends the loop: it goes on until something else happens.
+        _ => u32::MAX,
+    };
+    turns.min((limit - elapsed) / POLL_LOOP_CYCLES)
 }

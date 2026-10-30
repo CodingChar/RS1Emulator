@@ -224,7 +224,9 @@ function startWorker() {
     worker.onerror = (event) => say(`Error en el emulador: ${event.message}`, true);
     if ('transferControlToOffscreen' in screen) {
         const offscreen = screen.transferControlToOffscreen();
-        worker.postMessage({ type: 'start-worker', canvas: offscreen }, [offscreen]);
+        // `?canvas=2d` in the address forces the 2D canvas instead of WebGL (to compare them).
+        const prefer2d = new URLSearchParams(location.search).get('canvas') === '2d';
+        worker.postMessage({ type: 'start-worker', canvas: offscreen, prefer2d }, [offscreen]);
     } else {
         worker.postMessage({ type: 'start-worker', canvas: null });
     }

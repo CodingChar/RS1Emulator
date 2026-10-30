@@ -6,12 +6,14 @@
 
 import init, { Ps1 } from './pkg/ps1_wasm.js';
 import * as storage from './storage.js';
+import { createPresenter } from './present.js';
 
 const BIOS_KEY = 'bios';
 const CARD_COUNT = 2;
 const CARD_SIZE = 128 * 1024;
-/// Never run more than this many frames to catch up after a stall.
-const MAX_CATCH_UP_FRAMES = 4;
+/// Never run more than this many frames at once to catch up after a stall. Catching up in
+/// bigger bursts shows as the picture freezing and then jumping.
+const MAX_CATCH_UP_FRAMES = 2;
 /// In "maximum speed" mode, the time spent emulating before yielding.
 const TURBO_BUDGET_MS = 12;
 const CARD_SAVE_INTERVAL_MS = 1000;
@@ -19,11 +21,18 @@ const CARD_SAVE_INTERVAL_MS = 1000;
 const DISC_READ_CHUNK = 256 * 1024;
 /// The loop wakes up this often to see whether a frame is due.
 const TICK_MS = 2;
+/// A timer made inside a timer callback waits at least 4 ms once they are nested a few deep, which
+/// would make the frames arrive unevenly. The timer fires a message, and the loop runs from the
+/// message: the timer it makes there starts the count again.
+const tickChannel = new MessageChannel();
+tickChannel.port1.onmessage = () => tick();
+function scheduleTick() {
+    setTimeout(() => tickChannel.port2.postMessage(0), TICK_MS);
+}
 
 let wasm = null;
 let ps1 = null;
-let canvas = null; // an OffscreenCanvas, or null when frames are sent to the page
-let context = null;
+let presenter = null; // draws on the OffscreenCanvas, or null when frames are sent to the page
 let audioPort = null;
 
 let biosLoaded = false;
@@ -192,13 +201,9 @@ function present() {
         post({ type: 'frame-size', width, height, nativeWidth: ps1.framebuffer_width(), nativeHeight: ps1.framebuffer_height() });
     }
     // A view of the frame inside the module's memory: no copy until it is drawn.
-    const pixels = new Uint8ClampedArray(wasm.memory.buffer, ps1.frame_ptr(), ps1.frame_len());
-    if (context) {
-        if (canvas.width !== width || canvas.height !== height) {
-            canvas.width = width;
-            canvas.height = height;
-        }
-        context.putImageData(new ImageData(pixels, width, height), 0, 0);
+    const pixels = new Uint8Array(wasm.memory.buffer, ps1.frame_ptr(), ps1.frame_len());
+    if (presenter) {
+        presenter.draw(pixels, width, height);
     } else {
         // No OffscreenCanvas: the page draws it.
         const copy = pixels.slice().buffer;
@@ -222,6 +227,7 @@ function updateStats(now) {
         height: shownSize.height,
         scale: renderOptions.scale,
         heap: wasm.memory.buffer.byteLength,
+        presenter: presenter ? presenter.kind : 'page',
     });
     const lastPresent = stats.lastPresent;
     Object.assign(stats, newStats(now));
@@ -278,7 +284,7 @@ function reportRumble() {
 }
 
 function tick() {
-    setTimeout(tick, TICK_MS);
+    scheduleTick();
     if (!running) {
         lastFrameTime = performance.now();
         return;
@@ -298,8 +304,10 @@ function tick() {
             const frameTime = 1000 / ps1.frames_per_second();
             frames = Math.min(Math.floor(accumulator / frameTime), MAX_CATCH_UP_FRAMES);
             accumulator -= frames * frameTime;
-            // Too far behind (a slow machine or a stalled tab): give up the backlog.
-            if (accumulator > frameTime * MAX_CATCH_UP_FRAMES) accumulator = 0;
+            // Still more than a frame behind after catching up (a slow machine, a stalled tab):
+            // give the rest up. Running the debt off in bursts would only freeze the picture and
+            // make it jump; a slow machine shows every frame, at the speed it manages.
+            if (accumulator > frameTime) accumulator = frameTime;
             for (let i = 0; i < frames; i++) ps1.run_frame();
         }
         lastFrameTime = now;
@@ -426,8 +434,7 @@ async function start(message) {
     ps1 = new Ps1();
     applyRender(renderOptions);
     if (message.canvas) {
-        canvas = message.canvas;
-        context = canvas.getContext('2d');
+        presenter = createPresenter(message.canvas, message.prefer2d);
     }
     await restoreCards();
     post({ type: 'ready', persistent: await storage.isPersistent() });

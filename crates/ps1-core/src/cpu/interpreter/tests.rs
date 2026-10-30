@@ -1208,6 +1208,92 @@ fn the_fast_path_and_the_exact_one_agree_on_timing() {
     assert!(compared > 20, "only {compared} lengths compared");
 }
 
+#[test]
+fn polling_gpustat_gives_the_same_values_on_the_fast_and_the_exact_path() {
+    // A wait-for-the-GPU loop: read GPUSTAT, add it up, jump back. The sum shows any read that
+    // saw the GPU at a different moment, as the fast path answers without syncing the devices.
+    // (A loop of 7 cycles: the scanlines do not all fall on the same cycle of the loop.)
+    let program = [lw(2, 4, 1), NOP, addu(4, 4, 2), addu(5, 5, 4), NOP, j(CODE), NOP];
+    let setup = |m: &mut Machine| {
+        m.cpu.regs[1] = 0x1F80_1810;
+        // The odd/even bit follows the scanlines, and drawing keeps the GPU busy for a while
+        // before it becomes ready.
+        m.bus.gpu.write(4, 4, 0x0800_0001);
+        for word in [0x0200_0000, 0, (60 << 16) | 160] {
+            m.bus.gpu.write(0, 4, word);
+        }
+    };
+    let mut compared = 0;
+    for target in (500..30_000u64).step_by(37) {
+        let mut fast = Machine::new(&program);
+        setup(&mut fast);
+        let (ran, result) = fast.cpu.run(&mut fast.bus, target);
+        result.unwrap();
+
+        let mut exact = Machine::new(&program);
+        setup(&mut exact);
+        let mut cycles = 0u64;
+        while cycles < ran {
+            exact.cpu.set_irq(exact.bus.interrupt.pending());
+            exact.step();
+            let spent = 1 + exact.cpu.take_extra_cycles();
+            exact.bus.tick(spent);
+            cycles += spent as u64;
+        }
+        assert_eq!(cycles, ran, "target {target}");
+        compared += 1;
+        assert_eq!(fast.cpu.regs, exact.cpu.regs, "registers after {ran} cycles");
+        assert_eq!(fast.cpu.pc, exact.cpu.pc, "target {target}");
+    }
+    assert!(compared > 100);
+}
+
+#[test]
+fn the_wait_for_the_gpu_loop_is_skipped_without_changing_anything() {
+    // The loop the game libraries wait for the GPU with, then a counter of how often it ended.
+    // The fast path skips the turns that read a busy GPU; the exact path runs every one.
+    let wait = [lw(2, 4, 1), NOP, rtype(2, 3, 2, 0, 0x24), beq(2, 0, -4), NOP, addiu(6, 6, 1), j(CODE), NOP];
+    for (label, mask) in [("ready for commands", 0x0400_0000u32), ("ready for DMA", 0x1000_0000), ("both", 0x1400_0000), ("never", 0x0000_0004)] {
+        let setup = |m: &mut Machine| {
+            m.cpu.regs[1] = 0x1F80_1810;
+            m.cpu.regs[3] = mask;
+            // Drawing keeps the GPU busy for a while.
+            for word in [0x0200_0000, 0, (200 << 16) | 320] {
+                m.bus.gpu.write(0, 4, word);
+            }
+        };
+        let mut compared = 0;
+        for target in (100..60_000u64).step_by(331) {
+            let mut fast = Machine::new(&wait);
+            setup(&mut fast);
+            let (ran, result) = fast.cpu.run(&mut fast.bus, target);
+            result.unwrap();
+
+            let mut exact = Machine::new(&wait);
+            setup(&mut exact);
+            // Like `run`: instructions until the cycles asked for have gone by.
+            let mut cycles = 0u64;
+            while cycles < target {
+                exact.cpu.set_irq(exact.bus.interrupt.pending());
+                exact.step();
+                let spent = 1 + exact.cpu.take_extra_cycles();
+                exact.bus.tick(spent);
+                cycles += spent as u64;
+            }
+            assert_eq!(cycles, ran, "{label}: cycles run for a target of {target}");
+            compared += 1;
+            assert_eq!(fast.cpu.regs, exact.cpu.regs, "{label}: registers after {ran} cycles");
+            assert_eq!(fast.cpu.pc, exact.cpu.pc, "{label}: pc after {ran} cycles");
+            assert_eq!(fast.cpu.next_pc, exact.cpu.next_pc, "{label}: next pc after {ran} cycles");
+            // The fast path leaves the devices to catch up later: bring both up to date.
+            fast.bus.sync_devices();
+            exact.bus.sync_devices();
+            assert_eq!(fast.bus.gpu.status(), exact.bus.gpu.status(), "{label}: the GPU after {ran} cycles");
+        }
+        assert!(compared > 100);
+    }
+}
+
 // ----- Memory timing -----
 
 #[test]

@@ -627,6 +627,83 @@ fn drawing_is_visible_on_the_display() {
     assert_eq!(&fb[at..at + 4], &[255, 0, 0, 255]);
 }
 
+// ----- GPUSTAT projected over time -----
+
+/// A small deterministic generator for the property tests below.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self, below: u64) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 33) % below
+    }
+}
+
+#[test]
+fn status_after_is_what_advancing_then_reading_gives() {
+    let mut rng = Lcg(0x5EED);
+    for case in 0..400 {
+        // The same random video mode, drawing load and elapsed time on two GPUs.
+        let mode = [0u32, 1, 2, 3, 1 | (1 << 2), 1 | (1 << 2) | (1 << 5), 1 | (1 << 3), 1 << 6][rng.next(8) as usize];
+        let build = |extra_cycles: u64| {
+            let mut gpu = gpu();
+            gp1(&mut gpu, 0x0800_0000 | mode);
+            let mut local = Lcg(case);
+            for _ in 0..local.next(5) {
+                // Drawing makes the GPU busy for a while.
+                let (w, h) = (local.next(500) as u32 + 1, local.next(240) as u32 + 1);
+                gp0(&mut gpu, &[0x0200_0000, xy(0, 0), (h << 16) | w]);
+                gpu.advance(local.next(20_000) as u32);
+            }
+            gpu.advance(local.next(3_000_000) as u32);
+            gpu.advance(extra_cycles as u32);
+            gpu
+        };
+        let lead = rng.next(2_000) + case;
+        for elapsed in [0u32, 1, 7, 100, 2_100, 2_200, 5_000, 50_000, 565_000, 1_200_000] {
+            let projected = build(lead).status_after(elapsed);
+            let mut moved = build(lead);
+            moved.advance(elapsed);
+            assert_eq!(projected, moved.status(), "case {case}, mode {mode:#x}, {elapsed} cycles after {lead}");
+        }
+    }
+}
+
+#[test]
+fn cycles_until_idle_is_the_first_cycle_the_gpu_is_ready() {
+    const READY: u32 = 1 << 26;
+    let mut rng = Lcg(0xB05E);
+    let mut busy_cases = 0;
+    for case in 0..500 {
+        let mut gpu = gpu();
+        gp1(&mut gpu, 0x0800_0001);
+        for _ in 0..=rng.next(4) {
+            let (w, h) = (rng.next(600) as u32 + 1, rng.next(250) as u32 + 1);
+            gp0(&mut gpu, &[0x0200_0000, xy(0, 0), (h << 16) | w]);
+            gpu.advance(rng.next(30_000) as u32);
+        }
+        let after = [0u32, 1, 6, 11, 700, 5_000][rng.next(6) as usize];
+        match gpu.cycles_until_idle(after) {
+            None => assert_ne!(gpu.status_after(after) & READY, 0, "case {case}: not busy, so ready"),
+            Some(wait) => {
+                busy_cases += 1;
+                assert!(wait >= 1, "case {case}");
+                assert_eq!(gpu.status_after(after + wait - 1) & READY, 0, "case {case}: still busy one cycle before");
+                assert_ne!(gpu.status_after(after + wait) & READY, 0, "case {case}: ready at {wait}");
+            }
+        }
+    }
+    assert!(busy_cases > 50, "only {busy_cases} busy cases");
+}
+
+#[test]
+fn status_after_does_not_move_the_gpu() {
+    let mut gpu = gpu();
+    gp0(&mut gpu, &[0x0200_0000, xy(0, 0), (240 << 16) | 320]);
+    let before = (gpu.status(), gpu.scanline, gpu.is_busy());
+    gpu.status_after(1_000_000);
+    assert_eq!((gpu.status(), gpu.scanline, gpu.is_busy()), before);
+}
+
 // ----- Video timing (see also the CPU-visible effects in the bus tests) -----
 
 /// Advance one CPU cycle at a time, summing the video events.

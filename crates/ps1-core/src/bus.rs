@@ -242,6 +242,25 @@ impl Bus {
         addr & REGION_MASK[(addr >> 29) as usize]
     }
 
+    /// The address of GPUSTAT.
+    pub const GPU_STATUS: u32 = GPU + 4;
+
+    /// GPUSTAT as the CPU reads it `elapsed` cycles into a batch of instructions that the bus has
+    /// not been told about yet. This is the value an exact read would give after bringing the
+    /// devices up to date, without doing that: the game polls this register thousands of times a
+    /// frame while it waits for the GPU.
+    #[inline(always)]
+    pub fn gpu_status_after(&self, elapsed: u32) -> u32 {
+        self.gpu.status_after(self.pending_cycles + elapsed)
+    }
+
+    /// The cycles from `elapsed` cycles into a batch (see [`Bus::gpu_status_after`]) until the GPU
+    /// has finished what it is drawing, or `None` if it is idle by then.
+    #[inline(always)]
+    pub fn gpu_idle_in(&self, elapsed: u32) -> Option<u32> {
+        self.gpu.cycles_until_idle(self.pending_cycles + elapsed)
+    }
+
     /// CPU cycles that can run before some device needs to be brought up to
     /// date (at least 1).
     #[inline(always)]

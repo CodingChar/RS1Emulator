@@ -550,6 +550,51 @@ impl Gpu {
 
     /// `GPUSTAT`.
     pub fn status(&self) -> u32 {
+        self.status_with(self.is_busy(), self.field, self.scanline)
+    }
+
+    /// What GPUSTAT reads after `cpu_cycles` more CPU cycles, without moving the GPU: what
+    /// [`Gpu::advance`] followed by [`Gpu::status`] gives. Only the busy time, the field and the
+    /// scanline change with time (nothing else here moves between device events), so a program
+    /// that polls the register in a loop can be answered without bringing every device up to date.
+    pub fn status_after(&self, cpu_cycles: u32) -> u32 {
+        let clocks = (self.clock_remainder as u64 + cpu_cycles as u64 * GPU_CLOCKS_PER_7_CPU_CYCLES as u64)
+            / CPU_CYCLES_PER_11_GPU_CLOCKS as u64;
+        let busy = self.busy_clocks as u64 > clocks;
+        let per_line = self.clocks_per_line() as u64;
+        let mut line_clock = self.line_clock as u64 + clocks;
+        let (mut scanline, mut field) = (self.scanline, self.field);
+        if line_clock >= per_line {
+            let lines_per_frame = self.lines_per_frame();
+            while line_clock >= per_line {
+                line_clock -= per_line;
+                scanline += 1;
+                if scanline == VBLANK_START_LINE {
+                    field = !field;
+                }
+                if scanline >= lines_per_frame {
+                    scanline = 0;
+                }
+            }
+        }
+        self.status_with(busy, field, scanline)
+    }
+
+    /// The CPU cycles from `cpu_cycles` more cycles on until the GPU stops being busy, or `None`
+    /// if it is not busy then. (What [`Gpu::status_after`] reads is busy up to that point.)
+    pub fn cycles_until_idle(&self, cpu_cycles: u32) -> Option<u32> {
+        let total = self.clock_remainder as u64 + cpu_cycles as u64 * GPU_CLOCKS_PER_7_CPU_CYCLES as u64;
+        let busy = (self.busy_clocks as u64).saturating_sub(total / CPU_CYCLES_PER_11_GPU_CLOCKS as u64);
+        if busy == 0 {
+            return None;
+        }
+        // The first cycle after which `busy` more GPU clocks have gone by.
+        let clocks_left = busy * CPU_CYCLES_PER_11_GPU_CLOCKS as u64 - total % CPU_CYCLES_PER_11_GPU_CLOCKS as u64;
+        Some(clocks_left.div_ceil(GPU_CLOCKS_PER_7_CPU_CYCLES as u64) as u32)
+    }
+
+    /// GPUSTAT for a given busy state, field and scanline (the parts that move with time).
+    fn status_with(&self, busy: bool, field: bool, scanline: u32) -> u32 {
         let mut stat = self.page_x
             | (self.page_y << 4)
             | ((self.semi_mode as u32) << 5)
@@ -576,19 +621,19 @@ impl Gpu {
         // Data request: follows the DMA direction.
         stat |= ((self.dma_direction != 0) as u32) << 25;
         stat |= STAT_READY_FOR_VRAM_READ;
-        if !self.is_busy() {
+        if !busy {
             stat |= STAT_READY_FOR_COMMAND | STAT_READY_FOR_DMA;
         }
         stat |= (self.dma_direction as u32) << 29;
 
         // Interlace field / odd-even line.
         if self.is_interlaced() {
-            stat |= (!self.field as u32) << 13;
-            stat |= (self.field as u32) << 31;
+            stat |= (!field as u32) << 13;
+            stat |= (field as u32) << 31;
         } else {
             stat |= 1 << 13;
-            if !self.in_vblank() {
-                stat |= (self.scanline & 1) << 31;
+            if scanline < VBLANK_START_LINE {
+                stat |= (scanline & 1) << 31;
             }
         }
         stat
